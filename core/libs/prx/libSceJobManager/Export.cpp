@@ -19,6 +19,8 @@
 #include "prx/libc/include/GuestArena.hpp"
 
 extern "C" {
+int APS5_VABI _sceUlobjmgrRegisterObject_nid_postfix(std::uint64_t object, std::int32_t kind, std::uint32_t* id);
+int APS5_VABI _sceUlobjmgrUnregisterObject_nid_postfix(std::uint32_t id);
 int APS5_VABI scePthreadAttrInit(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrSetinheritsched(PthreadAttr* attr, int inheritSched);
@@ -257,6 +259,7 @@ public:
 };
 
 struct Manager {
+    std::uint32_t objectId = 0;
     std::mutex lock;
     std::condition_variable work;
     std::condition_variable quiesced;
@@ -843,7 +846,7 @@ int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t worke
         throw;
     }
     Implementation(self) = owner.release();
-    return 0;
+    return _sceUlobjmgrRegisterObject_nid_postfix(base, 0x21, &manager->objectId);
 }
 
 ISequenceFactory* FactoryFor(void* self, std::uint32_t priority, bool unified) {
@@ -927,6 +930,7 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
         manager->running = false;
     }
     StopManager(*manager);
+    static_cast<void>(_sceUlobjmgrUnregisterObject_nid_postfix(manager->objectId));
     Implementation(self) = nullptr;
     delete manager;
     return 0;
