@@ -1,10 +1,12 @@
 #include "SceTypes.hpp"
+#include "prx/libSceAgcDriver/tests/execution/VulkanTestDevice.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
 #include <mutex>
 #include <thread>
@@ -17,6 +19,9 @@ struct ISequence {
     APS5_VABI virtual int Dispatch(JobEntry, void*, std::uint32_t, const char*) = 0;
     APS5_VABI virtual int SyncPoint() = 0;
     APS5_VABI virtual int Wait() = 0;
+    APS5_VABI virtual void CompleteDestructor() = 0;
+    APS5_VABI virtual void DeletingDestructor() = 0;
+    APS5_VABI virtual int DispatchCompute(const void*, void*, std::int32_t, std::int32_t, std::int32_t, const char*) = 0;
 };
 
 struct ISequenceFactory {
@@ -33,6 +38,9 @@ void APS5_VABI _ZN3sce3Job10JobManagerC1Ev(void*);
 int APS5_VABI _ZN3sce3Job10JobManager10initializeEPvmjjjmPKNS1_12ConfigParamsE(void*, void*, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, const ConfigParams*);
 int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void*);
 ISequenceFactory* APS5_VABI _ZN3sce3Job10JobManager34getUnifiedSequenceFactoryInterfaceENS1_8PriorityE(void*, std::uint32_t);
+int APS5_VABI sceAgcDriverSubmitAcb(std::uint32_t, const Packet*);
+std::uint32_t* APS5_VABI sceAgcAcbWaitRegMem(CommandBuffer*, std::uint8_t, std::uint8_t, std::uint8_t, const volatile void*, std::uint64_t, std::uint64_t, std::uint32_t);
+void AgcDriverShutdown_nid_postfix();
 }
 
 namespace {
@@ -279,6 +287,60 @@ void ConcurrentCase() {
     reader.Done();
 }
 
+void GpuBarrierCase(bool mixed, bool cpuAfter) {
+    Fixture fixture;
+    ISequence* sequence = fixture.Create(nullptr, true);
+    alignas(256) static const std::array<std::uint32_t, 1> code{0xbf810000u};
+    const auto address = reinterpret_cast<std::uint64_t>(code.data());
+    const std::array<ShaderRegister, 7> registers{{{0x20c, static_cast<std::uint32_t>(address >> 8)}, {0x20d, static_cast<std::uint32_t>(address >> 40) & 0xff}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    const std::array<std::uint32_t, 8> specials{0, 0, 0, 0, 1, 0, 0, 0};
+    const ShaderRegister* registerPointer = registers.data();
+    const std::uint32_t* specialPointer = specials.data();
+    std::array<std::uint8_t, 0x80> shader{};
+    std::memcpy(shader.data() + 0x20, &registerPointer, sizeof(registerPointer));
+    std::memcpy(shader.data() + 0x28, &specialPointer, sizeof(specialPointer));
+    shader[0x5c] = static_cast<std::uint8_t>(registers.size());
+    alignas(64) std::uint32_t gate = 0;
+    alignas(256) std::array<std::uint32_t, 32> commands{};
+    CommandBuffer buffer{commands.data(), commands.data() + commands.size(), commands.data(), commands.data() + commands.size(), nullptr, nullptr, 0};
+    Require(sceAgcAcbWaitRegMem(&buffer, 0, 3, 3, &gate, 1, 0xffffffffu, 0x190) != nullptr);
+    const Packet packet{commands.data(), static_cast<std::uint32_t>(buffer.cursor_up - commands.data()), 0, {}};
+    Require(sceAgcDriverSubmitAcb(0x21, &packet) == 0);
+    Context context;
+    if (mixed) {
+        context.released.store(false);
+        Require(sequence->Dispatch(Job, &context, 1, nullptr) == 0);
+        Await(context.entered);
+    }
+    Require(sequence->DispatchCompute(shader.data(), nullptr, 1, 1, 1, nullptr) == 0);
+    Require(sequence->SyncPoint() == 0);
+    if (cpuAfter) {
+        Require(sequence->Dispatch(Job, &context, 1, nullptr) == 0);
+        Require(sequence->SyncPoint() == 0);
+    }
+    Require(sequence->DispatchCompute(shader.data(), nullptr, 1, 1, 1, nullptr) == 0);
+    context.released.store(true);
+    std::atomic_ref<std::uint32_t>(gate).store(1);
+    Require(sequence->Wait() == 0);
+    Require(fixture.factory->DestroyCompute(sequence) == 0);
+    fixture.Stop();
+    Reader reader(fixture.id);
+    reader.Sequence(nullptr, 0, 1);
+    reader.Sequence(nullptr, 2, 3);
+    if (cpuAfter) {
+        reader.Sequence(nullptr, 2, 4);
+        reader.Sequence(nullptr, 2, 3);
+    }
+    if (mixed || cpuAfter) {
+        reader.Dispatch(nullptr, context, 1, 2);
+        reader.Sequence(nullptr, 2, 4);
+        reader.Sequence(nullptr, 2, 3);
+    }
+    reader.Sequence(nullptr, 2, 4);
+    reader.Sequence(nullptr, 0, 2);
+    reader.Done();
+}
+
 void ShutdownCase(bool queued) {
     Fixture fixture;
     ISequence* sequence = fixture.Create(nullptr);
@@ -333,7 +395,19 @@ int APS5_VABI sceRazorCpuJobManagerDispatch(const char* name, std::uint16_t mana
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "gpu") == 0) {
+        auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        device.reset();
+        GpuBarrierCase(false, false);
+        GpuBarrierCase(false, true);
+        GpuBarrierCase(true, false);
+        AgcDriverShutdown_nid_postfix();
+        std::puts("job manager GPU profiler tests passed");
+        return 0;
+    }
+    if (argc != 1) return 2;
     EmptyAndIdentityCase();
     BatchCase(false, false);
     BatchCase(true, false);

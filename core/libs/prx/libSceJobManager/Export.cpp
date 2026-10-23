@@ -282,6 +282,8 @@ private:
     std::uint32_t pendingCompute = 0;
     bool batchStarted = false;
     bool profileActive = false;
+    bool profileCpu = false;
+    bool profileGpuBarrier = false;
     const char* profileName = nullptr;
     std::uint32_t* commandBegin = nullptr;
     std::size_t commandWords = 0;
@@ -399,6 +401,8 @@ bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueu
     commandUsed = 0;
     batchStarted = false;
     profileActive = false;
+    profileCpu = false;
+    profileGpuBarrier = false;
     profileName = name;
     reserved = TakeNode(*owner);
     if (reserved == nullptr) return false;
@@ -437,8 +441,14 @@ void Sequence::Advance() {
     while (cursor != nullptr) {
         Item& item = *cursor;
         if (item.type == ItemType::Dispatch) {
+            if (profileGpuBarrier) {
+                Profile(4);
+                profileActive = false;
+                profileGpuBarrier = false;
+            }
             if (!profileActive) Profile(3);
             profileActive = true;
+            profileCpu = true;
             if (!manager->running) return;
             ++outstanding;
             cursor = item.next;
@@ -451,6 +461,7 @@ void Sequence::Advance() {
             if (!manager->running) return;
             if (!profileActive) Profile(3);
             profileActive = true;
+            profileGpuBarrier = false;
             ++outstanding;
             cursor = item.next;
             SubmitCompute(item);
@@ -458,13 +469,21 @@ void Sequence::Advance() {
         }
         FlushCompute();
         if (outstanding != 0) return;
-        if (profileActive) Profile(4);
-        profileActive = false;
         if (item.type == ItemType::SyncPoint) {
+            if (profileCpu) {
+                Profile(4);
+                profileActive = false;
+                profileCpu = false;
+            }
+            profileGpuBarrier = profileActive;
             ++completed.syncPoints;
             cursor = item.next;
             continue;
         }
+        if (profileActive) Profile(4);
+        profileActive = false;
+        profileCpu = false;
+        profileGpuBarrier = false;
         bool* const waiter = item.passed;
         while (first != &item) {
             Item* retired = first;
