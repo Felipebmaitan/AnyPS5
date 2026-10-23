@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "core/relinker/relinker/tests"))
 from guest_import_fixtures import executable
 
-CASES = ("memory", "validation", "dispatch", "ordering", "nested", "limits", "node_pool", "priority", "shutdown", "worker_policy", "worker_wake", "worker_count", "worker_spin")
+CASES = ("memory", "owned_state", "concurrent_wait", "validation", "dispatch", "ordering", "nested", "limits", "node_pool", "priority", "shutdown", "worker_policy", "worker_wake", "worker_count", "worker_spin")
 
 
 def stage_libraries(directory, build, toolchain, dependencies):

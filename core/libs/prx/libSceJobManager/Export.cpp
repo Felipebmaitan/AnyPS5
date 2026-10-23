@@ -4,14 +4,13 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <deque>
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 #include "SceTypes.hpp"
 #include "ComputeProgress.hpp"
@@ -156,19 +155,50 @@ class Sequence;
 enum class ItemType { Dispatch, SyncPoint, Wait, Compute, ComputeIndirect };
 
 struct Item {
-    ItemType type;
+    Item* next = nullptr;
+    Item* runnableNext = nullptr;
     Sequence* sequence;
-    JobEntry entry;
-    void* argument;
-    std::uint32_t count;
-    std::uint32_t handedOut;
-    std::uint32_t completed;
-    bool* passed;
-    const void* shader = nullptr;
-    std::array<std::uint32_t, 3> groups{};
-    const void* indirectArguments = nullptr;
-    std::string name;
-    bool named = false;
+    struct Cpu {
+        JobEntry entry;
+        void* argument;
+        std::uint32_t count;
+        std::uint32_t handedOut;
+        std::uint32_t completed;
+    };
+    struct Compute {
+        const void* shader;
+        void* userData;
+        union {
+            std::array<std::uint32_t, 3> groups;
+            const void* indirectArguments;
+        };
+    };
+    union {
+        Cpu cpu;
+        Compute gpu;
+        bool* passed;
+    };
+    const char* name = nullptr;
+    ItemType type;
+};
+
+static_assert(sizeof(Item) == NodeBytes);
+
+struct RunQueue {
+    Item* first = nullptr;
+    Item* last = nullptr;
+
+    void Push(Item* item) {
+        item->runnableNext = nullptr;
+        if (last != nullptr) last->runnableNext = item;
+        else first = item;
+        last = item;
+    }
+
+    void Pop() {
+        first = first->runnableNext;
+        if (first == nullptr) last = nullptr;
+    }
 };
 
 struct Counters {
@@ -226,6 +256,8 @@ private:
     void RequireOpen() const;
     int WaitLocked(std::unique_lock<std::mutex>& guard);
     int AppendCompute(Item item);
+    void Append(Item* item);
+    void RemoveWait(Item* item);
     void SubmitCompute(const Item& item);
     void FlushCompute();
 
@@ -235,8 +267,10 @@ private:
     std::uint32_t priority = 0;
     int error = 0;
     std::uint32_t outstanding = 0;
-    std::size_t cursor = 0;
-    std::deque<Item> items;
+    Item* reserved = nullptr;
+    Item* first = nullptr;
+    Item* last = nullptr;
+    Item* cursor = nullptr;
     std::condition_variable passed;
     Label* label = nullptr;
     JobManager::ComputeProgress progress;
@@ -246,6 +280,22 @@ private:
     std::size_t commandWords = 0;
     std::size_t commandUsed = 0;
 };
+
+static_assert(sizeof(Sequence) < SequenceBytes);
+
+struct alignas(64) SequenceSlot {
+    Sequence value;
+    std::array<std::byte, SequenceBytes - sizeof(Sequence)> padding;
+};
+
+static_assert(sizeof(SequenceSlot) == SequenceBytes);
+
+struct WorkerSlot {
+    Pthread thread = nullptr;
+    std::array<std::byte, ThreadRecordBytes - sizeof(Pthread)> padding;
+};
+
+static_assert(sizeof(WorkerSlot) == ThreadRecordBytes);
 
 class Factory final : public ISequenceFactory {
 public:
@@ -265,7 +315,7 @@ struct Manager {
     std::condition_variable quiesced;
     bool running = false;
     std::uint32_t blockedWaiters = 0;
-    std::uint32_t freeNodes = 0;
+    Item* freeNodes = nullptr;
     std::uint32_t freeSequences = 0;
     std::uint32_t persistentThreads = 0;
     std::uint32_t workerCount = 0;
@@ -273,17 +323,23 @@ struct Manager {
     std::uint32_t wakeTokens = 0;
     std::uint64_t pendingInvocations = 0;
     std::uint64_t spinTicks = 0;
-    std::array<std::deque<Item*>, 2> runQueues;
-    std::vector<Sequence> sequences;
-    std::deque<Sequence> computeSequences;
+    std::array<RunQueue, 2> runQueues;
+    std::span<SequenceSlot> sequences;
+    std::span<SequenceSlot> computeSequences;
     std::uint32_t freeComputeSequences = 0;
-    std::vector<std::uint32_t> computeQueues;
+    std::uint64_t computeQueues = 0;
     KernelEqueue computeEvents = 0;
     Pthread computeHandler = nullptr;
     std::array<Factory, 2> factories;
     std::array<Factory, 2> unifiedFactories;
-    std::vector<Pthread> workers;
+    std::span<WorkerSlot> workers;
+    std::uint32_t activeWorkers = 0;
+    void* stateBegin = nullptr;
+    std::size_t stateBytes = 0;
+    std::span<Item> nodes;
 };
+
+static_assert(sizeof(Manager) <= StateEnd - StateOffset);
 
 thread_local Manager* currentWorker = nullptr;
 
@@ -297,14 +353,18 @@ Manager*& Implementation(void* self) {
     return *static_cast<Manager**>(self);
 }
 
-bool TakeNode(Manager& manager) {
-    if (manager.freeNodes == 0) return false;
-    --manager.freeNodes;
-    return true;
+Item* TakeNode(Manager& manager) {
+    Item* item = manager.freeNodes;
+    if (item != nullptr) {
+        manager.freeNodes = item->next;
+        *item = {};
+    }
+    return item;
 }
 
-void ReturnNodes(Manager& manager, std::uint32_t count) {
-    manager.freeNodes += count;
+void ReturnNode(Manager& manager, Item* item) {
+    item->next = manager.freeNodes;
+    manager.freeNodes = item;
 }
 
 int Sequence::Latch(int code) {
@@ -320,11 +380,13 @@ bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueu
     priority = runQueue;
     error = 0;
     outstanding = 0;
-    cursor = 0;
-    items.clear();
+    cursor = nullptr;
+    first = nullptr;
+    last = nullptr;
     commandUsed = 0;
     batchStarted = false;
-    if (!TakeNode(*owner)) return false;
+    reserved = TakeNode(*owner);
+    if (reserved == nullptr) return false;
     open = true;
     return true;
 }
@@ -333,22 +395,44 @@ void Sequence::RequireOpen() const {
     if (!open) throw std::runtime_error("libSceJobManager: a destroyed sequence was used");
 }
 
+void Sequence::Append(Item* item) {
+    item->next = nullptr;
+    if (last != nullptr) last->next = item;
+    else first = item;
+    last = item;
+    if (cursor == nullptr) cursor = item;
+}
+
+void Sequence::RemoveWait(Item* item) {
+    Item* previous = nullptr;
+    for (Item* current = first; current != nullptr; current = current->next) {
+        if (current == item) {
+            if (previous != nullptr) previous->next = item->next;
+            else first = item->next;
+            if (last == item) last = previous;
+            if (cursor == item) cursor = item->next;
+            return;
+        }
+        previous = current;
+    }
+}
+
 void Sequence::Advance() {
-    while (cursor < items.size()) {
-        Item& item = items[cursor];
+    while (cursor != nullptr) {
+        Item& item = *cursor;
         if (item.type == ItemType::Dispatch) {
             if (!manager->running) return;
             ++outstanding;
-            ++cursor;
-            manager->runQueues[priority].push_back(&item);
-            manager->pendingInvocations -= item.count;
-            WakeWorkers(*manager, item.count);
+            cursor = item.next;
+            manager->runQueues[priority].Push(&item);
+            manager->pendingInvocations -= item.cpu.count;
+            WakeWorkers(*manager, item.cpu.count);
             continue;
         }
         if (item.type == ItemType::Compute || item.type == ItemType::ComputeIndirect) {
             if (!manager->running) return;
             ++outstanding;
-            ++cursor;
+            cursor = item.next;
             SubmitCompute(item);
             continue;
         }
@@ -356,13 +440,18 @@ void Sequence::Advance() {
         if (outstanding != 0) return;
         if (item.type == ItemType::SyncPoint) {
             ++completed.syncPoints;
-            ++cursor;
+            cursor = item.next;
             continue;
         }
         bool* const waiter = item.passed;
-        const auto retired = static_cast<std::uint32_t>(cursor);
-        items.erase(items.begin(), items.begin() + static_cast<std::ptrdiff_t>(retired + 1));
-        cursor = 0;
+        while (first != &item) {
+            Item* retired = first;
+            first = first->next;
+            ReturnNode(*manager, retired);
+        }
+        first = item.next;
+        if (last == &item) last = nullptr;
+        cursor = first;
         commandUsed = 0;
         batchStarted = false;
         if (error == 0) {
@@ -372,7 +461,6 @@ void Sequence::Advance() {
             --submitted.waits;
             completed = {};
         }
-        ReturnNodes(*manager, retired);
         *waiter = true;
         passed.notify_all();
     }
@@ -386,13 +474,13 @@ void Sequence::DispatchCompleted(std::uint32_t invocations) {
 }
 
 void Sequence::CancelWaits() {
-    for (Item& item : items) {
-        if (item.type == ItemType::Wait) *item.passed = true;
+    for (Item* item = first; item != nullptr; item = item->next) {
+        if (item->type == ItemType::Wait) *item->passed = true;
     }
     passed.notify_all();
 }
 
-int Sequence::Dispatch(JobEntry entry, void* argument, std::uint32_t count, const char*) {
+int Sequence::Dispatch(JobEntry entry, void* argument, std::uint32_t count, const char* name) {
     if (entry == nullptr) return SequenceNullArgument;
     if (count == 0 || count > MaxInvocations) return SequenceOutOfRange;
     const std::lock_guard guard(manager->lock);
@@ -402,15 +490,20 @@ int Sequence::Dispatch(JobEntry entry, void* argument, std::uint32_t count, cons
     submitted.invocations += count;
     ++submitted.dispatches;
     if (before.invocations + count > limits.invocations || before.dispatches >= limits.dispatches) return Latch(SequenceLimitExceeded);
-    if (!TakeNode(*manager)) return Latch(SequenceNoNodes);
-    items.push_back({ItemType::Dispatch, this, entry, argument, count, 0, 0, nullptr});
+    Item* item = TakeNode(*manager);
+    if (item == nullptr) return Latch(SequenceNoNodes);
+    item->type = ItemType::Dispatch;
+    item->sequence = this;
+    item->name = name;
+    item->cpu = {entry, argument, count, 0, 0};
+    Append(item);
     manager->pendingInvocations += count;
     Advance();
     return 0;
 }
 
 void Sequence::SubmitCompute(const Item& item) {
-    const auto* bytes = static_cast<const std::uint8_t*>(item.shader);
+    const auto* bytes = static_cast<const std::uint8_t*>(item.gpu.shader);
     const ShaderRegister* registers = nullptr;
     const std::uint8_t* specials = nullptr;
     std::memcpy(&registers, bytes + 0x20, sizeof(registers));
@@ -418,9 +511,9 @@ void Sequence::SubmitCompute(const Item& item) {
     const std::uint32_t registerCount = bytes[0x5c];
     std::uint32_t modifier = 0;
     std::memcpy(&modifier, specials + 0x10, sizeof(modifier));
-    const auto userData = reinterpret_cast<std::uint64_t>(item.argument);
+    const auto userData = reinterpret_cast<std::uint64_t>(item.gpu.userData);
     const std::array<std::uint32_t, 2> userDataWords{static_cast<std::uint32_t>(userData), static_cast<std::uint32_t>(userData >> 32)};
-    const auto capacity = std::min(commandWords - commandUsed, 64 + 3 * registerCount + item.name.size() / 4);
+    const auto capacity = std::min(commandWords - commandUsed, 64 + 3 * registerCount + (item.name != nullptr ? std::strlen(item.name) / 4 : 0));
     auto* const words = commandBegin + commandUsed;
     CommandBuffer buffer{words, words + capacity, words, words + capacity, nullptr, nullptr, 0};
     {
@@ -428,13 +521,13 @@ void Sequence::SubmitCompute(const Item& item) {
         bool encoded = sceAgcAcbAcquireMem(&buffer, 0x20380u | (batchStarted ? 0u : 1u), nullptr, 0, 0x190) != nullptr;
         encoded = encoded && sceAgcCbSetShRegistersDirect(&buffer, registers, registerCount) != nullptr;
         encoded = encoded && sceAgcCbSetShRegisterRangeDirect(&buffer, UserDataRegister, userDataWords.data(), 2) != nullptr;
-        if (item.named) encoded = encoded && sceAgcAcbPushMarker(&buffer, item.name.c_str(), 0) != nullptr;
+        if (item.name != nullptr) encoded = encoded && sceAgcAcbPushMarker(&buffer, item.name, 0) != nullptr;
         if (item.type == ItemType::Compute) {
-            encoded = encoded && sceAgcCbDispatch(&buffer, item.groups[0], item.groups[1], item.groups[2], modifier) != nullptr;
+            encoded = encoded && sceAgcCbDispatch(&buffer, item.gpu.groups[0], item.gpu.groups[1], item.gpu.groups[2], modifier) != nullptr;
         } else {
-            encoded = encoded && sceAgcAcbDispatchIndirect(&buffer, item.indirectArguments, modifier) != nullptr;
+            encoded = encoded && sceAgcAcbDispatchIndirect(&buffer, item.gpu.indirectArguments, modifier) != nullptr;
         }
-        if (item.named) encoded = encoded && sceAgcAcbPopMarker(&buffer) != nullptr;
+        if (item.name != nullptr) encoded = encoded && sceAgcAcbPopMarker(&buffer) != nullptr;
         if (!encoded) throw std::runtime_error("libSceJobManager: a compute dispatch did not fit its command buffer");
     }
     batchStarted = true;
@@ -483,8 +576,10 @@ int Sequence::AppendCompute(Item item) {
     if (!compute) throw std::runtime_error("libSceJobManager: a compute dispatch was made on a CPU sequence");
     if (error != 0) return SequenceInvalid;
     if (submitted.dispatches++ >= limits.dispatches) return Latch(SequenceLimitExceeded);
-    if (!TakeNode(*manager)) return Latch(SequenceNoNodes);
-    items.push_back(std::move(item));
+    Item* stored = TakeNode(*manager);
+    if (stored == nullptr) return Latch(SequenceNoNodes);
+    *stored = item;
+    Append(stored);
     Advance();
     return 0;
 }
@@ -492,22 +587,26 @@ int Sequence::AppendCompute(Item item) {
 int Sequence::DispatchCompute(const void* shader, void* userData, std::int32_t x, std::int32_t y, std::int32_t z, const char* name) {
     if (shader == nullptr) return SequenceNullArgument;
     if (x <= 0 || y <= 0 || z <= 0) return SequenceOutOfRange;
-    Item item{ItemType::Compute, this, nullptr, userData, 0, 0, 0, nullptr};
-    item.shader = shader;
-    item.groups = {static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), static_cast<std::uint32_t>(z)};
-    item.named = name != nullptr;
-    if (item.named) item.name = name;
-    return AppendCompute(std::move(item));
+    Item item{};
+    item.type = ItemType::Compute;
+    item.sequence = this;
+    item.gpu.shader = shader;
+    item.gpu.userData = userData;
+    item.gpu.groups = {static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), static_cast<std::uint32_t>(z)};
+    item.name = name;
+    return AppendCompute(item);
 }
 
 int Sequence::DispatchComputeIndirect(const void* shader, void* userData, const void* indirectArguments, const char* name) {
     if (shader == nullptr || indirectArguments == nullptr || (reinterpret_cast<std::uint64_t>(indirectArguments) & 0x1f) != 0) return SequenceNullArgument;
-    Item item{ItemType::ComputeIndirect, this, nullptr, userData, 0, 0, 0, nullptr};
-    item.shader = shader;
-    item.indirectArguments = indirectArguments;
-    item.named = name != nullptr;
-    if (item.named) item.name = name;
-    return AppendCompute(std::move(item));
+    Item item{};
+    item.type = ItemType::ComputeIndirect;
+    item.sequence = this;
+    item.gpu.shader = shader;
+    item.gpu.userData = userData;
+    item.gpu.indirectArguments = indirectArguments;
+    item.name = name;
+    return AppendCompute(item);
 }
 
 int Sequence::SyncPoint() {
@@ -516,8 +615,11 @@ int Sequence::SyncPoint() {
     if (error != 0) return SequenceInvalid;
     const std::uint32_t before = submitted.syncPoints++;
     if (before >= limits.syncPoints) return Latch(SequenceLimitExceeded);
-    if (!TakeNode(*manager)) return Latch(SequenceNoNodes);
-    items.push_back({ItemType::SyncPoint, this, nullptr, nullptr, 0, 0, 0, nullptr});
+    Item* item = TakeNode(*manager);
+    if (item == nullptr) return Latch(SequenceNoNodes);
+    item->type = ItemType::SyncPoint;
+    item->sequence = this;
+    Append(item);
     Advance();
     return 0;
 }
@@ -530,11 +632,16 @@ int Sequence::Wait() {
 int Sequence::WaitAndClose(std::uint32_t index) {
     std::unique_lock guard(manager->lock);
     const int result = WaitLocked(guard);
-    const auto remaining = static_cast<std::uint32_t>(std::count_if(items.begin(), items.end(), [](const Item& item) { return item.type != ItemType::Wait; }));
-    ReturnNodes(*manager, remaining + 1);
-    items.clear();
+    while (first != nullptr) {
+        Item* item = first;
+        first = item->next;
+        if (item->type != ItemType::Wait) ReturnNode(*manager, item);
+    }
+    ReturnNode(*manager, reserved);
+    reserved = nullptr;
+    last = nullptr;
     commandUsed = 0;
-    cursor = 0;
+    cursor = nullptr;
     outstanding = 0;
     open = false;
     (compute ? manager->freeComputeSequences : manager->freeSequences) |= std::uint32_t{1} << index;
@@ -551,9 +658,14 @@ int Sequence::WaitLocked(std::unique_lock<std::mutex>& guard) {
     }
     ++manager->blockedWaiters;
     bool done = false;
-    items.push_back({ItemType::Wait, this, nullptr, nullptr, 0, 0, 0, &done});
+    Item waiter{};
+    waiter.type = ItemType::Wait;
+    waiter.sequence = this;
+    waiter.passed = &done;
+    Append(&waiter);
     Advance();
     passed.wait(guard, [&done] { return done; });
+    RemoveWait(&waiter);
     --manager->blockedWaiters;
     manager->quiesced.notify_all();
     return result;
@@ -572,7 +684,7 @@ int CreateIn(Manager* manager, TSequences& sequences, std::uint32_t& free, std::
     if (free == 0) return SequenceNoneFree;
     const int index = std::countr_zero(free);
     free &= ~(std::uint32_t{1} << index);
-    Sequence& sequence = sequences[static_cast<std::size_t>(index)];
+    Sequence& sequence = sequences[static_cast<std::size_t>(index)].value;
     if (!sequence.Open(manager, limits, priority)) return SequenceNoNodes;
     *out = &sequence;
     return 0;
@@ -585,10 +697,10 @@ int DestroyIn(Manager* manager, TSequences& sequences, const std::uint32_t& free
     {
         const std::lock_guard guard(manager->lock);
         for (; index < sequences.size(); ++index) {
-            if (&sequences[index] == sequence) break;
+            if (&sequences[index].value == sequence) break;
         }
         if (index == sequences.size() || (free & (std::uint32_t{1} << index)) != 0) return SequenceInvalid;
-        found = &sequences[index];
+        found = &sequences[index].value;
     }
     static_cast<void>(found->WaitAndClose(index));
     return 0;
@@ -619,7 +731,7 @@ void* APS5_VABI ComputeHandlerEntry(void* argument) {
         if (count <= 0) continue;
         if (sceKernelGetEventFilter(&event) == UserEventFilter && sceKernelGetEventId(&event) == 0) return nullptr;
         const std::lock_guard guard(manager.lock);
-        for (Sequence& sequence : manager.computeSequences) sequence.CollectCompute();
+        for (SequenceSlot& slot : manager.computeSequences) slot.value.CollectCompute();
     }
 }
 
@@ -627,19 +739,19 @@ bool RunOne(Manager& manager, std::unique_lock<std::mutex>& guard) {
     Item* item = nullptr;
     for (const std::size_t queue : {std::size_t{1}, std::size_t{0}}) {
         auto& pending = manager.runQueues[queue];
-        if (pending.empty()) continue;
-        item = pending.front();
-        if (item->handedOut + 1 == item->count) pending.pop_front();
+        if (pending.first == nullptr) continue;
+        item = pending.first;
+        if (item->cpu.handedOut + 1 == item->cpu.count) pending.Pop();
         break;
     }
     if (item == nullptr) return false;
-    const std::uint32_t index = item->handedOut++;
-    const JobEntry entry = item->entry;
-    void* const argument = item->argument;
+    const std::uint32_t index = item->cpu.handedOut++;
+    const JobEntry entry = item->cpu.entry;
+    void* const argument = item->cpu.argument;
     guard.unlock();
     entry(argument, index);
     guard.lock();
-    if (++item->completed == item->count) item->sequence->DispatchCompleted(item->count);
+    if (++item->cpu.completed == item->cpu.count) item->sequence->DispatchCompleted(item->cpu.count);
     return true;
 }
 
@@ -670,6 +782,10 @@ void* APS5_VABI WorkerEntry(void* argument) {
 }
 
 struct WorkLayout {
+    std::uint64_t workers = 0;
+    std::uint64_t sequences = 0;
+    std::uint64_t stateEnd = 0;
+    std::uint64_t pool = 0;
     std::uint64_t commands = 0;
     std::uint64_t commandBytes = 0;
     std::uint64_t labels = 0;
@@ -679,9 +795,12 @@ struct WorkLayout {
 WorkLayout LayoutFor(std::uint64_t memory, std::uint64_t size, std::uint32_t workers, std::uint32_t sequences, std::uint32_t computeQueues) {
     WorkLayout layout;
     const std::uint64_t end = memory + size;
-    std::uint64_t address = AlignUp(memory + StateEnd, 8) + workers * ThreadRecordBytes;
+    layout.workers = AlignUp(memory + StateEnd, 8);
+    std::uint64_t address = layout.workers + workers * ThreadRecordBytes;
     for (const std::uint64_t bytes : {std::uint64_t{0x100}, std::uint64_t{0x80}, std::uint64_t{0x80}, std::uint64_t{0x80}}) address = AlignUp(address, 64) + bytes;
-    address = AlignUp(address, 64) + (sequences + computeQueues) * SequenceBytes;
+    layout.sequences = AlignUp(address, 64);
+    address = layout.sequences + (sequences + computeQueues) * SequenceBytes;
+    layout.stateEnd = address;
     if (computeQueues != 0) {
         layout.commandBytes = ComputeCommandBudget();
         layout.commands = AlignUp(address + ComputeContextBytes, 0x100);
@@ -689,6 +808,7 @@ WorkLayout LayoutFor(std::uint64_t memory, std::uint64_t size, std::uint32_t wor
         address = layout.labels + 8 * std::uint64_t{computeQueues};
     }
     address = AlignUp(address, 64);
+    layout.pool = address;
     if (address <= end) layout.nodes = static_cast<std::uint32_t>(((end - address) / NodeBytes) & 0xffff);
     return layout;
 }
@@ -720,7 +840,9 @@ void StartWorkers(Manager& manager, const ConfigParams& config, std::uint32_t wo
             affinity = remaining & (~remaining + 1);
             remaining &= remaining - 1;
         }
-        const std::string name = config.threadName != nullptr ? std::string(config.threadName).substr(0, 31) : "SceJobManagerWorker" + std::to_string(index);
+        std::array<char, 32> name{};
+        if (config.threadName != nullptr) std::snprintf(name.data(), name.size(), "%.31s", config.threadName);
+        else std::snprintf(name.data(), name.size(), "SceJobManagerWorker%u", index);
         const KernelSchedParam schedule{static_cast<int>(config.priority)};
         ThreadAttributes attributes;
         if (scePthreadAttrSetinheritsched(&attributes.value, 0) != 0 || scePthreadAttrSetschedparam(&attributes.value, &schedule) != 0 ||
@@ -728,9 +850,9 @@ void StartWorkers(Manager& manager, const ConfigParams& config, std::uint32_t wo
             throw std::runtime_error("libSceJobManager: a worker thread attribute was rejected");
         }
         Pthread thread = nullptr;
-        const int created = scePthreadCreate(&thread, &attributes.value, WorkerEntry, &manager, name.c_str());
+        const int created = scePthreadCreate(&thread, &attributes.value, WorkerEntry, &manager, name.data());
         if (created != 0) throw std::runtime_error("libSceJobManager: scePthreadCreate failed for a worker");
-        manager.workers.push_back(thread);
+        manager.workers[manager.activeWorkers++].thread = thread;
     }
 }
 
@@ -739,13 +861,15 @@ void StartCompute(Manager& manager, const WorkLayout& layout, std::uint32_t comp
     for (std::uint64_t mask = computeQueueMask; mask != 0; mask &= mask - 1) {
         const std::uint32_t queue = FirstComputeQueue + static_cast<std::uint32_t>(std::countr_zero(mask));
         if (sceAgcDriverAddEqEvent(manager.computeEvents, static_cast<int>(queue), nullptr) != 0) throw std::runtime_error("libSceJobManager: sceAgcDriverAddEqEvent failed");
-        manager.computeQueues.push_back(queue);
+        manager.computeQueues |= std::uint64_t{1} << (queue - FirstComputeQueue);
     }
-    manager.computeSequences.resize(computeSequences);
+    std::uint64_t availableQueues = computeQueueMask;
     for (std::uint32_t index = 0; index < computeSequences; ++index) {
-        manager.computeSequences[index].compute = true;
-        manager.computeSequences[index].queue = manager.computeQueues[index];
-        manager.computeSequences[index].SetComputeStorage(reinterpret_cast<std::uint32_t*>(layout.commands + index * layout.commandBytes),
+        Sequence& sequence = manager.computeSequences[index].value;
+        sequence.compute = true;
+        sequence.queue = FirstComputeQueue + static_cast<std::uint32_t>(std::countr_zero(availableQueues));
+        availableQueues &= availableQueues - 1;
+        sequence.SetComputeStorage(reinterpret_cast<std::uint32_t*>(layout.commands + index * layout.commandBytes),
             static_cast<std::size_t>(layout.commandBytes / 4), reinterpret_cast<Label*>(layout.labels + index * sizeof(Label)));
     }
     manager.freeComputeSequences = computeSequences == MaxSequences ? ~std::uint32_t{0} : (std::uint32_t{1} << computeSequences) - 1;
@@ -765,9 +889,9 @@ void StopManager(Manager& manager) {
         manager.running = false;
         manager.work.notify_all();
     }
-    while (!manager.workers.empty()) {
-        if (scePthreadJoin(manager.workers.back(), nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
-        manager.workers.pop_back();
+    while (manager.activeWorkers != 0) {
+        if (scePthreadJoin(manager.workers[manager.activeWorkers - 1].thread, nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
+        manager.workers[--manager.activeWorkers].thread = nullptr;
     }
     if (manager.computeHandler != nullptr) {
         if (sceKernelAddUserEventEdge(manager.computeEvents, 0) != 0 || sceKernelTriggerUserEvent(manager.computeEvents, 0, nullptr) != 0) {
@@ -777,15 +901,25 @@ void StopManager(Manager& manager) {
         manager.computeHandler = nullptr;
     }
     if (manager.computeEvents != 0) {
-        for (const std::uint32_t queue : manager.computeQueues) static_cast<void>(sceAgcDriverDeleteEqEvent(manager.computeEvents, static_cast<int>(queue)));
+        for (std::uint64_t mask = manager.computeQueues; mask != 0; mask &= mask - 1) {
+            const auto queue = FirstComputeQueue + static_cast<std::uint32_t>(std::countr_zero(mask));
+            static_cast<void>(sceAgcDriverDeleteEqEvent(manager.computeEvents, static_cast<int>(queue)));
+        }
         if (sceKernelDeleteEqueue(manager.computeEvents) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: sceKernelDeleteEqueue failed");
         manager.computeEvents = 0;
-        manager.computeQueues.clear();
+        manager.computeQueues = 0;
     }
     std::unique_lock guard(manager.lock);
-    for (Sequence& sequence : manager.sequences) sequence.CancelWaits();
-    for (Sequence& sequence : manager.computeSequences) sequence.CancelWaits();
+    for (SequenceSlot& slot : manager.sequences) slot.value.CancelWaits();
+    for (SequenceSlot& slot : manager.computeSequences) slot.value.CancelWaits();
     manager.quiesced.wait(guard, [&manager] { return manager.blockedWaiters == 0; });
+}
+
+void DestroyManager(Manager* manager) {
+    const GuestArena::HostWrite memory(manager->stateBegin, manager->stateBytes);
+    for (SequenceSlot& slot : manager->sequences) std::destroy_at(&slot);
+    for (SequenceSlot& slot : manager->computeSequences) std::destroy_at(&slot);
+    std::destroy_at(manager);
 }
 
 int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t workers, std::uint32_t sequences, std::uint32_t computeSequences, std::uint64_t computeQueueMask, const ConfigParams* config, bool unified) {
@@ -817,16 +951,31 @@ int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t worke
     const std::uint32_t handlerPriority = ownHandlerSettings ? settings.computePriority : 0x100;
     const std::uint32_t handlerAffinity = ownHandlerSettings ? settings.computeAffinity : 0x1fff;
     if (computeSequences != 0 && (handlerPriority < 0x100 || handlerPriority > 0x2ff || handlerAffinity == 0 || handlerAffinity > 0x1fff)) return ManagerInvalidArgument;
-    auto owner = std::make_unique<Manager>();
-    Manager* manager = owner.get();
+    const GuestArena::HostWrite stateMemory(memory, static_cast<std::size_t>(layout.stateEnd - base));
+    const GuestArena::HostWrite nodeMemory(reinterpret_cast<void*>(layout.pool), layout.nodes * sizeof(Item));
+    Manager* manager = std::construct_at(reinterpret_cast<Manager*>(base + StateOffset));
+    manager->stateBegin = memory;
+    manager->stateBytes = static_cast<std::size_t>(layout.stateEnd - base);
+    manager->nodes = {reinterpret_cast<Item*>(layout.pool), layout.nodes};
+    std::unique_ptr<Manager, decltype(&DestroyManager)> owner(manager, DestroyManager);
     manager->running = true;
     manager->workerCount = workers;
     manager->spinTicks = sceKernelGetTscFrequency() / 1000000 * settings.spinMicroseconds;
-    manager->freeNodes = layout.nodes - 1;
+    for (std::uint32_t index = 0; index < layout.nodes; ++index) std::construct_at(&manager->nodes[index]);
+    for (std::uint32_t index = layout.nodes; index > 1; --index) ReturnNode(*manager, &manager->nodes[index - 1]);
     manager->freeSequences = sequences == MaxSequences ? ~std::uint32_t{0} : (std::uint32_t{1} << sequences) - 1;
-    manager->sequences = std::vector<Sequence>(sequences);
-    manager->workers.reserve(workers);
-    manager->computeQueues.reserve(computeQueues);
+    manager->workers = {reinterpret_cast<WorkerSlot*>(layout.workers), workers};
+    for (WorkerSlot& worker : manager->workers) std::construct_at(&worker);
+    auto* cpuSlots = reinterpret_cast<SequenceSlot*>(layout.sequences);
+    auto* computeSlots = cpuSlots + sequences;
+    for (std::uint32_t index = 0; index < sequences; ++index) {
+        std::construct_at(cpuSlots + index);
+        manager->sequences = {cpuSlots, index + 1};
+    }
+    for (std::uint32_t index = 0; index < computeSequences; ++index) {
+        std::construct_at(computeSlots + index);
+        manager->computeSequences = {computeSlots, index + 1};
+    }
     for (std::uint32_t priority = 0; priority < 2; ++priority) {
         manager->factories[priority].manager = manager;
         manager->factories[priority].priority = priority;
@@ -924,7 +1073,8 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
     if (currentWorker == manager) throw std::runtime_error("sce::Job::JobManager::shutdown: a worker cannot join itself");
     {
         const std::lock_guard guard(manager->lock);
-        for (const Sequence& sequence : manager->computeSequences) {
+        for (const SequenceSlot& slot : manager->computeSequences) {
+            const Sequence& sequence = slot.value;
             if (sequence.open && sequence.Busy()) throw std::runtime_error("sce::Job::JobManager::shutdown: a compute sequence still has work in flight");
         }
         manager->running = false;
@@ -932,7 +1082,7 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
     StopManager(*manager);
     static_cast<void>(_sceUlobjmgrUnregisterObject_nid_postfix(manager->objectId));
     Implementation(self) = nullptr;
-    delete manager;
+    DestroyManager(manager);
     return 0;
 }
 
