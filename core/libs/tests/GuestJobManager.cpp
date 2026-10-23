@@ -753,31 +753,51 @@ static void ShutdownActiveCase(bool wait, bool queue, bool destroy, std::uint32_
     }
 }
 
-int RunJobManagerCase(const char* caseName) {
-    const std::string name = caseName;
-    if (name == "memory") MemoryCase();
-    else if (name == "validation") ValidationCase();
-    else if (name == "dispatch") DispatchCase();
-    else if (name == "ordering") OrderingCase();
-    else if (name == "limits") LimitsCase();
-    else if (name == "nested") NestedCase();
-    else if (name == "priority") PriorityCase();
-    else if (name == "shutdown") ShutdownCase();
-    else if (name == "shutdown_running") ShutdownActiveCase(false, false, false);
-    else if (name == "shutdown_waiter") ShutdownActiveCase(true, false, false);
-    else if (name == "shutdown_queued") ShutdownActiveCase(true, true, false);
-    else if (name == "shutdown_destroy") ShutdownActiveCase(true, true, true);
-    else if (name == "shutdown_partial") ShutdownActiveCase(true, false, false, 4);
-    else if (name == "shutdown_running") ShutdownActiveCase(false, false, false);
-    else if (name == "shutdown_waiter") ShutdownActiveCase(true, false, false);
-    else if (name == "shutdown_queued") ShutdownActiveCase(true, true, false);
-    else if (name == "shutdown_destroy") ShutdownActiveCase(true, true, true);
-    else if (name == "shutdown_partial") ShutdownActiveCase(true, false, false, 4);
-    else return 2;
-    return 0;
+struct ShutdownCrossWait {
+    Sequence* sequence;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> returned{false};
+};
+
+static void APS5_VABI ShutdownWaitOther(void* argument, std::uint32_t) {
+    auto& state = *static_cast<ShutdownCrossWait*>(argument);
+    state.entered = true;
+    Require(state.sequence->Wait() == 0);
+    state.returned = true;
 }
 
-#ifndef ANYPS5_JOB_MANAGER_REFERENCE
+static void ShutdownCrossWaitCase() {
+    Block block(SizeFor(2, 2, 4, 2, 2));
+    ManagerObject manager;
+    Require(Initialize(manager.storage, block.memory, block.bytes, 2, 2, nullptr) == 0);
+    auto* factory = Factories(manager.storage, 0);
+    Sequence* producer = nullptr;
+    Sequence* consumer = nullptr;
+    Require(factory->Create(&producer, 1, 1, 1, 1, nullptr) == 0);
+    Require(factory->Create(&consumer, 1, 1, 1, 1, nullptr) == 0);
+    Order order;
+    Require(producer->Dispatch(ShutdownGateJob, &order, 1, nullptr) == 0);
+    while (!order.started) std::this_thread::yield();
+    ShutdownCrossWait state{producer};
+    Require(consumer->Dispatch(ShutdownWaitOther, &state, 1, nullptr) == 0);
+    while (!state.entered) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Require(!state.returned);
+    std::atomic<bool> stopping{false};
+    std::atomic<bool> stopped{false};
+    std::thread shutdown([&] {
+        stopping = true;
+        Require(Shutdown(manager.storage) == 0);
+        stopped = true;
+    });
+    while (!stopping) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Require(!stopped);
+    order.release = true;
+    shutdown.join();
+    Require(state.returned && stopped && order.next == 1);
+}
+
 int RunJobManagerCase(const char* caseName) {
     const std::string name = caseName;
     if (name == "memory") MemoryCase();
@@ -798,6 +818,7 @@ int RunJobManagerCase(const char* caseName) {
     else if (name == "shutdown_queued") ShutdownActiveCase(true, true, false);
     else if (name == "shutdown_destroy") ShutdownActiveCase(true, true, true);
     else if (name == "shutdown_partial") ShutdownActiveCase(true, false, false, 4);
+    else if (name == "shutdown_cross_wait") ShutdownCrossWaitCase();
     else return 2;
     return 0;
 }
