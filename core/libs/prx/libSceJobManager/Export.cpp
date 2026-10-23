@@ -121,7 +121,7 @@ std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-std::uint64_t ComputeCommandBytes() {
+std::uint64_t ComputeCommandBudget() {
     std::array<std::uint32_t, 256> words{};
     CommandBuffer buffer{words.data(), words.data() + words.size(), words.data(), words.data() + words.size(), nullptr, nullptr, 0};
     const ShaderRegister shaderRegister{};
@@ -667,7 +667,7 @@ WorkLayout LayoutFor(std::uint64_t memory, std::uint64_t size, std::uint32_t wor
     for (const std::uint64_t bytes : {std::uint64_t{0x100}, std::uint64_t{0x80}, std::uint64_t{0x80}, std::uint64_t{0x80}}) address = AlignUp(address, 64) + bytes;
     address = AlignUp(address, 64) + (sequences + computeQueues) * SequenceBytes;
     if (computeQueues != 0) {
-        layout.commandBytes = ComputeCommandBytes();
+        layout.commandBytes = ComputeCommandBudget();
         layout.commands = AlignUp(address + ComputeContextBytes, 0x100);
         layout.labels = AlignUp(layout.commands + layout.commandBytes * computeQueues + 4 * std::uint64_t{computeQueues}, 8);
         address = layout.labels + 8 * std::uint64_t{computeQueues};
@@ -834,7 +834,7 @@ std::uint64_t APS5_VABI _ZN3sce3Job10JobManager27calculateRequiredMemorySizeEPKN
     if (computeSequences != 0) {
         const auto queues = static_cast<std::uint64_t>(std::popcount(params->computeQueueMask));
         bytes = (bytes + (params->sequences + queues) * SequenceBytes + 0x267) & ~std::uint64_t{0xff};
-        bytes = (bytes + ComputeCommandBytes() * queues + 3) & ~std::uint64_t{3};
+        bytes = (bytes + ComputeCommandBudget() * queues + 3) & ~std::uint64_t{3};
         bytes = (bytes + 4 * queues + 7) & ~std::uint64_t{7};
         bytes += 8 * queues;
     } else {
