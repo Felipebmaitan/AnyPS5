@@ -4,6 +4,13 @@ target_link_libraries(libSceJobManager PRIVATE libSceAgc libSceAgcDriver libSceR
 configure_windows_unwind(libSceJobManager)
 
 if(BUILD_TESTING)
+    add_test(NAME guest_job_manager_compute_capacity COMMAND agc_driver_job_manager_compute_tests barrier_capacity_overflow)
+    set_tests_properties(guest_job_manager_compute_capacity PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 20 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(guest_job_manager_compute_capacity PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_job_manager_profiler_tests ${LIBS_INCLUDE_DIR}/tests/JobManagerProfiler.cpp Export.cpp)
     target_include_directories(guest_job_manager_profiler_tests PRIVATE ${LIBS_INCLUDE_DIR}
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
