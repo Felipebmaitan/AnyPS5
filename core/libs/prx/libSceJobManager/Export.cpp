@@ -183,6 +183,7 @@ struct Item {
     };
     const char* name = nullptr;
     ItemType type;
+    bool encoded = false;
 };
 
 static_assert(sizeof(Item) == NodeBytes);
@@ -263,6 +264,8 @@ private:
     void Append(Item* item);
     void RemoveWait(Item* item);
     void SubmitCompute(const Item& item);
+    void SubmitComputeAhead(Item* item);
+    void RetireCompute();
     void FlushCompute();
     void Profile(std::uint16_t event);
 
@@ -280,6 +283,8 @@ private:
     Label* label = nullptr;
     JobManager::ComputeProgress progress;
     std::uint32_t pendingCompute = 0;
+    std::uint32_t activeCompute = 0;
+    std::uint32_t availableCompute = 0;
     bool batchStarted = false;
     bool profileActive = false;
     bool profileCpu = false;
@@ -400,6 +405,8 @@ bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueu
     last = nullptr;
     commandUsed = 0;
     batchStarted = false;
+    activeCompute = 0;
+    availableCompute = 0;
     profileActive = false;
     profileCpu = false;
     profileGpuBarrier = false;
@@ -463,12 +470,20 @@ void Sequence::Advance() {
             profileActive = true;
             profileGpuBarrier = false;
             ++outstanding;
+            ++activeCompute;
             cursor = item.next;
-            SubmitCompute(item);
+            if (!item.encoded) {
+                SubmitCompute(item);
+                item.encoded = true;
+            }
+            RetireCompute();
             continue;
         }
         FlushCompute();
-        if (outstanding != 0) return;
+        if (outstanding != 0) {
+            if (item.type == ItemType::SyncPoint && !profileCpu && manager->running) SubmitComputeAhead(item.next);
+            return;
+        }
         if (item.type == ItemType::SyncPoint) {
             if (profileCpu) {
                 Profile(4);
@@ -586,6 +601,21 @@ void Sequence::SetComputeStorage(std::uint32_t* commands, std::size_t words, Lab
     label->value = 0;
 }
 
+void Sequence::SubmitComputeAhead(Item* item) {
+    while (item != nullptr) {
+        if (item->type == ItemType::Compute || item->type == ItemType::ComputeIndirect) {
+            if (!item->encoded) {
+                SubmitCompute(*item);
+                item->encoded = true;
+            }
+        } else {
+            FlushCompute();
+            if (item->type != ItemType::SyncPoint) return;
+        }
+        item = item->next;
+    }
+}
+
 void Sequence::FlushCompute() {
     if (pendingCompute == 0) return;
     if (commandWords - commandUsed < 8) throw std::runtime_error("libSceJobManager: a compute completion did not fit its command buffer");
@@ -603,11 +633,19 @@ void Sequence::FlushCompute() {
     if (sceAgcDriverSubmitAcb(queue, &packet) != 0) throw std::runtime_error("libSceJobManager: sceAgcDriverSubmitAcb failed for a completion");
 }
 
+void Sequence::RetireCompute() {
+    const auto finished = std::min(activeCompute, availableCompute);
+    activeCompute -= finished;
+    availableCompute -= finished;
+    completed.dispatches += finished;
+    outstanding -= finished;
+}
+
 void Sequence::CollectCompute() {
     const auto finished = progress.Collect(label->value);
     if (finished == 0) return;
-    completed.dispatches += finished;
-    outstanding -= finished;
+    availableCompute += finished;
+    RetireCompute();
     if (outstanding == 0) Advance();
 }
 
