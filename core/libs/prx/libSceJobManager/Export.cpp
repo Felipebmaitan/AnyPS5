@@ -24,7 +24,6 @@ int APS5_VABI scePthreadAttrSetstacksize(PthreadAttr* attr, std::size_t stackSiz
 int APS5_VABI scePthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask);
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
 int APS5_VABI scePthreadJoin(Pthread thread, void** result);
-std::uint64_t APS5_VABI sceKernelReadTsc();
 std::uint64_t APS5_VABI sceKernelGetTscFrequency();
 int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
 int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
@@ -232,7 +231,7 @@ struct Manager {
     std::uint32_t workerCount = 0;
     std::uint32_t sleepingWorkers = 0;
     std::uint32_t wakeTokens = 0;
-    std::uint64_t outstandingInvocations = 0;
+    std::uint64_t pendingInvocations = 0;
     std::uint64_t spinTicks = 0;
     std::array<std::deque<Item*>, 2> runQueues;
     std::vector<Sequence> sequences;
@@ -301,6 +300,7 @@ void Sequence::Advance() {
             ++outstanding;
             ++cursor;
             manager->runQueues[priority].push_back(&item);
+            manager->pendingInvocations -= item.count;
             WakeWorkers(*manager, item.count);
             continue;
         }
@@ -336,7 +336,6 @@ void Sequence::Advance() {
 }
 
 void Sequence::DispatchCompleted(std::uint32_t invocations) {
-    manager->outstandingInvocations -= invocations;
     completed.invocations += invocations;
     ++completed.dispatches;
     --outstanding;
@@ -355,7 +354,7 @@ int Sequence::Dispatch(JobEntry entry, void* argument, std::uint32_t count, cons
     if (before.invocations + count > limits.invocations || before.dispatches >= limits.dispatches) return Latch(SequenceLimitExceeded);
     if (!TakeNode(*manager)) return Latch(SequenceNoNodes);
     items.push_back({ItemType::Dispatch, this, entry, argument, count, 0, 0, nullptr});
-    manager->outstandingInvocations += count;
+    manager->pendingInvocations += count;
     Advance();
     return 0;
 }
@@ -570,14 +569,14 @@ bool RunOne(Manager& manager, std::unique_lock<std::mutex>& guard) {
 void* APS5_VABI WorkerEntry(void* argument) {
     Manager& manager = *static_cast<Manager*>(argument);
     currentWorker = &manager;
-    std::uint64_t lastWork = sceKernelReadTsc();
+    std::uint64_t lastWork = __rdtsc();
     std::unique_lock guard(manager.lock);
     while (manager.running) {
         if (RunOne(manager, guard)) {
-            lastWork = sceKernelReadTsc();
+            lastWork = __rdtsc();
             continue;
         }
-        const bool spinning = manager.outstandingInvocations != 0 && sceKernelReadTsc() - lastWork < manager.spinTicks;
+        const bool spinning = manager.pendingInvocations != 0 && __rdtsc() - lastWork < manager.spinTicks;
         if (spinning || manager.sleepingWorkers >= manager.workerCount - manager.persistentThreads) {
             guard.unlock();
             _mm_pause();
