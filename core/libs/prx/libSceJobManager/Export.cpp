@@ -248,7 +248,6 @@ public:
     void CollectCompute();
     void SetComputeStorage(std::uint32_t* commands, std::size_t words, Label* completion);
     void CancelWaits();
-    bool Busy() const { return outstanding != 0; }
 
     Manager* manager = nullptr;
     bool open = false;
@@ -1168,10 +1167,6 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
     if (currentWorker == manager) throw std::runtime_error("sce::Job::JobManager::shutdown: a worker cannot join itself");
     {
         const std::lock_guard guard(manager->lock);
-        for (const SequenceSlot& slot : manager->computeSequences) {
-            const Sequence& sequence = slot.value;
-            if (sequence.open && sequence.Busy()) throw std::runtime_error("sce::Job::JobManager::shutdown: a compute sequence still has work in flight");
-        }
         manager->running = false;
     }
     StopManager(*manager);

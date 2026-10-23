@@ -74,6 +74,7 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void*);
 SequenceFactory* APS5_VABI _ZN3sce3Job10JobManager34getUnifiedSequenceFactoryInterfaceENS1_8PriorityE(void*, std::uint32_t);
 std::uint32_t* APS5_VABI sceAgcAcbWaitRegMem(CommandBuffer*, std::uint8_t, std::uint8_t, std::uint8_t, const volatile void*, std::uint64_t, std::uint64_t, std::uint32_t);
 int APS5_VABI sceAgcDriverSubmitAcb(std::uint32_t, const Packet*);
+std::uint32_t* APS5_VABI sceAgcCbReleaseMem(CommandBuffer*, std::uint8_t, std::uint16_t, std::uint8_t, std::uint8_t, const volatile Label*, std::uint8_t, std::uint64_t, std::uint16_t, std::uint16_t, std::uint8_t, std::uint32_t);
 }
 
 #define Construct _ZN3sce3Job10JobManagerC1Ev
@@ -454,6 +455,88 @@ void GpuBarriersCase() {
     }
 }
 
+void ComputeShutdownCase() {
+    for (const std::uint32_t mode : {0u, 1u, 2u}) {
+        const bool waiting = mode == 1;
+        const bool queuedCpu = mode == 2;
+        const auto size = SizeFor(1, 2, true);
+        const auto allocationSize = (size + 255) & ~std::uint64_t{255};
+        auto* memory = static_cast<std::uint8_t*>(::operator new(allocationSize, std::align_val_t{256}));
+        std::memset(memory, 0, size);
+        std::memset(memory + size, 0xa5, allocationSize - size);
+        alignas(64) unsigned char manager[0x100]{};
+        Construct(manager);
+        Require(Initialize(manager, memory, size, 2, 1, 1, 2, nullptr) == 0, "compute shutdown initialization failed");
+        auto* factory = Factories(manager, 0);
+        Sequence* sequence = nullptr;
+        Require(factory->CreateCompute(&sequence, 1, 4, 2, 2, nullptr) == 0, "compute shutdown sequence creation failed");
+        auto registers = Registers;
+        auto shader = Shader;
+        alignas(16) const std::array<std::uint32_t, 4> descriptor{Low(Output + 1), High(Output + 1) & 0xffffu, sizeof(Output[1]), 0x31016facu};
+        registers[7].value = Low(descriptor.data());
+        registers[8].value = High(descriptor.data());
+        const ShaderRegister* registerPointer = registers.data();
+        std::memcpy(shader.data() + 0x20, &registerPointer, sizeof(registerPointer));
+        alignas(64) std::uint32_t gate = 0;
+        alignas(256) std::array<std::uint32_t, 32> commands{};
+        CommandBuffer buffer{commands.data(), commands.data() + commands.size(), commands.data(), commands.data() + commands.size(), nullptr, nullptr, 0};
+        Require(sceAgcAcbWaitRegMem(&buffer, 0, 3, 3, &gate, 1, 0xffffffffu, 0x190) != nullptr, "compute shutdown gate encoding failed");
+        const Packet packet{commands.data(), static_cast<std::uint32_t>(buffer.cursor_up - commands.data()), 0, {}};
+        Require(sceAgcDriverSubmitAcb(0x21, &packet) == 0, "compute shutdown gate submission failed");
+        Output[0] = 0;
+        Output[1] = 0;
+        SeenByJob = 0;
+        Value[0] = 0x5a170000u + mode;
+        Require(sequence->DispatchCompute(Shader.data(), Table.data(), 1, 1, 1, nullptr) == 0, "compute shutdown first dispatch failed");
+        Require(sequence->SyncPoint() == 0, "compute shutdown first sync failed");
+        if (queuedCpu) {
+            Require(sequence->Dispatch(ReadOutputJob, nullptr, 1, nullptr) == 0, "compute shutdown queued CPU dispatch failed");
+            Require(sequence->SyncPoint() == 0, "compute shutdown second sync failed");
+        }
+        Require(sequence->DispatchCompute(shader.data(), Table.data(), 1, 1, 1, nullptr) == 0, "compute shutdown second dispatch failed");
+        std::atomic<bool> waitingStarted{false};
+        std::atomic<bool> waitingReturned{false};
+        std::thread waiter;
+        if (waiting) {
+            waiter = std::thread([&] {
+                waitingStarted.store(true);
+                Require(sequence->Wait() == 0, "compute shutdown canceled wait failed");
+                waitingReturned.store(true);
+            });
+            while (!waitingStarted.load()) std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Require(!waitingReturned.load(), "compute shutdown wait passed the held GPU gate");
+        }
+        std::atomic<bool> stopped{false};
+        std::thread stopper([&] {
+            Require(Shutdown(manager) == 0, "compute shutdown failed");
+            stopped.store(true);
+        });
+        const auto stopDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!stopped.load() && std::chrono::steady_clock::now() < stopDeadline) std::this_thread::yield();
+        const bool stoppedBeforeGpu = stopped.load();
+        while (waiting && !waitingReturned.load() && std::chrono::steady_clock::now() < stopDeadline) std::this_thread::yield();
+        const bool waiterBeforeGpu = !waiting || waitingReturned.load();
+        std::atomic_ref<std::uint32_t>(gate).store(1);
+        stopper.join();
+        if (waiting) waiter.join();
+        alignas(256) Label fence{};
+        alignas(256) std::array<std::uint32_t, 32> tailWords{};
+        CommandBuffer tail{tailWords.data(), tailWords.data() + tailWords.size(), tailWords.data(), tailWords.data() + tailWords.size(), nullptr, nullptr, 0};
+        Require(sceAgcCbReleaseMem(&tail, 0x2f, 0x200, 1, 3, &fence, 1, 1, 0, 0, 0, 0) != nullptr, "compute shutdown tail fence encoding failed");
+        const Packet tailPacket{tailWords.data(), static_cast<std::uint32_t>(tail.cursor_up - tailWords.data()), 0, {}};
+        Require(sceAgcDriverSubmitAcb(0x21, &tailPacket) == 0, "compute shutdown tail fence submission failed");
+        const auto gpuDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (fence.value != 1 && std::chrono::steady_clock::now() < gpuDeadline) std::this_thread::yield();
+        Require(fence.value == 1, "submitted compute work did not survive manager shutdown");
+        Require(stoppedBeforeGpu && waiterBeforeGpu, "shutdown waited for GPU completion");
+        Require(Output[0] == Value[0] && Output[1] == (queuedCpu ? 0 : Value[0]), "shutdown changed submitted or deferred compute work");
+        Require(SeenByJob == 0, "shutdown published queued CPU work after GPU completion");
+        for (auto offset = size; offset < allocationSize; ++offset) Require(memory[offset] == 0xa5, "compute shutdown wrote past the caller work area");
+        ::operator delete(memory, std::align_val_t{256});
+    }
+}
+
 void StorageCase(bool directMemory) {
     constexpr std::uint64_t mask = (1u << 1) | (1u << 5) | (1u << 8);
     const MemorySizeQueryParams query{1, 2, 0, 0, 32, 8, 4, 2, mask};
@@ -530,7 +613,7 @@ void StorageCase(bool directMemory) {
 
 int RunJobManagerCase(const char* name) {
     try {
-        Require(std::strcmp(name, "compute") == 0 || std::strcmp(name, "size") == 0 || std::strcmp(name, "execution") == 0 || std::strcmp(name, "storage") == 0 || std::strcmp(name, "capacity") == 0 || std::strcmp(name, "deferred_inputs") == 0 || std::strcmp(name, "gpu_barriers") == 0, "unknown compute fixture");
+        Require(std::strcmp(name, "compute") == 0 || std::strcmp(name, "size") == 0 || std::strcmp(name, "execution") == 0 || std::strcmp(name, "storage") == 0 || std::strcmp(name, "capacity") == 0 || std::strcmp(name, "deferred_inputs") == 0 || std::strcmp(name, "gpu_barriers") == 0 || std::strcmp(name, "compute_shutdown") == 0, "unknown compute fixture");
 #ifndef ANYPS5_JOB_MANAGER_REFERENCE
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -545,6 +628,7 @@ int RunJobManagerCase(const char* name) {
             DeferredInputsCase(true);
         }
         if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "gpu_barriers") == 0) GpuBarriersCase();
+        if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "compute_shutdown") == 0) ComputeShutdownCase();
         if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "storage") == 0) {
             StorageCase(false);
             StorageCase(true);
