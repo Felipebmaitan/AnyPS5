@@ -53,15 +53,16 @@ if(BUILD_TESTING)
     target_include_directories(guest_job_manager_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_job_manager_tests PRIVATE libSceJobManager libSceAgc libSceAgcDriver libkernel libc)
     configure_windows_unwind(guest_job_manager_tests)
-    if(WIN32)
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_library(job_manager_reference SHARED EXCLUDE_FROM_ALL
             ${LIBS_INCLUDE_DIR}/tests/GuestJobManager.cpp
             ${LIBS_INCLUDE_DIR}/tests/JobManagerReference.cpp)
         target_include_directories(job_manager_reference PRIVATE ${LIBS_INCLUDE_DIR})
         target_compile_definitions(job_manager_reference PRIVATE ANYPS5_JOB_MANAGER_REFERENCE)
-        target_link_libraries(job_manager_reference PRIVATE libkernel libc)
+        target_link_libraries(job_manager_reference PRIVATE libkernel libc ${CMAKE_DL_LIBS})
         set_target_properties(job_manager_reference PROPERTIES PREFIX "" SUFFIX .prx
-            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
         configure_windows_unwind(job_manager_reference)
     endif()
     foreach(testCase IN ITEMS memory owned_state validation dispatch ordering nested limits node_pool priority shutdown worker_policy worker_wake worker_count worker_spin shutdown_running shutdown_waiter shutdown_queued shutdown_destroy shutdown_partial shutdown_cross_wait concurrent_wait)
