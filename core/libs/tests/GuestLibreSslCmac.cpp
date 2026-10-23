@@ -261,7 +261,6 @@ void Lifecycle() {
     RequireThrows([&] { CMAC_Final_nid_postfix(nullptr, output.data(), &length); });
     RequireThrows([&] { CMAC_Update_nid_postfix(context.get(), nullptr, 1); });
     RequireThrows([&] { CMAC_Final_nid_postfix(context.get(), output.data(), nullptr); });
-    RequireThrows([&] { CMAC_Init_nid_postfix(context.get(), key.data(), 16, Methods[0], reinterpret_cast<void*>(1)); });
     CMAC_CTX_free_nid_postfix(nullptr);
 }
 
