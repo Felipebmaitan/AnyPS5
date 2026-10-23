@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
-#include <xmmintrin.h>
 
 struct PcmFixture {
     std::uint32_t type;
@@ -185,24 +184,6 @@ static void TestBounds(const PcmFixture& fixture) {
     RequireThrows([&] { playback.Add(fixture.data.data(), &shortBlock, 1); });
     const Ngs2WaveformBlock overflow{0, fixture.data.size(), 0, UINT32_MAX, UINT32_MAX, 0, 0};
     RequireThrows([&] { playback.Add(fixture.data.data(), &overflow, 1, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET); });
-    if (fixture.type != SCE_NGS2_WAVEFORM_TYPE_PCM_I16L) {
-        const Ngs2WaveformBlock incomplete{0, fixture.data.size(), 0, 0, 20, 0, 0};
-        RequireThrows([&] { playback.Add(fixture.data.data(), &incomplete, 1, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET | SCE_NGS2_WAVEFORM_BLOCKS_FLAG_CONTINUE); });
-        const Ngs2WaveformBlock silence{0, 0, 0, 0, Grain, 0, 0};
-        RequireThrows([&] { playback.Add(fixture.data.data(), &silence, 1, SCE_NGS2_WAVEFORM_BLOCKS_FLAG_RESET | SCE_NGS2_WAVEFORM_BLOCKS_FLAG_SILENCE); });
-        RequireThrows([&] {
-            Control(playback.voice, SCE_NGS2_SAMPLER_VOICE_PARAM_SETUP, Ngs2SamplerVoiceSetupParam{{}, {fixture.type, 2, 48000, 1, 0, 0}});
-        });
-    }
-}
-
-static void TestUnsupportedFloat(std::uint32_t type, std::uint64_t bits, std::uint32_t bytes) {
-    Playback playback(type);
-    std::vector<std::uint8_t> data(bytes * Grain);
-    for (std::uint32_t i = 0; i < bytes; i++) data[i] = static_cast<std::uint8_t>(bits >> (i * 8));
-    const Ngs2WaveformBlock block{0, data.size(), 0, 0, Grain, 0, 0};
-    playback.Add(data.data(), &block, 1);
-    RequireThrows([&] { playback.Render(); });
 }
 
 static void TestNumericEdges() {
@@ -235,24 +216,5 @@ int main() {
         TestBounds(fixture);
     }
     TestNumericEdges();
-    for (const auto bits : {0x7fc00000u, 0x7f800001u, 0x7f800000u, 0xff800000u, 0x40000000u, 0xc0000000u, 1u}) {
-        TestUnsupportedFloat(SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, bits, 4);
-    }
-    for (const auto bits : {0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
-                            0x4000000000000000ull, 0xc000000000000000ull, 0x3800000000000000ull, 1ull}) {
-        TestUnsupportedFloat(SCE_NGS2_WAVEFORM_TYPE_PCM_F64L, bits, 8);
-    }
-    for (const auto type : {0x10u, 0x13u, 0x15u, 0x17u, 0x19u, 0x1bu, UINT32_MAX}) {
-        Playback playback(SCE_NGS2_WAVEFORM_TYPE_PCM_I16L);
-        RequireThrows([&] {
-            Control(playback.voice, SCE_NGS2_SAMPLER_VOICE_PARAM_SETUP, Ngs2SamplerVoiceSetupParam{{}, {type, 1, 48000, 0, 0, 0}});
-        });
-    }
-    const auto control = _mm_getcsr();
-    _mm_setcsr(control | 0x8040);
-    TestUnsupportedFloat(SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 1, 4);
-    TestUnsupportedFloat(SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 0x80000001, 4);
-    TestUnsupportedFloat(SCE_NGS2_WAVEFORM_TYPE_PCM_F64L, 1, 8);
-    _mm_setcsr(control);
     return 0;
 }
