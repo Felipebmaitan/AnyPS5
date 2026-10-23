@@ -35,6 +35,7 @@ alignas(64) std::array<std::uint8_t, 0x100> manager{};
 std::uint32_t registrationCalls = 0;
 std::uint32_t unregistrationCalls = 0;
 std::uint32_t assignedId = 0;
+bool writeId = true;
 int registrationResult = 0;
 std::atomic<std::uint32_t> jobs{0};
 
@@ -60,12 +61,12 @@ int APS5_VABI _sceUlobjmgrRegisterObject_nid_postfix(std::uint64_t object, std::
     Require(workArea[0] == 0x4a && workArea[1] == 0x4d);
     Require(_ZN3sce3Job10JobManager27getSequenceFactoryInterfaceENS1_8PriorityE(manager.data(), 0) != nullptr);
     ++registrationCalls;
-    *id = assignedId;
+    if (writeId) *id = assignedId;
     return registrationResult;
 }
 
 int APS5_VABI _sceUlobjmgrUnregisterObject_nid_postfix(std::uint32_t id) {
-    Require(id == assignedId);
+    Require(id == (writeId ? assignedId : 0));
     Require(_ZN3sce3Job10JobManager27getSequenceFactoryInterfaceENS1_8PriorityE(manager.data(), 0) != nullptr);
     ++unregistrationCalls;
     return 37;
@@ -75,13 +76,14 @@ int APS5_VABI _sceUlobjmgrUnregisterObject_nid_postfix(std::uint32_t id) {
 
 int main() {
     for (const bool unified : {false, true}) {
-        for (const int result : {0, 22, static_cast<int>(0x8002000cu)}) {
+        for (const auto [result, assignsId] : std::array<std::pair<int, bool>, 5>{{{0, true}, {22, true}, {static_cast<int>(0x8002000cu), true}, {22, false}, {static_cast<int>(0x8002000cu), false}}}) {
             for (const bool destructor : {false, true}) {
                 _ZN3sce3Job10JobManagerC1Ev(manager.data());
                 const auto before = registrationCalls;
                 Require(Initialize(unified, nullptr) == static_cast<int>(0x81581001u));
                 Require(registrationCalls == before);
                 registrationResult = result;
+                writeId = assignsId;
                 assignedId = 101 + before;
                 Require(Initialize(unified, workArea.data()) == result);
                 Require(registrationCalls == before + 1 && unregistrationCalls == before);
