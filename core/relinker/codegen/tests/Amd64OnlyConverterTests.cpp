@@ -21,6 +21,7 @@
 #include <elfpatcher/general/SegmentFilter.hpp>
 #include <elfpatcher/linux/LinuxElfPatcher.hpp>
 #include <io/ByteWriter.hpp>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -1811,7 +1812,13 @@ void sha1Execution() {
                 else
                     require(run.Xmm[reg][0] == xmmIn[reg][0] && run.Xmm[reg][1] == xmmIn[reg][1], "SHA-1 stub clobbered an xmm register");
             }
-            require(run.Rax == rax && run.Rcx == 0x1122334455667788ull && (run.Flags & 0x8D5) == (0x8D7 & 0x8D5), "SHA-1 stub changed a general register or RFLAGS");
+            if (run.Rax != rax || run.Rcx != 0x1122334455667788ull || (run.Flags & 0x8D5) != (0x8D7 & 0x8D5)) {
+                std::cerr << "SHA-1 sample=" << sample << " site=" << std::hex;
+                for (const auto byte : site)
+                    std::cerr << static_cast<unsigned>(byte) << ' ';
+                std::cerr << "rax=" << run.Rax << " expected=" << rax << " rcx=" << run.Rcx << " flags=" << run.Flags << std::dec << '\n';
+                throw std::runtime_error("SHA-1 stub changed a general register or RFLAGS");
+            }
         }
     }
 }
@@ -1952,6 +1959,40 @@ void mcommitExecution() {
     }
     munmap(code, 4096);
 }
+
+void wideStoreExecution() {
+    const auto matcher = Codegen::MakeAmd64OnlyInstructionMatcher(Codegen::Amd64OnlyTarget::Rosetta);
+    const Bytes site = {0xC5, 0xFC, 0x11, 0x00};
+    const auto match = matcher->Match(site.data(), site.size());
+    require(match && match->Lowering == Codegen::Amd64OnlyLowering::Trampoline, "256-bit store stub was not produced");
+    auto body = match->StubBody;
+    body[match->ReturnBranchOffset] = 0xC3;
+    void* code = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(code != MAP_FAILED, "cannot map executable memory for the stub");
+    std::memcpy(code, body.data(), body.size());
+    alignas(32) std::uint8_t source[32];
+    for (std::size_t index = 0; index < sizeof(source); ++index) source[index] = static_cast<std::uint8_t>(index + 1);
+    auto* pages = static_cast<std::uint8_t*>(mmap(nullptr, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    require(pages != MAP_FAILED, "cannot map the destination pages");
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{1}, std::size_t{4080}}) {
+        std::memset(pages, 0, 8192);
+        auto* destination = pages + offset;
+        asm volatile(
+            "vmovups (%[source]), %%ymm0\n\t"
+            "sub $128, %%rsp\n\t"
+            "call *%[code]\n\t"
+            "add $128, %%rsp\n\t"
+            :
+            : [source] "r"(source), [code] "r"(code), "a"(destination)
+            : "memory", "ymm0");
+        require(std::memcmp(destination, source, sizeof(source)) == 0, "256-bit store stub did not write both halves");
+        require(std::all_of(pages, destination, [](const std::uint8_t value) { return value == 0; }), "256-bit store stub wrote before its operand");
+        require(std::all_of(destination + sizeof(source), pages + 8192, [](const std::uint8_t value) { return value == 0; }),
+                "256-bit store stub wrote past its operand");
+    }
+    munmap(pages, 8192);
+    munmap(code, 4096);
+}
 #else
 void reciprocalExecution() {}
 void registerFormExecution() {}
@@ -1996,6 +2037,7 @@ void rdtscpExecution() {
 }
 #else
 void rdtscpExecution() {}
+void wideStoreExecution() {}
 #endif
 
 void scannerZeroTail() {
@@ -2055,6 +2097,7 @@ int main() {
         rosettaLegacyScalarCompares();
         converterRosettaLegacyScalarCompare();
         rdtscpExecution();
+        wideStoreExecution();
         wideStoreSplit();
         converterWideStoreWindows();
         converterClaimedFollower();

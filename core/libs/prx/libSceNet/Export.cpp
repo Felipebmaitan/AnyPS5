@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <poll.h>
 #include <unistd.h>
@@ -43,6 +44,7 @@
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include "src/ResolverTestHooks.hpp"
 
 // Guest socket descriptors retain PS5 semantics while their transport is backed by host sockets.
 
@@ -231,6 +233,7 @@ constexpr int NET_EBADF = 9;
 constexpr int NET_EACCES = 13;
 constexpr int NET_EFAULT = 14;
 constexpr int NET_EINVAL = 22;
+constexpr int NET_ENOTTY = 25;
 constexpr int NET_ENOSPC = 28;
 constexpr int NET_EDOM = 33;
 constexpr int NET_EAGAIN = 35;
@@ -455,7 +458,8 @@ HostMutex g_mutex;
 HostCondition g_cv;
 std::map<int, Sock> g_socks;
 std::set<int> g_epolls;
-std::map<int, std::map<int, NetEpollEvent>> g_epoll_socks;
+using EpollRegistrations = std::map<int, std::shared_ptr<const NetEpollEvent>>;
+std::map<int, EpollRegistrations> g_epoll_socks;
 std::set<int> g_epoll_aborted;
 std::map<int, std::size_t> g_pools;
 
@@ -477,6 +481,7 @@ int g_next_epoll = 0x4000;
 int g_next_pool = 1;
 int g_next_resolver = 0x100;
 bool g_net_inited = false;
+std::atomic<GuestSceNetTest::ResolverLookup> g_resolverLookupForTests{nullptr};
 
 int* errno_slot() {
     static thread_local int e = 0;
@@ -616,15 +621,6 @@ std::int64_t message_length(const NetMsghdr* message) {
     return static_cast<std::int64_t>(total);
 }
 
-int receive_error(const Sock& socket) {
-#ifdef _WIN32
-    if (WSAGetLastError() == WSAETIMEDOUT && socket.type != NET_SOCK_STREAM && socket.native->receiveTimeout > 0) return NET_EAGAIN;
-#else
-    (void)socket;
-#endif
-    return native_error();
-}
-
 bool message_flags_supported(int flags, int accepted) {
     return (flags & ~accepted) == 0;
 }
@@ -652,7 +648,7 @@ auto native_transfer(const NativeSocketHandle& socket, int flags, bool send, TOp
         if (timeout > 0) {
             const auto remaining = deadline - std::chrono::steady_clock::now();
             if (remaining <= std::chrono::steady_clock::duration::zero()) {
-                WSASetLastError(completeLength > 0 ? WSAEWOULDBLOCK : WSAETIMEDOUT);
+                WSASetLastError(send && completeLength == 0 ? WSAETIMEDOUT : WSAEWOULDBLOCK);
                 return transferred > 0 ? static_cast<Result>(transferred) : static_cast<Result>(-1);
             }
             milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count(), milliseconds));
@@ -691,12 +687,23 @@ int native_message_flags(int flags) {
     return native;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
+#ifdef __APPLE__
+bool has_local_address(NativeSocket native) {
+    sockaddr_storage local{};
+    NativeLength local_length = sizeof(local);
+    if (::getsockname(native, reinterpret_cast<sockaddr*>(&local), &local_length) != 0) return true;
+    if (local.ss_family == AF_INET) return reinterpret_cast<const sockaddr_in&>(local).sin_port != 0;
+    if (local.ss_family == AF_INET6) return reinterpret_cast<const sockaddr_in6&>(local).sin6_port != 0;
+    return true;
+}
+#else
 bool has_local_address(NativeSocket native) {
     sockaddr_storage local{};
     NativeLength local_length = sizeof(local);
     return ::getsockname(native, reinterpret_cast<sockaddr*>(&local), &local_length) == 0 || WSAGetLastError() != WSAEINVAL;
 }
+#endif
 
 void note_local_address(int s, const Sock& socket) {
     if (socket.type == NET_SOCK_STREAM || socket.bound || !has_local_address(socket.native->value)) return;
@@ -713,10 +720,17 @@ int wait_for_datagram(const Sock& socket, std::chrono::steady_clock::time_point 
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) return NET_EAGAIN;
     const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+#ifdef _WIN32
     WSAPOLLFD descriptor{};
     descriptor.fd = socket.native->value;
     descriptor.events = POLLRDNORM;
     return WSAPoll(&descriptor, 1, static_cast<INT>(std::min<long long>(remaining, INT_MAX))) == 0 ? NET_EAGAIN : 0;
+#else
+    pollfd descriptor{};
+    descriptor.fd = socket.native->value;
+    descriptor.events = POLLIN;
+    return ::poll(&descriptor, 1, static_cast<int>(std::min<long long>(remaining, INT_MAX))) == 0 ? NET_EAGAIN : 0;
+#endif
 }
 
 int wait_for_local_address(int s, const Sock& socket, bool empty, int flags) {
@@ -786,6 +800,10 @@ bool parse_ipv4_parts(const char* text, std::uint32_t& address) {
 }
 
 }  // namespace
+
+void GuestSceNetTest::SetResolverLookupForTests_nid_no_patch(ResolverLookup lookup) noexcept {
+    g_resolverLookupForTests.store(lookup);
+}
 
 extern "C" {
 
@@ -1022,6 +1040,7 @@ int APS5_VABI sceNetSocketClose(int s) {
         if (it != g_socks.end()) {
             native = it->second.native;
             g_socks.erase(it);
+            for (auto& epoll : g_epoll_socks) epoll.second.erase(s);
             found = true;
         }
     }
@@ -1212,7 +1231,7 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
 #endif
     if (native.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
     if (::connect(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) == 0) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         note_local_address(s, socket);
 #endif
         return 0;
@@ -1248,7 +1267,7 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (const int wait = wait_for_local_address(s, socket, len == 0, flags)) return wait == RECEIVE_NOTHING ? 0 : fail(wait);
 #endif
     const GuestArena::HostWrite destination(len == 0 ? nullptr : buf, len);
@@ -1260,7 +1279,7 @@ int64_t APS5_VABI sceNetRecv(int s, void* buf, size_t len, int flags) {
 #ifdef _WIN32
     if (result < 0 && socket.type == NET_SOCK_DGRAM && WSAGetLastError() == WSAEMSGSIZE) return static_cast<int64_t>(len);
 #endif
-    return result >= 0 ? result : fail(receive_error(socket));
+    return result >= 0 ? result : fail(native_error());
 }
 
 int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* from, uint32_t* fromlen) {
@@ -1277,7 +1296,7 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
     }
     const GuestArena::HostWrite lengthOutput(from == nullptr ? nullptr : fromlen, from == nullptr ? 0 : sizeof(*fromlen));
     if (!lengthOutput.Open()) return fail(NET_EFAULT);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (const int wait = wait_for_local_address(s, socket, len == 0, flags)) {
         if (wait != RECEIVE_NOTHING) return fail(wait);
         if (from) *fromlen = 0;
@@ -1301,7 +1320,7 @@ int64_t APS5_VABI sceNetRecvfrom(int s, void* buf, size_t len, int flags, void* 
 #ifdef _WIN32
     if (result < 0 && socket.type == NET_SOCK_DGRAM && WSAGetLastError() == WSAEMSGSIZE) result = static_cast<int>(len);
 #endif
-    if (result < 0) return fail(receive_error(socket));
+    if (result < 0) return fail(native_error());
     if (from && !native_to_guest_address(peer, from, fromlen)) return fail(NET_EAFNOSUPPORT);
     return result;
 }
@@ -1351,7 +1370,7 @@ int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, co
         }, true, static_cast<int>(len));
     }
     if (result < 0) return fail(native_error());
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     note_local_address(s, socket);
 #endif
     return result;
@@ -1395,7 +1414,7 @@ int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
         if (!destinations.emplace_back(entry.base, static_cast<std::size_t>(entry.length)).Open()) return fail(NET_EFAULT);
     }
     const bool datagram = socket.type != NET_SOCK_STREAM;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (const int wait = wait_for_local_address(s, socket, total == 0, flags)) {
         if (wait != RECEIVE_NOTHING) return fail(wait);
         msg->flags = 0;
@@ -1419,7 +1438,7 @@ int64_t APS5_VABI sceNetRecvmsg(int s, NetMsghdr* msg, int flags) {
     });
     if (received < 0) {
 #ifdef _WIN32
-        if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return fail(receive_error(socket));
+        if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return fail(native_error());
         received = static_cast<std::int64_t>(buffer.size());
 #else
         return fail(native_error());
@@ -1507,6 +1526,7 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
         if (value < 0) return fail(NET_EINVAL);
         if (set_native_timeout(socket.native->value, optname, value) != 0) return fail(native_error());
     } else if (optname == NET_SO_REUSEADDR || optname == NET_SO_BROADCAST || optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) {
+        if ((optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) && value < 1) return fail(NET_EINVAL);
         const int native_option = optname == NET_SO_REUSEADDR ? SO_REUSEADDR : optname == NET_SO_BROADCAST ? SO_BROADCAST : optname == NET_SO_SNDBUF ? SO_SNDBUF : SO_RCVBUF;
         if (::setsockopt(socket.native->value, SOL_SOCKET, native_option, reinterpret_cast<const char*>(&value), sizeof(value)) != 0)
             return fail(native_error());
@@ -1752,7 +1772,7 @@ int APS5_VABI sceNetEpollCreate(const char* name, int flags) {
     std::lock_guard lk(g_mutex);
     const int id = g_next_epoll++;
     g_epolls.insert(id);
-    g_epoll_socks.emplace(id, std::map<int, NetEpollEvent>{});
+    g_epoll_socks.emplace(id, EpollRegistrations{});
     return id;
 }
 
@@ -1817,16 +1837,17 @@ int APS5_VABI sceNetEpollControl(int eid, int op, int id, const NetEpollEvent* e
     }
     if (op != NET_EPOLL_CTL_ADD && op != NET_EPOLL_CTL_MOD && op != NET_EPOLL_CTL_DEL) return fail(NET_EINVAL);
     if (op != NET_EPOLL_CTL_DEL && !event) return fail(NET_EINVAL);
-    if (op != NET_EPOLL_CTL_DEL && g_socks.count(id) == 0) return fail(NET_EBADF);
+    if (g_socks.count(id) == 0) return fail(NET_EBADF);
     auto& registrations = g_epoll_socks[eid];
     if (op == NET_EPOLL_CTL_ADD) {
-        if (!registrations.emplace(id, *event).second) return fail(NET_EADDRINUSE);
+        if (registrations.count(id) != 0) return fail(NET_EADDRINUSE);
+        registrations.emplace(id, std::make_shared<const NetEpollEvent>(*event));
     } else if (op == NET_EPOLL_CTL_DEL) {
         if (registrations.erase(id) == 0) return fail(NET_ENOENT);
     } else {
         auto registration = registrations.find(id);
         if (registration == registrations.end()) return fail(NET_ENOENT);
-        registration->second = *event;
+        registration->second = std::make_shared<const NetEpollEvent>(*event);
     }
     g_cv.NotifyAll();
     return 0;
@@ -1834,12 +1855,16 @@ int APS5_VABI sceNetEpollControl(int eid, int op, int id, const NetEpollEvent* e
 
 int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int timeout) {
     if (!events || maxevents <= 0) return fail(NET_EINVAL);
+    struct Watch {
+        int descriptor;
+        std::shared_ptr<const NetEpollEvent> registration;
+        std::shared_ptr<NativeSocketHandle> native;
+    };
     const auto deadline = timeout > 0
         ? std::chrono::steady_clock::now() + std::chrono::microseconds(timeout)
         : std::chrono::steady_clock::time_point::max();
     for (;;) {
-        std::vector<NetEpollEvent> registered_events;
-        std::vector<std::shared_ptr<NativeSocketHandle>> native_sockets;
+        std::vector<Watch> watches;
         {
             std::lock_guard lk(g_mutex);
             if (g_epolls.count(eid) == 0) return fail(NET_EBADF);
@@ -1849,12 +1874,11 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
                 for (const auto& entry : registration->second) {
                     const auto socket = g_socks.find(entry.first);
                     if (socket == g_socks.end()) continue;
-                    registered_events.push_back({entry.second.events, 0, static_cast<std::uint64_t>(entry.first), entry.second.data});
-                    native_sockets.push_back(socket->second.native);
+                    watches.push_back({entry.first, entry.second, socket->second.native});
                 }
             }
         }
-        if (registered_events.empty()) {
+        if (watches.empty()) {
             if (timeout == 0) return 0;
             std::unique_lock lk(g_mutex);
             const auto now = std::chrono::steady_clock::now();
@@ -1866,18 +1890,18 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
         }
 
 #ifdef _WIN32
-        std::vector<WSAPOLLFD> descriptors(registered_events.size());
+        std::vector<WSAPOLLFD> descriptors(watches.size());
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
-            descriptors[index].fd = native_sockets[index]->value;
-            if (registered_events[index].events & 1) descriptors[index].events |= POLLRDNORM;
-            if (registered_events[index].events & 2) descriptors[index].events |= POLLWRNORM;
+            descriptors[index].fd = watches[index].native->value;
+            if (watches[index].registration->events & 1) descriptors[index].events |= POLLRDNORM;
+            if (watches[index].registration->events & 2) descriptors[index].events |= POLLWRNORM;
         }
 #else
-        std::vector<pollfd> descriptors(registered_events.size());
+        std::vector<pollfd> descriptors(watches.size());
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
-            descriptors[index].fd = native_sockets[index]->value;
-            if (registered_events[index].events & 1) descriptors[index].events |= POLLIN;
-            if (registered_events[index].events & 2) descriptors[index].events |= POLLOUT;
+            descriptors[index].fd = watches[index].native->value;
+            if (watches[index].registration->events & 1) descriptors[index].events |= POLLIN;
+            if (watches[index].registration->events & 2) descriptors[index].events |= POLLOUT;
         }
 #endif
         const auto now = std::chrono::steady_clock::now();
@@ -1898,27 +1922,32 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
             std::lock_guard lk(g_mutex);
             if (g_epolls.count(eid) == 0) return fail(NET_EBADF);
             if (g_epoll_aborted.erase(eid) != 0) return fail(NET_ECONNABORTED);
-        }
-        if (ready_count > 0) {
-            int count = 0;
-            for (std::size_t index = 0; index < descriptors.size() && count < maxevents; ++index) {
-                const auto native_events = descriptors[index].revents;
-                if (!native_events) continue;
-                std::uint32_t guest_events = 0;
+            if (ready_count > 0) {
+                int count = 0;
+                const auto& registrations = g_epoll_socks.at(eid);
+                for (std::size_t index = 0; index < descriptors.size() && count < maxevents; ++index) {
+                    const auto registration = registrations.find(watches[index].descriptor);
+                    if (registration == registrations.end() || registration->second != watches[index].registration) continue;
+                    const auto native_events = descriptors[index].revents;
+                    if (!native_events) continue;
+                    std::uint32_t guest_events = 0;
 #ifdef _WIN32
-                if (native_events & (POLLRDNORM | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLWRNORM) guest_events |= 2;
+                    if (native_events & (POLLRDNORM | POLLPRI)) guest_events |= 1;
+                    if (native_events & POLLWRNORM) guest_events |= 2;
 #else
-                if (native_events & (POLLIN | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLOUT) guest_events |= 2;
+                    if (native_events & (POLLIN | POLLPRI)) guest_events |= 1;
+                    if (native_events & POLLOUT) guest_events |= 2;
 #endif
-                if (native_events & POLLERR) guest_events |= 8;
-                if (native_events & POLLHUP) guest_events |= 16;
-                events[count] = registered_events[index];
-                events[count].events = guest_events;
-                ++count;
+                    if (native_events & POLLERR) guest_events |= 8;
+                    if (native_events & POLLHUP) guest_events |= 16;
+                    events[count] = *watches[index].registration;
+                    events[count].ident = static_cast<std::uint64_t>(watches[index].descriptor);
+                    events[count].reserved = 0;
+                    events[count].events = guest_events;
+                    ++count;
+                }
+                if (count > 0) return count;
             }
-            if (count > 0) return count;
         }
         if (timeout == 0) return 0;
     }
@@ -2041,6 +2070,14 @@ int lookup_host(int rid, const char* hostname, const char* func, int family, std
     if (!initialize_sockets()) return fail(5);
     std::uint64_t generation = 0;
     if (const int error = begin_lookup(rid, &Resolver::abort_ntoa, generation)) return error;
+    if (const auto lookup = g_resolverLookupForTests.load()) {
+        if (!lookup(hostname, family, addresses) || addresses.empty()) {
+            set_errno(NET_ENOENT);
+            log_soft(func, "host DNS lookup failed");
+            return end_lookup(rid, generation, NET_ERROR_RESOLVER_ENODNS);
+        }
+        return end_lookup(rid, generation, 0);
+    }
     addrinfo hints{};
     hints.ai_family = family;
     addrinfo* results = nullptr;
@@ -2450,19 +2487,45 @@ int APS5_VABI sceNetInetPtonEx(int af, const char* src, void* dst, int) {
     return 1;
 }
 
+extern "C" int APS5_VABI ioctl_nid_postfix(int descriptor, std::uint64_t request, void* argument);
+
 int APS5_VABI sceNetIoctl(int socketId, std::uint32_t command, void* argument) {
-    NotImplemented_nid_no_patch(__func__);
+    constexpr std::uint32_t nonblockingRequest = 0x8004667e;
+    constexpr std::uint32_t readableRequest = 0x4004667f;
+    std::shared_ptr<NativeSocketHandle> native;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto it = g_socks.find(socketId);
+        if (it != g_socks.end()) native = it->second.native;
+    }
+    if (!native) {
+        if (!GuestSocketIsOpen_nid_no_patch(socketId)) return fail(NET_EBADF);
+        return ioctl_nid_postfix(socketId, command, argument) == 0 ? 0 : fail(*__error_nid_postfix());
+    }
+    if (command != nonblockingRequest && command != readableRequest) return fail(NET_ENOTTY);
+    if (!argument) return fail(NET_EFAULT);
+    if (command == nonblockingRequest) {
+        const int enabled = *static_cast<const int*>(argument) != 0;
+        return sceNetSetsockopt(socketId, NET_SOL_SOCKET, NET_SO_NBIO, &enabled, sizeof(enabled));
+    }
+#ifdef _WIN32
+    u_long available = 0;
+    if (ioctlsocket(native->value, FIONREAD, &available) != 0) return fail(native_error());
+#else
+    int available = 0;
+    if (::ioctl(native->value, FIONREAD, &available) != 0) return fail(native_error());
+#endif
+    *static_cast<int*>(argument) = static_cast<int>(available);
     return 0;
 }
 
 void* APS5_VABI sceNetMemoryAllocate(std::int32_t size, int flags) {
     constexpr int zeroFill = 2;
+    constexpr std::size_t blockAlignment = 64;
     if (size <= 0) return nullptr;
-    if ((flags & 4) != 0)
-        throw std::runtime_error("sceNetMemoryAllocate: pool reserve allocation is not implemented");
     void* memory = nullptr;
     try {
-        memory = GuestHeap::GuestHeapAllocate_nid_postfix(static_cast<std::size_t>(size));
+        memory = GuestHeap::GuestHeapAlign_nid_postfix(blockAlignment, static_cast<std::size_t>(size));
     } catch (const std::bad_alloc&) {
         return nullptr;
     } catch (const std::length_error&) {

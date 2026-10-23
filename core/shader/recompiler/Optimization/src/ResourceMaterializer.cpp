@@ -4,6 +4,7 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ThreadOwned.hpp"
 #include "ImageTableAbi.hpp"
@@ -118,6 +119,19 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
     }
 }
 
+std::uint32_t imageCoordinates(RdnaImageDimension dimension) {
+    switch (dimension) {
+        case RdnaImageDimension::Dim1D: return 1u;
+        case RdnaImageDimension::Dim1DArray: case RdnaImageDimension::Dim2D: return 2u;
+        case RdnaImageDimension::Dim2DMsaaArray: return 4u;
+        default: return 3u;
+    }
+}
+
+bool multisamplePlaneRead(const ImageResource& image) {
+    return image.dimension == RdnaImageDimension::Dim2D && image.resourceClass == ImageResourceClass::Sampled && image.table == NoTable && !image.depthCompare && !image.r128 && image.cubeFaceCompatible;
+}
+
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
@@ -199,8 +213,12 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
             decoded.dimension = RdnaImageDimension::Dim2DArray;
         }
     }
+    if (GcnGuestShaders() && imageCoordinates(decoded.dimension) != imageCoordinates(base.dimension)) {
+        throw std::runtime_error("GCN image instruction on a descriptor of type " + std::to_string(static_cast<std::uint32_t>(rawImageType(descriptor))) + " needs a different address count than its inferred dimension; not implemented");
+    }
     decoded.cube = descriptorIsCube(descriptor);
     const auto format = rawImageFormat(descriptor);
+    if (decoded.dimension == RdnaImageDimension::Dim2DMsaa && rawImageType(descriptor) == ImageType::Color2DMsaa && multisamplePlaneRead(base) && !IsFmaskTextureFormat(format) && !IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) decoded.dimension = RdnaImageDimension::Dim2D;
     if (base.atomic64 && format != IrBufferFormat::Format32_32UInt && format != IrBufferFormat::Format32_32SInt && format != IrBufferFormat::Format32_32Float) {
         return rejectImage(PoisonReason::InvalidFormat, "64-bit atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)));
     }
@@ -214,9 +232,14 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
     if (decoded.fmask && (storage || base.depthCompare || table)) {
         return rejectImage(PoisonReason::Fmask, "FMASK requires a direct sampled image load");
     }
-    if (decoded.fmask && format != IrBufferFormat::Fmask32_S8_F8) return rejectImage(PoisonReason::Fmask, "FMASK format is not implemented");
-    if (decoded.fmask && (descriptor.dwords[6] & (3u << 20u)) != 0u) return rejectImage(PoisonReason::Fmask, "FMASK CMASK compression is not implemented");
+    if (decoded.fmask && !FmaskLayoutOf(format).has_value()) return rejectImage(PoisonReason::Fmask, "FMASK format is not implemented");
+    if (decoded.fmask && ((descriptor.dwords[6] & (1u << 20u)) != 0u || ((descriptor.dwords[6] & (1u << 21u)) != 0u && (descriptor.dwords[6] >> 24u) == 0u && descriptor.dwords[7] == 0u))) return rejectImage(PoisonReason::Fmask, "FMASK CMASK compression is not implemented without readable metadata");
+    if (decoded.fmask && (descriptor.dwords[6] & (1u << 21u)) != 0u && format != IrBufferFormat::Fmask32_S8_F8) return rejectImage(PoisonReason::Fmask, "FMASK CMASK compression is implemented only for 8-sample, 8-fragment FMASK");
     if (decoded.fmask && (base.packed || base.byElements != 0u)) return rejectImage(PoisonReason::Fmask, "packed FMASK image reads are not implemented");
+    for (std::uint32_t component = 0; decoded.fmask && component < 4u; ++component) {
+        const auto selector = (descriptorImageSwizzle(descriptor) >> (component * 3u)) & 7u;
+        if (selector != 0u && selector != 1u && selector != 4u) return rejectImage(PoisonReason::Fmask, "FMASK destination channel selector is not implemented");
+    }
     if (base.packed) {
         if (table || (!storage && descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle)) {
             return rejectImage(PoisonReason::InvalidFormat, "packed image access requires a direct image, with identity swizzle when sampled");
@@ -237,7 +260,8 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
         }
     }
     const bool nativeRepacked = format == IrBufferFormat::Format10_11_11Float && !storage && !base.packed;
-    decoded.conversionFormat = RemapTextureFormat(format) != format && !nativeRepacked ? format : IrBufferFormat::Invalid;
+    const auto remappedFormat = storage ? RemapStorageTextureFormat(format) : RemapTextureFormat(format);
+    decoded.conversionFormat = remappedFormat != format && !nativeRepacked ? format : IrBufferFormat::Invalid;
     if (format == IrBufferFormat::Format11_11_10UNorm || (format == IrBufferFormat::Format10_11_11Float && !nativeRepacked)) {
         const bool floating = format == IrBufferFormat::Format10_11_11Float;
         if (!base.srgbDecodeCompatible) {
@@ -252,6 +276,7 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
             if (((descriptorImageSwizzle(descriptor) >> (component * 3u)) & 7u) == 7u) return rejectImage(PoisonReason::Conversion, "selects a channel the converted image format does not have");
         }
     }
+    if (decoded.fmask && format != IrBufferFormat::Fmask32_S8_F8) decoded.conversionFormat = FmaskExpansion;
     decoded.srgbDecode = !storage && !base.depthCompare && (srgbDecodeFormats & SrgbDecodeBit(format)) != 0u;
     if (decoded.srgbDecode && !base.srgbDecodeCompatible) {
         return rejectImage(PoisonReason::SrgbUnsupported, "samples or gathers an sRGB image the device cannot sample, which is not implemented");
@@ -262,7 +287,7 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
     const bool wideSint = format == IrBufferFormat::Format32SInt || format == IrBufferFormat::Format32_32SInt || format == IrBufferFormat::Format32_32_32_32SInt;
     const bool narrowSint = format == IrBufferFormat::Format16SInt || format == IrBufferFormat::Format8_8SInt || format == IrBufferFormat::Format16_16SInt || format == IrBufferFormat::Format8_8_8_8SInt || format == IrBufferFormat::Format16_16_16_16SInt;
     const bool rawSintStorage = storage && (wideSint || (narrowSint && !base.packed)) && base.written && !base.read && !base.atomic;
-    decoded.numericClass = base.atomic || decoded.fmask ? IrTextureNumericClass::Uint : nativeRepacked ? IrTextureNumericClass::Float : SampledTextureNumericClass(format);
+    decoded.numericClass = base.atomic || decoded.fmask ? IrTextureNumericClass::Uint : nativeRepacked ? IrTextureNumericClass::Float : SampledTextureNumericClass(remappedFormat);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
         if (!base.depthBitsCompatible) return rejectImage(PoisonReason::DepthBits16, "runtime image reads depth bits as unsupported 16-bit results");
@@ -281,7 +306,9 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
             decoded.conversionFormat = format;
         }
     } else if (decoded.numericClass == IrTextureNumericClass::Unsupported || (base.depthCompare && decoded.numericClass != IrTextureNumericClass::Float)) {
-        return rejectImage(PoisonReason::NumericClass, "sampled image descriptor uses an unsupported format");
+        char words[96];
+        std::snprintf(words, sizeof(words), " (T# %08x %08x %08x %08x %08x %08x %08x %08x)", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
+        return rejectImage(PoisonReason::NumericClass, std::string("sampled image descriptor uses an unsupported format") + words);
     }
     return result;
 }
@@ -640,6 +667,7 @@ private:
 
 struct WordsIndexTag {};
 struct ElementIndexTag {};
+struct SamplerIndexTag {};
 struct PoisonIndexTag {};
 struct TableRecordsTag {};
 
@@ -1285,6 +1313,12 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         throw std::runtime_error("materialization sources are missing buffer descriptors");
     }
     snapshot.buffers.assign(values.begin(), values.begin() + plan.info.buffers.size());
+    if (GcnGuestShaders()) {
+        for (auto& buffer : snapshot.buffers) {
+            buffer.dwords[1] &= GcnBufferWord1Mask;
+            buffer.dwords[3] = GcnBufferWord3(buffer.dwords[1], buffer.dwords[3]);
+        }
+    }
     cursor += plan.info.buffers.size();
 
     snapshot.images.resize(plan.info.images.size());
@@ -1304,6 +1338,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         cursor++;
         if (descriptor.dwordCount != 8u) {
             throw std::runtime_error("image descriptor has an invalid width");
+        }
+        if (GcnGuestShaders()) {
+            const auto words = GcnImageWords(std::span<const std::uint32_t, 8>(descriptor.dwords.data(), 8u));
+            std::copy(words.begin(), words.end(), descriptor.dwords.begin());
         }
         const auto activity = plan.descriptorSources.size() + i;
         if (activity < activeSources.size() && activeSources[activity] == 0u) {
@@ -1646,6 +1684,7 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         return Abi::PoisonCode(*index);
     };
     HashScratchIndex elementIndex{threadScratch<HashSlot, ElementIndexTag>()};
+    HashScratchIndex samplerIndex{threadScratch<HashSlot, SamplerIndexTag>()};
     std::vector<std::uint32_t> directSamplers(info.images.size(), 0u);
     for (const auto& pair : info.sampledPairs) {
         if (info.samplers.at(pair.sampler).table == NoTable) directSamplers.at(pair.image) |= 1u << pair.sampler;
@@ -1674,17 +1713,17 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
                 auto element = words.dwords;
                 if (mode.conversionFormat != IrBufferFormat::Invalid || mode.depthBits) element[3] = (element[3] & ~0xfffu) | ShaderImageIdentitySwizzle;
                 const auto kind = DescriptorBindingForImage(mode);
-                const auto hash = hashWords(element, (static_cast<std::uint64_t>(mode.dimension) << 16u) ^ (static_cast<std::uint64_t>(mode.depthCompare) << 8u) ^ static_cast<std::uint64_t>(kind));
+                const auto hash = hashWords(element, (static_cast<std::uint64_t>(image.atomic) << 24u) ^ (static_cast<std::uint64_t>(mode.dimension) << 16u) ^ (static_cast<std::uint64_t>(mode.depthCompare) << 8u) ^ static_cast<std::uint64_t>(kind));
                 auto index = elementIndex.Find(hash, [&](std::uint32_t known) {
                     const auto& entry = out.elements[known];
-                    return entry.words == element && entry.dimension == mode.dimension && entry.depthCompare == mode.depthCompare && entry.kind == kind;
+                    return entry.words == element && entry.dimension == mode.dimension && entry.depthCompare == mode.depthCompare && entry.kind == kind && entry.atomic == image.atomic;
                 });
                 if (!index.has_value() && out.elements.size() >= Abi::ImageElementBudget) {
                     record[Abi::ImageRecordFlags] = poison(resource, PoisonReason::Budget, &words);
                 } else {
                     if (!index.has_value()) {
                         index = static_cast<std::uint32_t>(out.elements.size());
-                        out.elements.push_back({element, mode.dimension, mode.depthCompare, kind, 0u});
+                        out.elements.push_back({element, mode.dimension, mode.depthCompare, kind, 0u, image.atomic});
                         elementIndex.Insert(hash, *index);
                     }
                     out.elements[*index].samplers |= directSamplers[resource];
@@ -1703,19 +1742,29 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
             record[Abi::SamplerRecordFlags] = poison(resource, PoisonReason::Unnormalized, &words);
         } else if (((words.dwords[0] >> 29u) & 3u) != 0u) {
             record[Abi::SamplerRecordFlags] = poison(resource, PoisonReason::Reduction, &words);
-        } else if (out.samplers.size() + Abi::SamplerEntryElements > Abi::SamplerElementBudget) {
-            record[Abi::SamplerRecordFlags] = poison(resource, PoisonReason::Budget, &words);
         } else {
-            record[Abi::SamplerRecordElement] = static_cast<std::uint32_t>(out.samplers.size());
-            for (std::uint32_t variant = 0; variant < 2u; variant++) {
-                const bool compare = variant == 1u;
-                for (std::uint32_t point = 0; point < 2u; point++) {
-                    ImageTableSamplerElement element;
-                    std::copy_n(words.dwords.begin(), 4u, element.words.begin());
-                    element.compare = compare;
-                    element.point = point != 0u;
-                    out.samplers.push_back(element);
+            const auto hash = hashWords(std::span(words.dwords.data(), 4u), 0);
+            auto index = samplerIndex.Find(hash, [&](std::uint32_t known) {
+                return std::equal(words.dwords.begin(), words.dwords.begin() + 4u, out.samplers[known].words.begin());
+            });
+            if (!index.has_value() && out.samplers.size() + Abi::SamplerEntryElements > Abi::SamplerElementBudget) {
+                record[Abi::SamplerRecordFlags] = poison(resource, PoisonReason::Budget, &words);
+            } else {
+                if (!index.has_value()) {
+                    index = static_cast<std::uint32_t>(out.samplers.size());
+                    for (std::uint32_t variant = 0; variant < 2u; variant++) {
+                        const bool compare = variant == 1u;
+                        for (std::uint32_t point = 0; point < 2u; point++) {
+                            ImageTableSamplerElement element;
+                            std::copy_n(words.dwords.begin(), 4u, element.words.begin());
+                            element.compare = compare;
+                            element.point = point != 0u;
+                            out.samplers.push_back(element);
+                        }
+                    }
+                    samplerIndex.Insert(hash, *index);
                 }
+                record[Abi::SamplerRecordElement] = *index;
             }
         }
         const auto offset = static_cast<std::uint32_t>(out.map.size());
@@ -1823,6 +1872,7 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
 }
 
 std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageResource& image) {
+    if (image.targetMerge) return {image};
     const bool table = image.table != NoTable;
     if (table && image.tableOperation == TableOperation::Unsupported) return {};
     std::vector<ImageResource> modes;
@@ -1839,7 +1889,7 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         if (conversion == IrBufferFormat::Format11_11_10UNorm || conversion == IrBufferFormat::Format10_11_11Float) mode.shaderSwizzle = 0x2acu;
         modes.push_back(mode);
-        const bool volumeLoad = (image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray) && image.fmaskCompatible;
+        const bool volumeLoad = (image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray) && image.fmaskCompatible && conversion != FmaskExpansion;
         const bool volumeStore = image.dimension == RdnaImageDimension::Dim2DArray && storage && image.written && !image.read && !image.atomic && image.mipMode != ImageMipMode::DynamicStorage;
         const bool volumePlaneBias = image.dimension == RdnaImageDimension::Dim2D && image.singleMipPlaneBiasCompatible && !storage && image.table == NoTable && conversion == IrBufferFormat::Invalid;
         const bool volumeArraySample = image.dimension == RdnaImageDimension::Dim2DArray && image.volumeArraySampleCompatible && !storage && image.table == NoTable && conversion == IrBufferFormat::Invalid;
@@ -1847,6 +1897,12 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             auto volume = mode;
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
+        }
+        const bool arrayStore = image.dimension == RdnaImageDimension::Dim3D && storage && image.written && !image.read && !image.atomic && image.mipMode != ImageMipMode::DynamicStorage;
+        if (arrayStore && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
+            auto array = mode;
+            array.dimension = RdnaImageDimension::Dim2DArray;
+            modes.push_back(array);
         }
         if (image.dimension == RdnaImageDimension::Dim2DMsaa && image.fmaskCompatible && image.cubeFaceCompatible && !table && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
             auto plane = mode;
@@ -1923,11 +1979,17 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             append(IrTextureNumericClass::Uint, IrBufferFormat::Format11_11_10UInt, IrBufferFormat::Invalid, false, false);
             if ((image.srgbDecodeCompatible || (image.convertedSamples && convertedSampleCompatible(image))) && image.depthBitsCompatible) append(IrTextureNumericClass::Uint, IrBufferFormat::Format11_11_10UNorm, IrBufferFormat::Invalid, false, false);
             if (image.srgbDecodeCompatible && image.depthBitsCompatible) append(IrTextureNumericClass::Uint, IrBufferFormat::Format10_11_11Float, IrBufferFormat::Invalid, false, false);
+            if (storage) {
+                for (const auto format : {IrBufferFormat::Format5_6_5UNorm, IrBufferFormat::Format5_5_5_1UNorm, IrBufferFormat::Format4_4_4_4UNorm}) {
+                    append(IrTextureNumericClass::Uint, format, IrBufferFormat::Invalid, false, false);
+                }
+            }
             if (!storage) {
                 if (image.depthBitsCompatible) {
                     append(IrTextureNumericClass::Float, IrBufferFormat::Invalid, IrBufferFormat::Invalid, true, false);
                     append(IrTextureNumericClass::Float, IrBufferFormat::Invalid, IrBufferFormat::Invalid, true, true);
                 }
+                if (image.fmaskCompatible && !table) append(IrTextureNumericClass::Uint, FmaskExpansion, IrBufferFormat::Invalid, false, false);
             }
         }
     }
@@ -2273,7 +2335,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     PrepareImageModes(plan.info);
     plan.uniformFill = source.uniformFill;
     for (auto& block : plan.controlFlow) {
-        if (block.condition != nullptr && !Detail::Evaluator::MayEvaluate(source, block.condition)) block.condition = nullptr;
+        if (block.condition != nullptr && !Detail::Evaluator::MayDecide(source, block.condition)) block.condition = nullptr;
     }
     ownPlanValues(plan);
     const auto addSource = [&plan](std::uint32_t index) {
