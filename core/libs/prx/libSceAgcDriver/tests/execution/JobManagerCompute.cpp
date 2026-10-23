@@ -1,6 +1,7 @@
 #include "VulkanTestDevice.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -240,6 +241,49 @@ void RunCase() {
     ::operator delete(memory, std::align_val_t{256});
 }
 
+void CapacityCase() {
+    std::array<ShaderRegister, 255> registers;
+    registers.fill(Registers[2]);
+    std::copy(Registers.begin(), Registers.end(), registers.begin());
+    auto shader = Shader;
+    const ShaderRegister* data = registers.data();
+    std::memcpy(shader.data() + 0x20, &data, sizeof(data));
+    shader[0x5c] = static_cast<unsigned char>(registers.size());
+    const std::string marker(65535, 'm');
+    const MemorySizeQueryParams query{1, 1, 0, 0, 2, 0, 1, 1, 1};
+    const auto size = RequiredSize(&query);
+    const auto allocationSize = (size + 255) & ~std::uint64_t{255};
+    auto* memory = static_cast<std::uint8_t*>(::operator new(allocationSize, std::align_val_t{256}));
+    std::memset(memory, 0, allocationSize);
+    std::memset(memory + size, 0xa5, allocationSize - size);
+    alignas(64) unsigned char manager[0x100]{};
+    Construct(manager);
+    Require(Initialize(manager, memory, size, 1, 0, 1, 1, nullptr) == 0, "capacity manager initialization failed");
+    auto* factory = Factories(manager, 0);
+    Sequence* sequence = nullptr;
+    Require(factory->CreateCompute(&sequence, 0, 2, 0, 1, nullptr) == 0, "capacity sequence creation failed");
+    for (std::uint32_t round = 0; round < 2; ++round) {
+        Value[0] = 0xabcd0000u + round;
+        for (int dispatch = 0; dispatch < 2; ++dispatch)
+            Require(sequence->DispatchCompute(shader.data(), Table.data(), 1, 1, 1, marker.c_str()) == 0, "maximum register and marker dispatch failed");
+        Require(sequence->Wait() == 0, "maximum packet wait failed");
+        Require(Output[0] == Value[0], "maximum packet dispatch did not finish");
+        const auto* words = reinterpret_cast<const std::uint32_t*>(memory);
+        std::uint32_t markers = 0;
+        for (std::size_t offset = 0; offset + 0x4001 <= size / 4; ++offset) {
+            if (words[offset] != 0xffff102cu) continue;
+            Require(std::memcmp(words + offset + 1, marker.c_str(), marker.size() + 1) == 0, "maximum marker was truncated");
+            ++markers;
+        }
+        Require(markers == 2, "the maximum markers were not stored in the command area");
+    }
+    Require(factory->DestroyCompute(sequence) == 0, "capacity sequence destruction failed");
+    Require(Shutdown(manager) == 0, "capacity manager shutdown failed");
+    for (auto offset = size; offset < allocationSize; ++offset)
+        Require(memory[offset] == 0xa5, "maximum packets escaped the supplied work area");
+    ::operator delete(memory, std::align_val_t{256});
+}
+
 void StorageCase(bool directMemory) {
     constexpr std::uint64_t mask = (1u << 1) | (1u << 5) | (1u << 8);
     const MemorySizeQueryParams query{1, 2, 0, 0, 32, 8, 4, 2, mask};
@@ -304,7 +348,7 @@ void StorageCase(bool directMemory) {
 
 int RunJobManagerCase(const char* name) {
     try {
-        Require(std::strcmp(name, "compute") == 0 || std::strcmp(name, "size") == 0 || std::strcmp(name, "execution") == 0 || std::strcmp(name, "storage") == 0, "unknown compute fixture");
+        Require(std::strcmp(name, "compute") == 0 || std::strcmp(name, "size") == 0 || std::strcmp(name, "execution") == 0 || std::strcmp(name, "storage") == 0 || std::strcmp(name, "capacity") == 0, "unknown compute fixture");
 #ifndef ANYPS5_JOB_MANAGER_REFERENCE
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -313,6 +357,7 @@ int RunJobManagerCase(const char* name) {
         BuildShader();
         if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "size") == 0) SizeCase();
         if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "execution") == 0) RunCase();
+        if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "capacity") == 0) CapacityCase();
         if (std::strcmp(name, "compute") == 0 || std::strcmp(name, "storage") == 0) {
             StorageCase(false);
             StorageCase(true);
