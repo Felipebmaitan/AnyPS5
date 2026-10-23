@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <immintrin.h>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -210,6 +211,7 @@ public:
     void DispatchCompleted(std::uint32_t invocations);
     void CollectCompute();
     void SetComputeStorage(std::uint32_t* commands, std::size_t words, Label* completion);
+    void CancelWaits();
     bool Busy() const { return outstanding != 0; }
 
     Manager* manager = nullptr;
@@ -257,6 +259,7 @@ public:
 struct Manager {
     std::mutex lock;
     std::condition_variable work;
+    std::condition_variable quiesced;
     bool running = false;
     std::uint32_t blockedWaiters = 0;
     std::uint32_t freeNodes = 0;
@@ -328,6 +331,7 @@ void Sequence::RequireOpen() const {
 }
 
 void Sequence::Advance() {
+    if (!manager->running) return;
     while (cursor < items.size()) {
         Item& item = items[cursor];
         if (item.type == ItemType::Dispatch) {
@@ -374,7 +378,14 @@ void Sequence::DispatchCompleted(std::uint32_t invocations) {
     completed.invocations += invocations;
     ++completed.dispatches;
     --outstanding;
-    if (outstanding == 0) Advance();
+    if (outstanding == 0 && manager->running) Advance();
+}
+
+void Sequence::CancelWaits() {
+    for (Item& item : items) {
+        if (item.type == ItemType::Wait) *item.passed = true;
+    }
+    passed.notify_all();
 }
 
 int Sequence::Dispatch(JobEntry entry, void* argument, std::uint32_t count, const char*) {
@@ -540,6 +551,7 @@ int Sequence::WaitLocked(std::unique_lock<std::mutex>& guard) {
     Advance();
     passed.wait(guard, [&done] { return done; });
     --manager->blockedWaiters;
+    manager->quiesced.notify_all();
     return result;
 }
 
@@ -685,6 +697,17 @@ int ValidateWorkers(const ConfigParams& config, std::uint32_t workers) {
     return 0;
 }
 
+class ThreadAttributes {
+public:
+    ThreadAttributes() {
+        if (scePthreadAttrInit(&value) != 0) throw std::runtime_error("libSceJobManager: scePthreadAttrInit failed");
+    }
+    ~ThreadAttributes() { static_cast<void>(scePthreadAttrDestroy(&value)); }
+    ThreadAttributes(const ThreadAttributes&) = delete;
+    ThreadAttributes& operator=(const ThreadAttributes&) = delete;
+    PthreadAttr value = nullptr;
+};
+
 void StartWorkers(Manager& manager, const ConfigParams& config, std::uint32_t workers) {
     std::uint32_t remaining = config.threadFlags & 0x1fff;
     for (std::uint32_t index = 0; index < workers; ++index) {
@@ -695,15 +718,13 @@ void StartWorkers(Manager& manager, const ConfigParams& config, std::uint32_t wo
         }
         const std::string name = config.threadName != nullptr ? std::string(config.threadName).substr(0, 31) : "SceJobManagerWorker" + std::to_string(index);
         const KernelSchedParam schedule{static_cast<int>(config.priority)};
-        PthreadAttr attributes = nullptr;
-        if (scePthreadAttrInit(&attributes) != 0) throw std::runtime_error("libSceJobManager: scePthreadAttrInit failed");
-        if (scePthreadAttrSetinheritsched(&attributes, 0) != 0 || scePthreadAttrSetschedparam(&attributes, &schedule) != 0 ||
-            scePthreadAttrSetstacksize(&attributes, config.stackSize) != 0 || scePthreadAttrSetaffinity(&attributes, affinity) != 0) {
+        ThreadAttributes attributes;
+        if (scePthreadAttrSetinheritsched(&attributes.value, 0) != 0 || scePthreadAttrSetschedparam(&attributes.value, &schedule) != 0 ||
+            scePthreadAttrSetstacksize(&attributes.value, config.stackSize) != 0 || scePthreadAttrSetaffinity(&attributes.value, affinity) != 0) {
             throw std::runtime_error("libSceJobManager: a worker thread attribute was rejected");
         }
         Pthread thread = nullptr;
-        const int created = scePthreadCreate(&thread, &attributes, WorkerEntry, &manager, name.c_str());
-        scePthreadAttrDestroy(&attributes);
+        const int created = scePthreadCreate(&thread, &attributes.value, WorkerEntry, &manager, name.c_str());
         if (created != 0) throw std::runtime_error("libSceJobManager: scePthreadCreate failed for a worker");
         manager.workers.push_back(thread);
     }
@@ -725,14 +746,42 @@ void StartCompute(Manager& manager, const WorkLayout& layout, std::uint32_t comp
     }
     manager.freeComputeSequences = computeSequences == MaxSequences ? ~std::uint32_t{0} : (std::uint32_t{1} << computeSequences) - 1;
     const KernelSchedParam schedule{static_cast<int>(priority)};
-    PthreadAttr attributes = nullptr;
-    if (scePthreadAttrInit(&attributes) != 0 || scePthreadAttrSetinheritsched(&attributes, 0) != 0 || scePthreadAttrSetschedparam(&attributes, &schedule) != 0 ||
-        scePthreadAttrSetstacksize(&attributes, 0x4000) != 0 || scePthreadAttrSetaffinity(&attributes, affinity) != 0) {
+    ThreadAttributes attributes;
+    if (scePthreadAttrSetinheritsched(&attributes.value, 0) != 0 || scePthreadAttrSetschedparam(&attributes.value, &schedule) != 0 ||
+        scePthreadAttrSetstacksize(&attributes.value, 0x4000) != 0 || scePthreadAttrSetaffinity(&attributes.value, affinity) != 0) {
         throw std::runtime_error("libSceJobManager: a compute handler thread attribute was rejected");
     }
-    const int created = scePthreadCreate(&manager.computeHandler, &attributes, ComputeHandlerEntry, &manager, "SceJobManagerComputeEventHdlr");
-    scePthreadAttrDestroy(&attributes);
+    const int created = scePthreadCreate(&manager.computeHandler, &attributes.value, ComputeHandlerEntry, &manager, "SceJobManagerComputeEventHdlr");
     if (created != 0) throw std::runtime_error("libSceJobManager: scePthreadCreate failed for the compute handler");
+}
+
+void StopManager(Manager& manager) {
+    {
+        const std::lock_guard guard(manager.lock);
+        manager.running = false;
+        manager.work.notify_all();
+    }
+    while (!manager.workers.empty()) {
+        if (scePthreadJoin(manager.workers.back(), nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
+        manager.workers.pop_back();
+    }
+    if (manager.computeHandler != nullptr) {
+        if (sceKernelAddUserEventEdge(manager.computeEvents, 0) != 0 || sceKernelTriggerUserEvent(manager.computeEvents, 0, nullptr) != 0) {
+            throw std::runtime_error("sce::Job::JobManager::shutdown: the compute handler could not be signalled");
+        }
+        if (scePthreadJoin(manager.computeHandler, nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
+        manager.computeHandler = nullptr;
+    }
+    if (manager.computeEvents != 0) {
+        for (const std::uint32_t queue : manager.computeQueues) static_cast<void>(sceAgcDriverDeleteEqEvent(manager.computeEvents, static_cast<int>(queue)));
+        if (sceKernelDeleteEqueue(manager.computeEvents) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: sceKernelDeleteEqueue failed");
+        manager.computeEvents = 0;
+        manager.computeQueues.clear();
+    }
+    std::unique_lock guard(manager.lock);
+    for (Sequence& sequence : manager.sequences) sequence.CancelWaits();
+    for (Sequence& sequence : manager.computeSequences) sequence.CancelWaits();
+    manager.quiesced.wait(guard, [&manager] { return manager.blockedWaiters == 0; });
 }
 
 int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t workers, std::uint32_t sequences, std::uint32_t computeSequences, std::uint64_t computeQueueMask, const ConfigParams* config, bool unified) {
@@ -764,22 +813,35 @@ int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t worke
     const std::uint32_t handlerPriority = ownHandlerSettings ? settings.computePriority : 0x100;
     const std::uint32_t handlerAffinity = ownHandlerSettings ? settings.computeAffinity : 0x1fff;
     if (computeSequences != 0 && (handlerPriority < 0x100 || handlerPriority > 0x2ff || handlerAffinity == 0 || handlerAffinity > 0x1fff)) return ManagerInvalidArgument;
-    auto* manager = new Manager;
+    auto owner = std::make_unique<Manager>();
+    Manager* manager = owner.get();
     manager->running = true;
     manager->workerCount = workers;
     manager->spinTicks = sceKernelGetTscFrequency() / 1000000 * settings.spinMicroseconds;
     manager->freeNodes = layout.nodes - 1;
     manager->freeSequences = sequences == MaxSequences ? ~std::uint32_t{0} : (std::uint32_t{1} << sequences) - 1;
     manager->sequences = std::vector<Sequence>(sequences);
+    manager->workers.reserve(workers);
+    manager->computeQueues.reserve(computeQueues);
     for (std::uint32_t priority = 0; priority < 2; ++priority) {
         manager->factories[priority].manager = manager;
         manager->factories[priority].priority = priority;
         manager->unifiedFactories[priority].manager = manager;
         manager->unifiedFactories[priority].priority = priority;
     }
-    if (computeSequences != 0) StartCompute(*manager, layout, computeSequences, computeQueueMask, handlerPriority, handlerAffinity);
-    Implementation(self) = manager;
-    StartWorkers(*manager, settings, workers);
+    try {
+        if (computeSequences != 0) StartCompute(*manager, layout, computeSequences, computeQueueMask, handlerPriority, handlerAffinity);
+        StartWorkers(*manager, settings, workers);
+    } catch (...) {
+        try {
+            StopManager(*manager);
+        } catch (...) {
+            Implementation(self) = owner.release();
+            throw;
+        }
+        throw;
+    }
+    Implementation(self) = owner.release();
     return 0;
 }
 
@@ -855,26 +917,15 @@ int APS5_VABI _ZN3sce3Job10JobManager10initializeEPvmjjPKNS1_12ConfigParamsE(voi
 int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
     Manager* manager = Implementation(self);
     if (manager == nullptr) return ManagerNotInitialized;
+    if (currentWorker == manager) throw std::runtime_error("sce::Job::JobManager::shutdown: a worker cannot join itself");
     {
         const std::lock_guard guard(manager->lock);
-        if (manager->blockedWaiters != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: a thread is still blocked in a sequence wait");
         for (const Sequence& sequence : manager->computeSequences) {
             if (sequence.open && sequence.Busy()) throw std::runtime_error("sce::Job::JobManager::shutdown: a compute sequence still has work in flight");
         }
         manager->running = false;
-        manager->work.notify_all();
     }
-    for (const Pthread worker : manager->workers) {
-        if (scePthreadJoin(worker, nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
-    }
-    if (manager->computeHandler != nullptr) {
-        if (sceKernelAddUserEventEdge(manager->computeEvents, 0) != 0 || sceKernelTriggerUserEvent(manager->computeEvents, 0, nullptr) != 0) {
-            throw std::runtime_error("sce::Job::JobManager::shutdown: the compute handler could not be signalled");
-        }
-        if (scePthreadJoin(manager->computeHandler, nullptr) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: scePthreadJoin failed");
-        for (const std::uint32_t queue : manager->computeQueues) static_cast<void>(sceAgcDriverDeleteEqEvent(manager->computeEvents, static_cast<int>(queue)));
-        if (sceKernelDeleteEqueue(manager->computeEvents) != 0) throw std::runtime_error("sce::Job::JobManager::shutdown: sceKernelDeleteEqueue failed");
-    }
+    StopManager(*manager);
     Implementation(self) = nullptr;
     delete manager;
     return 0;
