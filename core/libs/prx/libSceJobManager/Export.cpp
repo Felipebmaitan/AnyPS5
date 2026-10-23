@@ -331,10 +331,10 @@ void Sequence::RequireOpen() const {
 }
 
 void Sequence::Advance() {
-    if (!manager->running) return;
     while (cursor < items.size()) {
         Item& item = items[cursor];
         if (item.type == ItemType::Dispatch) {
+            if (!manager->running) return;
             ++outstanding;
             ++cursor;
             manager->runQueues[priority].push_back(&item);
@@ -343,6 +343,7 @@ void Sequence::Advance() {
             continue;
         }
         if (item.type == ItemType::Compute || item.type == ItemType::ComputeIndirect) {
+            if (!manager->running) return;
             ++outstanding;
             ++cursor;
             SubmitCompute(item);
@@ -378,7 +379,7 @@ void Sequence::DispatchCompleted(std::uint32_t invocations) {
     completed.invocations += invocations;
     ++completed.dispatches;
     --outstanding;
-    if (outstanding == 0 && manager->running) Advance();
+    if (outstanding == 0) Advance();
 }
 
 void Sequence::CancelWaits() {
