@@ -10,6 +10,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 struct MemorySizeQueryParams {
     std::uint32_t version;
@@ -58,6 +61,7 @@ extern "C" {
 Pthread APS5_VABI scePthreadSelf();
 int APS5_VABI pthread_getcpuclockid_nid_postfix(Pthread thread, int* clockId);
 int APS5_VABI sceKernelClockGettime(KernelClockid clockId, KernelTimespec* time);
+int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds);
 void APS5_VABI _ZN3sce3Job10JobManagerC1Ev(void*);
 void APS5_VABI _ZN3sce3Job10JobManagerD1Ev(void*);
 std::uint64_t APS5_VABI _ZN3sce3Job10JobManager27calculateRequiredMemorySizeEPKNS1_21MemorySizeQueryParamsE(const MemorySizeQueryParams*);
@@ -539,6 +543,112 @@ static void WorkerWakeCase() {
     }
 }
 
+struct HeldWorker {
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+};
+
+struct SpinClock {
+    int guest = 0;
+    std::int64_t reference = 0;
+#ifdef _WIN32
+    HANDLE thread = nullptr;
+    ~SpinClock() { if (thread != nullptr) CloseHandle(thread); }
+#endif
+};
+
+static std::int64_t SpinCpuUnits(const SpinClock& clock);
+
+static void APS5_VABI CaptureSpinClock(void* argument, std::uint32_t) {
+    auto& clock = *static_cast<SpinClock*>(argument);
+    CaptureWorkerClock(&clock.guest, 0);
+#ifdef _WIN32
+    clock.thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+    Require(clock.thread != nullptr);
+#endif
+    const auto before = SpinCpuUnits(clock);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+    while (std::chrono::steady_clock::now() < until) {}
+    clock.reference = SpinCpuUnits(clock) - before;
+    Require(clock.reference > 0);
+}
+
+static std::int64_t SpinCpuUnits(const SpinClock& clock) {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    Require(QueryThreadCycleTime(clock.thread, &cycles));
+    return static_cast<std::int64_t>(cycles);
+#else
+    return CpuNanos(clock.guest);
+#endif
+}
+
+static void APS5_VABI HoldWorker(void* argument, std::uint32_t) {
+    auto& worker = *static_cast<HeldWorker*>(argument);
+    worker.started = true;
+    worker.started.notify_one();
+    worker.release.wait(false);
+}
+
+struct SpinSample {
+    std::int64_t consumed;
+    std::int64_t reference;
+};
+
+static SpinSample MeasureWorkerSpin(std::uint32_t spin, std::uint32_t rounds, bool pending) {
+    Block block(SizeFor(2, 2, 4, 2, 2));
+    ManagerObject manager;
+    const ConfigParams config{0, 0x10003, 0x10000, 0x2bc, "WorkerSpin", spin, 0, 0, 0};
+    Require(Initialize(manager.storage, block.memory, block.bytes, 2, 2, &config) == 0);
+    auto* factory = Factories(manager.storage, 0);
+    Sequence* held = nullptr;
+    Sequence* pulse = nullptr;
+    Require(factory->Create(&held, 4, 4, 2, 2, "held worker") == 0);
+    Require(factory->Create(&pulse, 4, 4, 2, 2, "idle worker") == 0);
+    HeldWorker worker;
+    Require(held->Dispatch(HoldWorker, &worker, 1, nullptr) == 0);
+    worker.started.wait(false);
+    if (pending) {
+        Require(held->SyncPoint() == 0);
+        Require(held->Dispatch(Nothing, nullptr, 1, nullptr) == 0);
+    }
+    SpinClock clock;
+    Require(pulse->Dispatch(CaptureSpinClock, &clock, 1, nullptr) == 0 && pulse->Wait() == 0);
+    RequireParked(clock.guest);
+    const auto before = SpinCpuUnits(clock);
+    for (std::uint32_t round = 0; round < rounds; ++round) {
+        Require(pulse->Dispatch(Nothing, nullptr, 1, nullptr) == 0 && pulse->Wait() == 0);
+        Require(sceKernelUsleep_nid_postfix(1000) == 0);
+    }
+    const auto consumed = SpinCpuUnits(clock) - before;
+    RequireParked(clock.guest);
+    Require(!worker.release);
+    worker.release = true;
+    worker.release.notify_one();
+    Require(held->Wait() == 0);
+    Require(factory->Destroy(held) == 0 && factory->Destroy(pulse) == 0);
+    Require(Shutdown(manager.storage) == 0);
+    return {consumed, clock.reference};
+}
+
+static void WorkerSpinCase() {
+    constexpr std::uint32_t rounds = 512;
+    const auto parked = MeasureWorkerSpin(0, rounds, true);
+    const auto spinning = MeasureWorkerSpin(50, rounds, true);
+    const auto noPending = MeasureWorkerSpin(50, rounds, false);
+#ifdef _WIN32
+    constexpr const char* units = "cycles";
+#else
+    constexpr const char* units = "ns";
+#endif
+    std::fprintf(stderr, "idle worker CPU over %u pulses (%s): spin=0 %lld, spin=50 %lld, no pending work %lld, 5ms active reference %lld\n", rounds, units,
+        static_cast<long long>(parked.consumed), static_cast<long long>(spinning.consumed), static_cast<long long>(noPending.consumed), static_cast<long long>(spinning.reference));
+    const auto interval = spinning.reference * rounds / 100;
+    Require(spinning.consumed > parked.consumed + interval / 3);
+    Require(spinning.consumed < parked.consumed + interval * 5);
+    Require(noPending.consumed < parked.consumed + interval / 3);
+}
+
 struct WorkerClocks {
     std::array<int, 4> clocks{};
     std::atomic<unsigned int> arrived{0};
@@ -602,6 +712,7 @@ int RunJobManagerCase(const char* caseName) {
     else if (name == "shutdown") ShutdownCase();
     else if (name == "worker_policy") WorkerPolicyCase();
     else if (name == "worker_wake") WorkerWakeCase();
+    else if (name == "worker_spin") WorkerSpinCase();
     else if (name == "worker_count") WorkerCountCase();
     else return 2;
     return 0;
