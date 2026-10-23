@@ -20,6 +20,9 @@
 extern "C" {
 int APS5_VABI _sceUlobjmgrRegisterObject_nid_postfix(std::uint64_t object, std::int32_t kind, std::uint32_t* id);
 int APS5_VABI _sceUlobjmgrUnregisterObject_nid_postfix(std::uint32_t id);
+int APS5_VABI sceRazorCpuJobManagerSequence(const char* name, std::uint16_t manager, std::uint16_t sequence, std::uint16_t event);
+int APS5_VABI sceRazorCpuJobManagerJob(std::uint16_t manager, std::uint16_t dispatch, std::uint16_t index, std::uint16_t event);
+int APS5_VABI sceRazorCpuJobManagerDispatch(const char* name, std::uint16_t manager, std::uint16_t sequence, std::uint16_t dispatch, std::uint16_t count, std::uint64_t entry, std::uint64_t argument);
 int APS5_VABI scePthreadAttrInit(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrSetinheritsched(PthreadAttr* attr, int inheritSched);
@@ -237,7 +240,7 @@ public:
     APS5_VABI int DispatchCompute(const void* shader, void* userData, std::int32_t x, std::int32_t y, std::int32_t z, const char* name) override;
     APS5_VABI int DispatchComputeIndirect(const void* shader, void* userData, const void* indirectArguments, const char* name) override;
 
-    bool Open(Manager* owner, const Counters& limit, std::uint32_t runQueue);
+    bool Open(Manager* owner, const Counters& limit, std::uint32_t runQueue, const char* name);
     int WaitAndClose(std::uint32_t index);
     void Advance();
     void DispatchCompleted(std::uint32_t invocations);
@@ -250,6 +253,7 @@ public:
     bool open = false;
     bool compute = false;
     std::uint32_t queue = 0;
+    std::uint16_t profileId = 0;
 
 private:
     int Latch(int code);
@@ -260,6 +264,7 @@ private:
     void RemoveWait(Item* item);
     void SubmitCompute(const Item& item);
     void FlushCompute();
+    void Profile(std::uint16_t event);
 
     Counters limits;
     Counters submitted;
@@ -276,6 +281,8 @@ private:
     JobManager::ComputeProgress progress;
     std::uint32_t pendingCompute = 0;
     bool batchStarted = false;
+    bool profileActive = false;
+    const char* profileName = nullptr;
     std::uint32_t* commandBegin = nullptr;
     std::size_t commandWords = 0;
     std::size_t commandUsed = 0;
@@ -310,6 +317,7 @@ public:
 
 struct Manager {
     std::uint32_t objectId = 0;
+    std::uint16_t profileId = 0;
     std::mutex lock;
     std::condition_variable work;
     std::condition_variable quiesced;
@@ -372,7 +380,12 @@ int Sequence::Latch(int code) {
     return code;
 }
 
-bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueue) {
+void Sequence::Profile(std::uint16_t event) {
+    const auto id = static_cast<std::uint16_t>(profileId - (compute && event <= 2 ? manager->sequences.size() : 0));
+    static_cast<void>(sceRazorCpuJobManagerSequence(profileName, manager->profileId, id, event));
+}
+
+bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueue, const char* name) {
     manager = owner;
     limits = limit;
     submitted = {};
@@ -385,9 +398,12 @@ bool Sequence::Open(Manager* owner, const Counters& limit, std::uint32_t runQueu
     last = nullptr;
     commandUsed = 0;
     batchStarted = false;
+    profileActive = false;
+    profileName = name;
     reserved = TakeNode(*owner);
     if (reserved == nullptr) return false;
     open = true;
+    Profile(1);
     return true;
 }
 
@@ -421,6 +437,8 @@ void Sequence::Advance() {
     while (cursor != nullptr) {
         Item& item = *cursor;
         if (item.type == ItemType::Dispatch) {
+            if (!profileActive) Profile(3);
+            profileActive = true;
             if (!manager->running) return;
             ++outstanding;
             cursor = item.next;
@@ -431,6 +449,8 @@ void Sequence::Advance() {
         }
         if (item.type == ItemType::Compute || item.type == ItemType::ComputeIndirect) {
             if (!manager->running) return;
+            if (!profileActive) Profile(3);
+            profileActive = true;
             ++outstanding;
             cursor = item.next;
             SubmitCompute(item);
@@ -438,6 +458,8 @@ void Sequence::Advance() {
         }
         FlushCompute();
         if (outstanding != 0) return;
+        if (profileActive) Profile(4);
+        profileActive = false;
         if (item.type == ItemType::SyncPoint) {
             ++completed.syncPoints;
             cursor = item.next;
@@ -644,6 +666,7 @@ int Sequence::WaitAndClose(std::uint32_t index) {
     cursor = nullptr;
     outstanding = 0;
     open = false;
+    Profile(2);
     (compute ? manager->freeComputeSequences : manager->freeSequences) |= std::uint32_t{1} << index;
     return result;
 }
@@ -677,7 +700,7 @@ bool ValidLimits(std::uint32_t invocations, std::uint32_t dispatches, std::uint3
 }
 
 template <typename TSequences>
-int CreateIn(Manager* manager, TSequences& sequences, std::uint32_t& free, std::uint32_t priority, ISequence** out, const Counters& limits) {
+int CreateIn(Manager* manager, TSequences& sequences, std::uint32_t& free, std::uint32_t priority, ISequence** out, const Counters& limits, const char* name) {
     if (out == nullptr) return SequenceNullArgument;
     if (!ValidLimits(limits.invocations, limits.dispatches, limits.syncPoints, limits.waits)) return SequenceOutOfRange;
     const std::lock_guard guard(manager->lock);
@@ -685,7 +708,7 @@ int CreateIn(Manager* manager, TSequences& sequences, std::uint32_t& free, std::
     const int index = std::countr_zero(free);
     free &= ~(std::uint32_t{1} << index);
     Sequence& sequence = sequences[static_cast<std::size_t>(index)].value;
-    if (!sequence.Open(manager, limits, priority)) return SequenceNoNodes;
+    if (!sequence.Open(manager, limits, priority, name)) return SequenceNoNodes;
     *out = &sequence;
     return 0;
 }
@@ -706,16 +729,16 @@ int DestroyIn(Manager* manager, TSequences& sequences, const std::uint32_t& free
     return 0;
 }
 
-int Factory::Create(ISequence** out, std::uint32_t invocations, std::uint32_t dispatches, std::uint32_t syncPoints, std::uint32_t waits, const char*) {
-    return CreateIn(manager, manager->sequences, manager->freeSequences, priority, out, {invocations, dispatches, syncPoints, waits});
+int Factory::Create(ISequence** out, std::uint32_t invocations, std::uint32_t dispatches, std::uint32_t syncPoints, std::uint32_t waits, const char* name) {
+    return CreateIn(manager, manager->sequences, manager->freeSequences, priority, out, {invocations, dispatches, syncPoints, waits}, name);
 }
 
 int Factory::Destroy(ISequence* sequence) {
     return DestroyIn(manager, manager->sequences, manager->freeSequences, sequence);
 }
 
-int Factory::CreateCompute(ISequence** out, std::uint32_t invocations, std::uint32_t dispatches, std::uint32_t syncPoints, std::uint32_t waits, const char*) {
-    return CreateIn(manager, manager->computeSequences, manager->freeComputeSequences, priority, out, {invocations, dispatches, syncPoints, waits});
+int Factory::CreateCompute(ISequence** out, std::uint32_t invocations, std::uint32_t dispatches, std::uint32_t syncPoints, std::uint32_t waits, const char* name) {
+    return CreateIn(manager, manager->computeSequences, manager->freeComputeSequences, priority, out, {invocations, dispatches, syncPoints, waits}, name);
 }
 
 int Factory::DestroyCompute(ISequence* sequence) {
@@ -748,10 +771,16 @@ bool RunOne(Manager& manager, std::unique_lock<std::mutex>& guard) {
     const std::uint32_t index = item->cpu.handedOut++;
     const JobEntry entry = item->cpu.entry;
     void* const argument = item->cpu.argument;
+    const auto dispatchId = static_cast<std::uint16_t>(item - manager.nodes.data());
     guard.unlock();
+    static_cast<void>(sceRazorCpuJobManagerJob(manager.profileId, dispatchId, static_cast<std::uint16_t>(index), 16));
     entry(argument, index);
+    static_cast<void>(sceRazorCpuJobManagerJob(manager.profileId, dispatchId, static_cast<std::uint16_t>(index), 32));
     guard.lock();
-    if (++item->cpu.completed == item->cpu.count) item->sequence->DispatchCompleted(item->cpu.count);
+    if (++item->cpu.completed == item->cpu.count) {
+        static_cast<void>(sceRazorCpuJobManagerDispatch(item->name, manager.profileId, item->sequence->profileId, dispatchId, static_cast<std::uint16_t>(item->cpu.count), reinterpret_cast<std::uint64_t>(entry), reinterpret_cast<std::uint64_t>(argument)));
+        item->sequence->DispatchCompleted(item->cpu.count);
+    }
     return true;
 }
 
@@ -970,10 +999,12 @@ int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t worke
     auto* computeSlots = cpuSlots + sequences;
     for (std::uint32_t index = 0; index < sequences; ++index) {
         std::construct_at(cpuSlots + index);
+        cpuSlots[index].value.profileId = static_cast<std::uint16_t>(index);
         manager->sequences = {cpuSlots, index + 1};
     }
     for (std::uint32_t index = 0; index < computeSequences; ++index) {
         std::construct_at(computeSlots + index);
+        computeSlots[index].value.profileId = static_cast<std::uint16_t>(sequences + index);
         manager->computeSequences = {computeSlots, index + 1};
     }
     for (std::uint32_t priority = 0; priority < 2; ++priority) {
@@ -995,7 +1026,14 @@ int Initialize(void* self, void* memory, std::uint64_t size, std::uint32_t worke
         throw;
     }
     Implementation(self) = owner.release();
-    return _sceUlobjmgrRegisterObject_nid_postfix(base, 0x21, &manager->objectId);
+    const int result = _sceUlobjmgrRegisterObject_nid_postfix(base, 0x21, &manager->objectId);
+    std::uint32_t crc = 0;
+    for (std::uint32_t byte = 0; byte < sizeof(base); ++byte) {
+        crc ^= static_cast<std::uint8_t>(base >> (byte * 8));
+        for (std::uint32_t bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1)));
+    }
+    manager->profileId = static_cast<std::uint16_t>(crc >> 16);
+    return result;
 }
 
 ISequenceFactory* FactoryFor(void* self, std::uint32_t priority, bool unified) {
