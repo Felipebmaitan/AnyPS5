@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -61,7 +62,9 @@ def run(args, directory):
         else:
             unwrap(args.module, target)
     source = directory / "input.elf"
-    source.write_bytes(executable("jobref.prx", symbol="Run_nid_no_patch"))
+    entry = executable("jobref.prx", symbol="Run_nid_no_patch")
+    entry[0x4000:0x400f] = b"\x48\x83\xec\x08\xff\x15" + struct.pack("<i", 0x4a20 - 0x400a) + b"\x48\x83\xc4\x08\xc3"
+    source.write_bytes(entry)
     output = directory / f"reference{suffix}"
     options = ["--skip-sce-module"] if args.host else []
     platform = ["--windows"] if sys.platform == "win32" else []
