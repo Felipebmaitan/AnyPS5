@@ -9,6 +9,8 @@ add_custom_command(OUTPUT ${libreSslStrings}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/GenerateErrorStrings.py ${libreSslSource} ${libreSslStrings}
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/GenerateErrorStrings.py ${libreSslStringSources}
     VERBATIM)
+add_custom_target(libressl_error_strings DEPENDS ${libreSslStrings})
+add_dependencies(libSceLibreSsl libressl_error_strings)
 target_sources(libSceLibreSsl PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/Error.cpp
     ${CMAKE_CURRENT_LIST_DIR}/ErrorQueue.cpp ${libreSslStrings})
 target_include_directories(libSceLibreSsl PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/prx/libSceLibreSsl)
