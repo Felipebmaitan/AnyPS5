@@ -32,6 +32,8 @@ struct GuestSigaction {
 };
 static_assert(sizeof(GuestSigaction) == 32 && offsetof(GuestSigaction, flags) == 8 && offsetof(GuestSigaction, mask) == 12);
 
+extern "C" GuestSignalSet _sigintr_nid_postfix{};
+
 namespace {
 using GuestHandler = void (APS5_VABI *)(int);
 constexpr int MaxSignal = 128;
@@ -120,6 +122,10 @@ bool TakePending(int guest) {
     const std::uint32_t bit = SignalBit(guest);
     if ((word.load(std::memory_order_relaxed) & bit) == 0) return false;
     return (word.fetch_and(~bit, std::memory_order_relaxed) & bit) != 0;
+}
+
+void DiscardPendingIfIgnored(int guest, const GuestSigaction& action) {
+    if (action.handler == 1 || (action.handler == 0 && IgnoredByDefault(guest))) TakePending(guest);
 }
 
 bool PendingInSet(const GuestSignalSet& set, int* guest) {
@@ -483,10 +489,11 @@ GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     const auto invalid = reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1));
     if (guest < 1 || guest > MaxSignal || ((guest == GuestSigkill || guest == GuestSigstop) && handler != nullptr)) { *__error_nid_postfix() = 22; return invalid; }
     std::lock_guard lock(registration);
-    const GuestSigaction action{reinterpret_cast<std::uintptr_t>(handler), SaRestart, {}};
+    const GuestSigaction action{reinterpret_cast<std::uintptr_t>(handler), SignalInSet(_sigintr_nid_postfix, guest) ? 0 : SaRestart, {}};
     if (!Install(guest, action)) { *__error_nid_postfix() = 22; return invalid; }
     const auto previous = reinterpret_cast<GuestHandler>(dispositions[guest].handler);
     dispositions[guest] = action;
+    DiscardPendingIfIgnored(guest, action);
     return previous;
 }
 int APS5_VABI sigaction_nid_postfix(int guest, const GuestSigaction* action, GuestSigaction* previous) {
@@ -498,9 +505,13 @@ int APS5_VABI sigaction_nid_postfix(int guest, const GuestSigaction* action, Gue
     if (action) {
         if (!Install(guest, *action)) { *__error_nid_postfix() = 22; return -1; }
         dispositions[guest] = *action;
+        DiscardPendingIfIgnored(guest, *action);
     }
     if (previous) *previous = old;
     return 0;
+}
+int APS5_VABI _sigaction_nid_postfix(int guest, const GuestSigaction* action, GuestSigaction* previous) {
+    return sigaction_nid_postfix(guest, action, previous);
 }
 int APS5_VABI raise_nid_postfix(int guest) {
     if (guest == 0) return 0;
@@ -647,6 +658,10 @@ int APS5_VABI sigsuspend_nid_postfix(const GuestSignalSet* set) {
     return -1;
 }
 
+int APS5_VABI _sigsuspend_nid_postfix(const GuestSignalSet* set) {
+    return sigsuspend_nid_postfix(set);
+}
+
 int APS5_VABI sigpending_nid_postfix(GuestSignalSet* set) {
     if (set == nullptr) { *__error_nid_postfix() = 14; return -1; }
     auto& pending = Pending();
@@ -665,4 +680,13 @@ int APS5_VABI _is_signal_return_nid_postfix(std::uint64_t programCounter) {
     return 0;
 }
 
+}
+
+namespace {
+struct RegisterSignalsOnLoad {
+    RegisterSignalsOnLoad() {
+        RegisterSigaction_nid_no_patch(reinterpret_cast<SigactionFn_nid_no_patch>(sigaction_nid_postfix), _sigintr_nid_postfix.bits);
+    }
+};
+const RegisterSignalsOnLoad gRegisterSignals;
 }

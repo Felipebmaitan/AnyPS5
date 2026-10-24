@@ -41,6 +41,8 @@ bool LaunchAppThrows(const char* titleId, const char* const* arguments, const vo
 }
 
 extern "C" int APS5_VABI sceSystemServicePowerTick(void);
+extern "C" int APS5_VABI sceSystemServiceIsBgmPlaying(void);
+extern "C" int APS5_VABI sceShellCoreUtilIsBgmPlaying(void);
 extern "C" int APS5_VABI sceSystemServiceReportAbnormalTermination(const void* info);
 extern "C" int APS5_VABI sceSystemServiceDisableMusicPlayer(void);
 extern "C" int APS5_VABI sceSystemServiceReenableMusicPlayer(void);
@@ -89,6 +91,7 @@ int main() {
     Require(sceSystemServiceDisableMusicPlayer() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceDisableMusicPlayer() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceReenableMusicPlayer() == SYSTEM_SERVICE_OK);
+    Require(sceSystemServiceIsBgmPlaying() == 0 && sceShellCoreUtilIsBgmPlaying() == 0);
     Require(sceSystemServiceReenableMusicPlayer() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceDisableMediaPlay() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceDisableMediaPlay() == SYSTEM_SERVICE_OK);
