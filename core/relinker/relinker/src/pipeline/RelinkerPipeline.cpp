@@ -409,6 +409,7 @@ RelinkResult RelinkerPipeline::Relink() {
 
     std::vector<std::pair<VirtualAddress, VirtualAddress>> unwindRanges;
     std::vector<std::vector<CodeRange>> segmentUnwindRanges(executableSegments.size());
+    bool hasCodeTail = false;
     const bool sceImage = std::any_of(programHeaders.begin(), programHeaders.end(), [](const ProgramHeader& ph) { return ph.Type == PT_SCE_DYNLIBDATA; });
     const bool hasEhFrame = sceImage || std::any_of(programHeaders.begin(), programHeaders.end(), [](const ProgramHeader& ph) { return ph.Type == PT_GNU_EH_FRAME; });
     if (hasEhFrame) {
@@ -419,8 +420,10 @@ RelinkResult RelinkerPipeline::Relink() {
             for (std::size_t index = 0; index < executableSegments.size(); ++index) {
                 auto& [segment, segmentVAddr, segmentFileOffset] = executableSegments[index];
                 static_cast<void>(segmentFileOffset);
-                if (const auto codeEnd = FindSceCodeEnd(segment, segmentVAddr, functions, gotVAddr, dynJmpRelSize))
+                if (const auto codeEnd = FindSceCodeEnd(segment, segmentVAddr, functions, gotVAddr, dynJmpRelSize)) {
+                    hasCodeTail = hasCodeTail || *codeEnd - segmentVAddr < segment.size();
                     segment.resize(*codeEnd - segmentVAddr);
+                }
                 segmentUnwindRanges[index] = SceUnwindRanges(segment, segmentVAddr, functions);
             }
     }
@@ -446,7 +449,8 @@ RelinkResult RelinkerPipeline::Relink() {
         }
     }
 
-    for (auto& patch : syscallScanner->ScanReferencedTailForSyscalls(raw, programHeaders)) syscallPatches.push_back(std::move(patch));
+    if (hasCodeTail)
+        for (auto& patch : syscallScanner->ScanReferencedTailForSyscalls(raw, programHeaders)) syscallPatches.push_back(std::move(patch));
 
 
     std::vector<std::pair<ByteCount, std::string>> exportedSymbols;

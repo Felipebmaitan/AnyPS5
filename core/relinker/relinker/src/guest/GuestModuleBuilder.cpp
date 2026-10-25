@@ -406,11 +406,14 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         std::vector<std::pair<VirtualAddress, VirtualAddress>> unwindRanges;
         for (const auto& function : unwindFunctions) unwindRanges.emplace_back(function.Begin, function.End);
         std::sort(unwindRanges.begin(), unwindRanges.end());
+        bool hasCodeTail = false;
         for (const auto& header : codeHeaders) {
             std::vector<std::uint8_t> code(image.Bytes.begin() + header.Offset, image.Bytes.begin() + header.Offset + header.FileSize);
             if (sceImage)
-                if (const auto end = FindSceCodeEnd(code, header.MappedAddress, unwindFunctions, image.Got, image.Dynamic.RelaPltData.size()))
+                if (const auto end = FindSceCodeEnd(code, header.MappedAddress, unwindFunctions, image.Got, image.Dynamic.RelaPltData.size())) {
+                    hasCodeTail = hasCodeTail || *end - header.MappedAddress < code.size();
                     code.resize(*end - header.MappedAddress);
+                }
             auto scanCode = code;
             for (const auto& table : FindRelativeJumpTables(code, header.MappedAddress, unwindRanges)) {
                 if (table.Begin >= header.MappedAddress && table.End >= table.Begin) {
@@ -431,7 +434,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
-        for (const auto& patch : syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, Io::Utf8Path(image.SourcePath))) {
+        const auto tailPatches = hasCodeTail ? syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, Io::Utf8Path(image.SourcePath)) : std::vector<RelinkPatch>{};
+        for (const auto& patch : tailPatches) {
             if (!image.PatchedRanges.empty()) {
                 const GamePatch::WriterRange trap{patch.Offset, patch.Bytes.size(), "syscall trap"};
                 GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.Traps = std::span<const GamePatch::WriterRange>(&trap, 1)});

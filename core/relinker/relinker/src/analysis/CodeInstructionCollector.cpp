@@ -215,7 +215,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
     };
     std::set<std::uint64_t> dataTargets;
     const auto addPointerRoot = [&](std::uint64_t address) {
-        if (inTail(address)) return;
+        if (inTail(address)) {
+            dataTargets.insert(address);
+            return;
+        }
         if (sceFunctions.empty() || !isCode(address) || insideSceFunction(address)) {
             addRoot(address);
             return;
@@ -601,6 +604,9 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
         if (const auto* header = findCodeHeader(address)) {
             const auto offset = address - header->MappedAddress;
             previousEnd = address + decoder.DecodeInstruction(bytes.data() + header->Offset + offset, header->FileSize - offset).Length;
+            const auto reference = dataTargets.upper_bound(address);
+            if (inTail(address) && reference != dataTargets.end() && *reference < previousEnd)
+                throw Domain::RelinkerException("Code analysis: reference enters a trailing instruction", *reference);
         }
     }
     std::vector<Domain::CodeRange> tailRanges;

@@ -186,6 +186,11 @@ def main():
                     converted = convert(relinker, work, f"{system}-{module}-{root}-raw", image, system, module=module)
                     actual = output_bytes(converted.read_bytes(), system, TAIL, len(TLS))
                     assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), root
+                for interior in (1, 4, 8):
+                    image = fixture("entry", relocated=True)
+                    struct.pack_into("<q", image, 0xA90, TAIL + interior)
+                    convert(relinker, work, f"{system}-{module}-interior-{interior}", image, system,
+                            "Code analysis: reference enters a trailing instruction", module)
                 sdk = bytes.fromhex("48 c7 c0 01 00 00 00 49 89 ca 0f 05 c3")
                 trapped = convert(relinker, work, f"{system}-{module}-trap", fixture("entry", sdk), system,
                                   module=module, flags=("--trap-sdk-syscall-stubs",))
