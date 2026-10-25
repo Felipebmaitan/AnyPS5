@@ -210,6 +210,9 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
     const bool queryLayers = base.dimension == RdnaImageDimension::Dim1D && base.dimensionQueryOnly && rawImageType(descriptor) == ImageType::Color2DArray;
     decoded.dimension = descriptorDimension(descriptor, queryLayers ? RdnaImageDimension::Dim2DArray : base.dimension);
     if (base.depthCompare) {
+        if ((decoded.dimension == RdnaImageDimension::Dim1D || decoded.dimension == RdnaImageDimension::Dim1DArray) && !base.remappedDepth1D && !base.flatLineCompatible) {
+            return rejectImage(PoisonReason::Dimension, "comparison through a 1D descriptor requires compatible 1D coordinate lowering");
+        }
         if (decoded.dimension == RdnaImageDimension::Dim1D) {
             decoded.dimension = RdnaImageDimension::Dim2D;
         } else if (decoded.dimension == RdnaImageDimension::Dim1DArray) {

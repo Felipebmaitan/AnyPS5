@@ -1972,6 +1972,9 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto& samplers = state.program.Info().samplers;
     const bool tableSampler = imageInfo.needsSampler && memory.sampler < samplers.size() && samplers[memory.sampler].table != NoTable;
     const bool tables = base.table != NoTable || tableSampler;
+    if (tables && state.program.Resources().stage == IrShaderStage::Compute && (inst.Opcode() == IrOpcode::ImageQueryLod || (inst.Opcode() == IrOpcode::ImageSampleRaw && !ImageSampleExplicitLod(memory.imageSampleFlags, IrShaderStage::Compute)))) {
+        ctx.Fail(inst, "uses compute texture derivatives through descriptor tables, which is not implemented");
+    }
     const auto modes = base.table != NoTable ? state.program.Info().runtimeImageModes.at(memory.resource) : ResourceMaterializer::RuntimeImageModes(base);
     std::uint32_t tableSelector = 0u;
     std::uint32_t samplerGuard = 0u;

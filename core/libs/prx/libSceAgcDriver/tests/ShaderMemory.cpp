@@ -96,8 +96,8 @@ void operator delete(void* allocation, std::size_t) noexcept {
 namespace {
 
 ShaderRecompiler::SpirvTarget BufferTarget() {
-    static constexpr std::array<std::uint32_t, 6> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityClipDistance};
-    static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    static constexpr std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityClipDistance, spv::CapabilityComputeDerivativeGroupLinearKHR};
+    static constexpr std::array<std::string_view, 3> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage", "SPV_KHR_compute_shader_derivatives"};
     ShaderRecompiler::SpirvTarget target{};
     target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     target.supportedCapabilities = capabilities;
