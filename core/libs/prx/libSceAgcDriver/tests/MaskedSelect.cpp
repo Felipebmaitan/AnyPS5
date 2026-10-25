@@ -1290,8 +1290,14 @@ int main() {
         return !sample(IrShaderStage::Pixel, 0u);
     });
 
-    passed &= run("implicit-LOD compute samples preserve inactive neighbors' coordinates", [&] {
-        return !sample(IrShaderStage::Compute, 0u) && !sample(IrShaderStage::Compute, RdnaImageSampleFlagBias) && !sample(IrShaderStage::Compute, RdnaImageSampleFlagLodClamp);
+    passed &= run("plain compute samples preserve inactive neighbors' coordinates", [&] {
+        return !sample(IrShaderStage::Compute, 0u);
+    });
+    passed &= run("biased compute samples preserve inactive neighbors' coordinates", [&] {
+        return !sample(IrShaderStage::Compute, RdnaImageSampleFlagBias);
+    });
+    passed &= run("clamped compute samples preserve inactive neighbors' coordinates", [&] {
+        return !sample(IrShaderStage::Compute, RdnaImageSampleFlagLodClamp);
     });
 
     passed &= run("explicit-LOD compute samples remain lane-local", [&] {
