@@ -1373,11 +1373,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceExtensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
         state->hdrMetadata = true;
     }
-    if (derivativeFeatures.computeDerivativeGroupLinear == VK_TRUE) {
-        deviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
-        state->capabilities.push_back(spv::CapabilityComputeDerivativeGroupLinearKHR);
-        state->spirvExtensions.push_back("SPV_KHR_compute_shader_derivatives");
-    }
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1402,6 +1397,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceExtensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityShaderClockKHR);
         state->spirvExtensions.push_back("SPV_KHR_shader_clock");
+    }
+    if (derivativeFeatures.computeDerivativeGroupLinear == VK_TRUE) {
+        deviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityComputeDerivativeGroupLinearKHR);
+        state->spirvExtensions.push_back("SPV_KHR_compute_shader_derivatives");
     }
     VkPhysicalDeviceShaderAtomicInt64FeaturesKHR atomicInt64Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR};
     if (hasExtension(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
@@ -1915,10 +1915,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.pNext = &coverageReductionFeatures;
     }
     byteFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
-    if (derivativeFeatures.computeDerivativeGroupLinear == VK_TRUE) {
-        derivativeFeatures.pNext = byteFeatures.pNext;
-        byteFeatures.pNext = &derivativeFeatures;
-    }
     if (state->fragmentShaderBarycentric) {
         barycentricFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &barycentricFeatures;
@@ -1935,6 +1931,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->shaderClock) {
         clockFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &clockFeatures;
+    }
+    if (derivativeFeatures.computeDerivativeGroupLinear == VK_TRUE) {
+        derivativeFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &derivativeFeatures;
     }
     if (float16Rte) {
         float16Features.pNext = byteFeatures.pNext;
