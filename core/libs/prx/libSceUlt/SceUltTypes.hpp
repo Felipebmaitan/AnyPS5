@@ -342,6 +342,7 @@ struct UltUlthreadState {
     Pthread _thread = nullptr;
     void* _runtime = nullptr;
     std::atomic<bool> _exited{false};
+    bool _joining = false;
 };
 
 #endif
