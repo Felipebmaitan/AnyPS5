@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libSceLibreSsl3/libSceLibreSsl3.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libSceLibreSsl/include/Error.hpp"
 #include <cstdint>
@@ -5,13 +7,6 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
-
-extern "C" {
-std::uint64_t APS5_VABI ERR_get_error_nid_postfix();
-std::uint64_t APS5_VABI ERR_peek_error_nid_postfix();
-void APS5_VABI ERR_clear_error_nid_postfix();
-void APS5_VABI ERR_remove_thread_state_nid_postfix(const void*);
-}
 
 static void Require(bool value, const char* what) {
     if (value) return;

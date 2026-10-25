@@ -6,7 +6,7 @@
 #include <cstring>
 #include <iterator>
 
-extern "C" int APS5_VABI strerror_r_nid_postfix(int error, char* buffer, std::size_t length);
+#include "prx/libc/include/Api.hpp"
 
 namespace {
 struct ErrorString {

@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <type_traits>
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
 #include "prx/libSceLibreSsl/include/Error.hpp"
 #include "prx/libc/include/General.hpp"
 
