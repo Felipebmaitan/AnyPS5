@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 #include "SceTypes.hpp"
 #include "Bio.hpp"
 #include "Cmac.hpp"
@@ -54,7 +55,9 @@ struct Bignum {
     int flags;
 };
 
-struct BignumContext;
+struct BignumContext {
+    std::vector<std::size_t> marks;
+};
 
 extern "C" {
 
@@ -147,13 +150,13 @@ int APS5_VABI ENGINE_init_nid_postfix(void);
 int APS5_VABI ENGINE_load_builtin_engines_nid_postfix(void);
 int APS5_VABI ENGINE_load_private_key_nid_postfix(void);
 int APS5_VABI ENGINE_set_default_nid_postfix(void);
-int APS5_VABI ERR_clear_error_nid_postfix(void);
-int APS5_VABI ERR_error_string_nid_postfix(void);
-int APS5_VABI ERR_error_string_n_nid_postfix(void);
-int APS5_VABI ERR_free_strings_nid_postfix(void);
-int APS5_VABI ERR_get_error_nid_postfix(void);
-int APS5_VABI ERR_peek_error_nid_postfix(void);
-int APS5_VABI ERR_remove_thread_state_nid_postfix(void);
+void APS5_VABI ERR_clear_error_nid_postfix();
+char* APS5_VABI ERR_error_string_nid_postfix(std::uint64_t error, char* buffer);
+void APS5_VABI ERR_error_string_n_nid_postfix(std::uint64_t error, char* buffer, std::size_t length);
+void APS5_VABI ERR_free_strings_nid_postfix();
+std::uint64_t APS5_VABI ERR_get_error_nid_postfix();
+std::uint64_t APS5_VABI ERR_peek_error_nid_postfix();
+void APS5_VABI ERR_remove_thread_state_nid_postfix(const void* id);
 int APS5_VABI EVP_CIPHER_CTX_cleanup_nid_postfix(void);
 int APS5_VABI EVP_CIPHER_CTX_ctrl_nid_postfix(void);
 int APS5_VABI EVP_CIPHER_CTX_free_nid_postfix(void);

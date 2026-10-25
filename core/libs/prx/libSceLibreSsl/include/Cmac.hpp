@@ -44,4 +44,3 @@ static_assert(sizeof(LibreSslCipher) == 88 && offsetof(LibreSslCipher, init) == 
 static_assert(sizeof(LibreSslCipherContext) == 168 && offsetof(LibreSslCipherContext, iv) == 40 && offsetof(LibreSslCipherContext, flags) == 112 && offsetof(LibreSslCipherContext, cipherData) == 120);
 
 struct LibreSslCmac;
-

@@ -10,10 +10,6 @@
 #include <vector>
 #include "prx/libc/include/General.hpp"
 
-struct BignumContext {
-    std::vector<std::size_t> marks;
-};
-
 namespace {
 
 static_assert(sizeof(Bignum) == 24);

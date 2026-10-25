@@ -1,3 +1,6 @@
+#include "prx/libc/include/Api.hpp"
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libSceLibreSsl3/libSceLibreSsl3.hpp"
 #include "prx/libSceLibreSsl/ErrorQueue.hpp"
 #include <array>
 #include <atomic>
@@ -6,12 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
-
-extern "C" {
-void APS5_VABI ERR_load_crypto_strings_nid_postfix();
-std::uint64_t APS5_VABI ERR_peek_last_error_nid_postfix();
-int* APS5_VABI __error_nid_postfix();
-}
 
 static void Require(bool value, const char* message) {
     if (value) return;
