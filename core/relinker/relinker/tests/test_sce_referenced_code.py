@@ -9,6 +9,7 @@ from test_sce_module_code_extent import sce_module
 from test_guest_symbol_names import importing_executable, dynamic_tags
 from test_guest_module_args import args_module
 from test_sce_code_extent import fixture as plt_fixture
+from test_jmprel_table_bounds import fixture as no_tail_fixture
 from test_tls_function_coverage import pe_bytes_at
 from test_macos_output import MachO
 
@@ -130,6 +131,42 @@ def imported_array():
     return image
 
 
+def padded_call(kind, body, padding=0):
+    image = fixture("entry", relocated=kind == "rip")
+    image[0x430:0x480] = b"\xcc" * 0x50
+    image[0x400:0x408] = b"\x48\x8d\x05" + struct.pack("<i", 0x2208 - 0x1007) + b"\xc3"
+    if kind == "direct":
+        code = b"\x90" * 3 + b"\xe8" + struct.pack("<i", 0x1000 - 0x1038)
+    elif kind == "rip":
+        code = b"\xff\x15" + struct.pack("<i", 0x2200 - 0x1036)
+        struct.pack_into("<q", image, 0xA90, 0x1000)
+    else:
+        code = b"\x4c\x8d\x1d" + struct.pack("<i", 0x1000 - 0x1037) + bytes.fromhex("41 ff d3")
+    image[0x430:0x430 + len(code)] = code
+    image[0x430 + len(code):0x440] = bytes([padding]) * (16 - len(code))
+    image[0x440:0x440 + len(body)] = body
+    return image
+
+
+def adjacent_segment(kind):
+    image = fixture("entry")
+    headers = bytes(image[64:400])
+    image.extend(bytes(0x1000 - len(image)))
+    image[0xD00:0xD00 + len(headers)] = headers
+    struct.pack_into("<Q", image, 32, 0xD00)
+    struct.pack_into("<Q", image, 24, 0x10F0)
+    struct.pack_into("<H", image, 56, 7)
+    image[0x4F0:0x500] = b"\x90" * 16
+    if kind == "call":
+        image[0x4FB:0x500] = b"\xe8" + struct.pack("<i", 0x1050 - 0x1100)
+        image[0x450] = 0xC3
+    elif kind == "jump":
+        image[0x4F0:0x4F5] = b"\xe9" + struct.pack("<i", 0x1100 - 0x10F5)
+    struct.pack_into("<IIQQQQQQ", image, 0xD00 + 6 * 56, 1, 5, 0xC00, 0x1100, 0x1100, len(TLS), len(TLS), 0x100)
+    image[0xC00:0xC00 + len(TLS)] = TLS
+    return image
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     systems = [sys.argv[2]] if len(sys.argv) > 2 else ["linux", "windows", "macos"]
@@ -141,6 +178,11 @@ def main():
             if os.name == "nt":
                 run = subprocess.run([str(converted)], capture_output=True, timeout=10)
                 assert run.returncode == 42, (root, run.returncode, run.stderr)
+        if "linux" in systems:
+            image = no_tail_fixture(linux=True)
+            struct.pack_into("<qQqQ", image, 0x4D0, 11, 24, 0, 0)
+            struct.pack_into("<QQ", image, 120 + 32, 240, 240)
+            convert(relinker, work, "no-tail-identical-tags", image, "linux")
         for system in systems:
             convert(relinker, work, system + "-external-array", imported_array(), system, module=True)
             if system != "linux":
@@ -152,6 +194,25 @@ def main():
                     converted = convert(relinker, work, f"{system}-plt-{plt:x}", image, system)
                     assert TLS not in converted.read_bytes()
             for module in (False, True):
+                for kind in ("direct", "rip", "register"):
+                    for padding in (0, 0x90):
+                        name = f"{system}-{module}-padded-{kind}-{padding}"
+                        convert(relinker, work, name + "-syscall", padded_call(kind, SYSCALL, padding), system,
+                                "Forbidden syscall instruction at code offset 0x1040", module)
+                        converted = convert(relinker, work, name, padded_call(kind, TLS, padding), system, module=module)
+                        actual = output_bytes(converted.read_bytes(), system, 0x1040, len(TLS))
+                        assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), name
+                        if os.name == "nt" and system == "windows" and not module:
+                            run = subprocess.run([str(converted)], capture_output=True, timeout=10)
+                            assert run.returncode == 42, (name, run.returncode, run.stderr)
+                for kind in ("fallthrough", "call", "jump"):
+                    name = f"{system}-{module}-adjacent-{kind}"
+                    converted = convert(relinker, work, name, adjacent_segment(kind), system, module=module)
+                    actual = output_bytes(converted.read_bytes(), system, 0x1100, len(TLS))
+                    assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), name
+                    if os.name == "nt" and system == "windows" and not module:
+                        run = subprocess.run([str(converted)], capture_output=True, timeout=10)
+                        assert run.returncode == 42, (name, run.returncode, run.stderr)
                 for root in ("fallthrough", "call-continuation", "conditional"):
                     convert(relinker, work, f"{system}-{module}-{root}-syscall", fixture(root, SYSCALL), system,
                             "Forbidden syscall instruction at code offset 0x1010", module)
@@ -186,11 +247,23 @@ def main():
                     converted = convert(relinker, work, f"{system}-{module}-{root}-raw", image, system, module=module)
                     actual = output_bytes(converted.read_bytes(), system, TAIL, len(TLS))
                     assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), root
-                for interior in (1, 4, 8):
-                    image = fixture("entry", relocated=True)
-                    struct.pack_into("<q", image, 0xA90, TAIL + interior)
-                    convert(relinker, work, f"{system}-{module}-interior-{interior}", image, system,
-                            "Code analysis: reference enters a trailing instruction", module)
+                for reference in ("relocation", "lea"):
+                    for interior in (1, 4, 8):
+                        image = fixture("entry", relocated=reference == "relocation")
+                        if reference == "relocation":
+                            struct.pack_into("<q", image, 0xA90, TAIL + interior)
+                        else:
+                            image[0x400:0x408] = b"\x48\x8d\x05" + struct.pack("<i", TAIL + interior - 0x1007) + b"\xc3"
+                        convert(relinker, work, f"{system}-{module}-{reference}-interior-{interior}", image, system,
+                                "Code analysis: reference enters a trailing instruction", module)
+                for opcode in ("0f34", "cd80", "0f07"):
+                    convert(relinker, work, f"{system}-{module}-forbidden-{opcode}", fixture("entry", bytes.fromhex(opcode) + b"\xc3"), system,
+                            "Forbidden syscall instruction at code offset 0x1030", module)
+                truncated = fixture("entry")
+                struct.pack_into("<Q", truncated, 24, 0x10FF)
+                truncated[0x4FF] = 0x0F
+                convert(relinker, work, f"{system}-{module}-truncated", truncated, system,
+                        "Instruction truncated after two-byte opcode escape", module)
                 sdk = bytes.fromhex("48 c7 c0 01 00 00 00 49 89 ca 0f 05 c3")
                 trapped = convert(relinker, work, f"{system}-{module}-trap", fixture("entry", sdk), system,
                                   module=module, flags=("--trap-sdk-syscall-stubs",))

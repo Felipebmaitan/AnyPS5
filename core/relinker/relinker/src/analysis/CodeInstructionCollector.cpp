@@ -531,7 +531,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
             for (const auto root : roots) if (root >= header.MappedAddress && root - header.MappedAddress < header.FileSize) entries.push_back(root);
             if (entries.empty()) continue;
             const std::span<const std::uint8_t> text(bytes.data() + header.Offset, header.FileSize);
-            const auto graph = UnusedNidFilter::BuildControlFlowGraph(text, header.MappedAddress, entries.front(), entries, pointers, sceFunctions.empty(), sectionReachable[i], [&](std::uint64_t count) { report(6000 + 2500 * count / std::max<std::uint64_t>(scanBytes, 1)); }, inTable);
+            const auto graph = UnusedNidFilter::BuildControlFlowGraph(text, header.MappedAddress, entries.front(), entries, pointers, sceFunctions.empty(), sectionReachable[i], [&](std::uint64_t count) { report(6000 + 2500 * count / std::max<std::uint64_t>(scanBytes, 1)); }, inTable, inTail(header.MappedAddress));
             for (const auto address : graph->ReachableVaddrs()) {
                 if (!decodedInstructions.insert(address).second) continue;
                 instructions.insert(address);
@@ -539,7 +539,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
                 const auto info = decoder.DecodeInstruction(text.data() + offset, text.size() - offset);
                 addAddressTakenRoot(address, text.data() + offset, info);
                 addTransferRoot(address, info);
-                if (offset + info.Length == header.FileSize && inTail(address + info.Length)) {
+                if (offset + info.Length == header.FileSize && (inTail(address) || inTail(address + info.Length))) {
                     const auto flow = info.FlowKind;
                     if (flow == Codegen::ControlFlowKind::Sequential || flow == Codegen::ControlFlowKind::ConditionalBranch || flow == Codegen::ControlFlowKind::Call || flow == Codegen::ControlFlowKind::IndirectCall)
                         addStrongRoot(address + info.Length);

@@ -31,7 +31,7 @@ private:
 
 namespace {
 
-void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, const std::vector<StrictDataRegion>* data, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress, const std::function<bool(VirtualAddress)>& isData) {
+void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, const std::vector<StrictDataRegion>* data, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress, const std::function<bool(VirtualAddress)>& isData, bool followCallContinuations) {
     if (text.size() > std::numeric_limits<VirtualAddress>::max() - textVaddr)
         throw RelinkerException("Text section range exceeds the address space");
     std::size_t codeSize = text.size();
@@ -152,10 +152,10 @@ void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, Vi
                     } else if (info.HasBranchTarget) {
                         enqueue(nextVaddr + static_cast<VirtualAddress>(info.BranchDisp));
                     }
-                    fallThrough = !zeroPaddingFollows(nextVaddr);
+                    fallThrough = followCallContinuations || !zeroPaddingFollows(nextVaddr);
                     break;
                 case IndirectCall:
-                    fallThrough = !zeroPaddingFollows(nextVaddr);
+                    fallThrough = followCallContinuations || !zeroPaddingFollows(nextVaddr);
                     break;
                 case Return:
                 case IndirectJump:
@@ -171,8 +171,8 @@ void buildGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, Vi
 
 }
 
-std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress, const std::function<bool(VirtualAddress)>& isData) {
-    buildGraph(text, textVaddr, entryVaddr, extraEntries, relativeRelocations, nullptr, followCodeAddresses, reachable, progress, isData);
+std::unique_ptr<IControlFlowGraph> BuildControlFlowGraph(std::span<const std::uint8_t> text, VirtualAddress textVaddr, VirtualAddress entryVaddr, const std::vector<VirtualAddress>& extraEntries, const IRelativeRelocationIndex& relativeRelocations, bool followCodeAddresses, std::unordered_set<VirtualAddress>& reachable, const std::function<void(std::uint64_t)>& progress, const std::function<bool(VirtualAddress)>& isData, bool followCallContinuations) {
+    buildGraph(text, textVaddr, entryVaddr, extraEntries, relativeRelocations, nullptr, followCodeAddresses, reachable, progress, isData, followCallContinuations);
     return std::make_unique<ControlFlowGraph>(&reachable);
 }
 
@@ -209,7 +209,7 @@ std::unique_ptr<IControlFlowGraph> BuildAddressTakenControlFlowGraph(
     const std::vector<StrictDataRegion>& data
 ) {
     std::unordered_set<VirtualAddress> reachable;
-    buildGraph(std::span<const std::uint8_t>(text.data(), text.size()), textVaddr, entryVaddr, extraEntries, relativeRelocations, &data, false, reachable, {}, {});
+    buildGraph(std::span<const std::uint8_t>(text.data(), text.size()), textVaddr, entryVaddr, extraEntries, relativeRelocations, &data, false, reachable, {}, {}, false);
     return std::make_unique<ControlFlowGraph>(std::move(reachable));
 }
 
