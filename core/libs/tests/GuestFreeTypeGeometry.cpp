@@ -1,4 +1,4 @@
-#include "prx/libSceFreeType/include/GuestFreeType.hpp"
+#include "prx/libSceFreeType/include/Api.hpp"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -9,12 +9,6 @@
 #include <iostream>
 
 using namespace FreeType;
-
-extern "C" {
-void APS5_VABI FT_Vector_Transform_nid_postfix(GuestVector*, const GuestMatrix*);
-void APS5_VABI FT_Matrix_Multiply_nid_postfix(const GuestMatrix*, GuestMatrix*);
-int APS5_VABI FT_Matrix_Invert_nid_postfix(GuestMatrix*);
-}
 
 static bool Equal(const GuestMatrix& a, const GuestMatrix& b) {
     return a.xx == b.xx && a.xy == b.xy && a.yx == b.yx && a.yy == b.yy;
