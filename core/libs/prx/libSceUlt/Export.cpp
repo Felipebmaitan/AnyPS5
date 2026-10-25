@@ -150,14 +150,17 @@ int joinUlthread(void* ulthread, std::int32_t* status, bool blocking) {
         state->_joining = true;
     }
     CleanupHandler cleanup{};
-    void* const mark = ThreadCancel::CleanupMark();
-    __pthread_cleanup_push_imp_nid_postfix(releaseUlthreadJoin, &state, &cleanup);
+    void* mark = nullptr;
+    bool cleanupRegistered = false;
     void* result = nullptr;
     int joined;
     try {
+        mark = ThreadCancel::CleanupMark();
+        __pthread_cleanup_push_imp_nid_postfix(releaseUlthreadJoin, &state, &cleanup);
+        cleanupRegistered = true;
         joined = scePthreadJoin(state->_thread, &result);
     } catch (...) {
-        ThreadCancel::CleanupRestore(mark);
+        if (cleanupRegistered) ThreadCancel::CleanupRestore(mark);
         releaseUlthreadJoin(&state);
         throw;
     }
@@ -850,9 +853,9 @@ int APS5_VABI sceUltUlthreadCreate(void* ulthread, const char* name, UltUlthread
     state->_arg = arg;
     state->_object = ulthread;
     state->_runtime = runtime;
-    const std::string threadName = name != nullptr ? std::string(name).substr(0, 31) : std::string();
     std::lock_guard lock(gMutex);
     if (!gRuntimes.contains(runtime) || gUlthreads.contains(ulthread)) return ULT_ERROR_STATE;
+    const std::string threadName = name != nullptr ? std::string(name).substr(0, 31) : std::string();
     gUlthreads.emplace(ulthread, state);
     std::memset(ulthread, 0, 512);
     try {

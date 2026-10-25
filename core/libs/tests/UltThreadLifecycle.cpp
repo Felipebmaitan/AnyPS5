@@ -9,6 +9,7 @@
 #include <semaphore>
 #include <stdexcept>
 #include <thread>
+#include "../prx/libSceUlt/Export.cpp"
 
 namespace {
 
@@ -26,6 +27,7 @@ struct alignas(8) Thread { std::byte bytes[512]{}; };
 struct HostThread {
     std::thread thread;
     void* result = nullptr;
+    std::uint64_t generation = 0;
 };
 
 std::atomic<bool> entryFinished{false};
@@ -36,6 +38,22 @@ std::binary_semaphore releaseJoin{0};
 bool gateJoin = false;
 int createFailure = 0;
 int joinFailure = 0;
+
+#ifdef ULT_LIFECYCLE_INTERPOSE
+thread_local int actor = 0;
+std::atomic<bool> pauseSelection{false};
+std::atomic<bool> failCleanupSetup{false};
+std::atomic<std::uint64_t> originalGeneration{0};
+std::binary_semaphore selected{0};
+std::binary_semaphore releaseSelection{0};
+std::binary_semaphore creating{0};
+std::binary_semaphore releaseCreate{0};
+std::binary_semaphore registryAttempt{0};
+std::binary_semaphore releaseRegistryAttempt{0};
+std::binary_semaphore replacementStarted{0};
+std::binary_semaphore releaseReplacement{0};
+bool gateCreate = false;
+#endif
 
 void Await(std::binary_semaphore& gate) {
     CHECK(gate.try_acquire_for(std::chrono::seconds(2)));
@@ -136,16 +154,140 @@ void JoinFailure(int failure) {
     Finish(runtime, thread);
 }
 
+#ifdef ULT_LIFECYCLE_INTERPOSE
+void Publication() {
+    Runtime runtime;
+    Thread thread;
+    CHECK(sceUltUlthreadRuntimeCreate(&runtime, "runtime", 1, 1, nullptr, nullptr, 0) == ULT_OK);
+    gateCreate = true;
+    std::thread creator([&] {
+        CHECK(sceUltUlthreadCreate(&thread, "thread", Entry, 73, nullptr, 0, &runtime, nullptr, 0) == ULT_OK);
+    });
+    Await(creating);
+    std::int32_t status = -1;
+    std::thread joiner([&] {
+        actor = 2;
+        CHECK(sceUltUlthreadJoin(&thread, &status) == ULT_OK);
+    });
+    Await(registryAttempt);
+    const bool registryAvailable = gMutex.try_lock();
+    if (registryAvailable) gMutex.unlock();
+    CHECK(!registryAvailable && joinCalls.load() == 0);
+    releaseRegistryAttempt.release();
+    releaseCreate.release();
+    creator.join();
+    joiner.join();
+    CHECK(status == 73 && hostThreads.load() == 0);
+    CHECK(sceUltUlthreadRuntimeDestroy(&runtime) == ULT_OK);
+    CHECK(sceUltFinalize() == ULT_OK);
+}
+
+std::int32_t APS5_VABI Replacement(std::uint64_t argument) {
+    replacementStarted.release();
+    Await(releaseReplacement);
+    return static_cast<std::int32_t>(argument);
+}
+
+void Generation() {
+    Runtime runtime;
+    Thread thread;
+    Create(runtime, thread);
+    pauseSelection.store(true);
+    std::int32_t originalStatus = -1;
+    int originalResult = ULT_ERROR_STATE;
+    std::thread original([&] {
+        actor = 1;
+        originalResult = sceUltUlthreadTryJoin(&thread, &originalStatus);
+    });
+    Await(selected);
+    std::int32_t contenderStatus = -2;
+    const int contender = sceUltUlthreadJoin(&thread, &contenderStatus);
+    if (contender == ULT_OK) {
+        CHECK(contenderStatus == 73);
+        CHECK(sceUltUlthreadCreate(&thread, "replacement", Replacement, 92, nullptr, 0, &runtime, nullptr, 0) == ULT_OK);
+        Await(replacementStarted);
+    } else {
+        CHECK(contender == ULT_ERROR_STATE && contenderStatus == -2);
+        CHECK(sceUltUlthreadCreate(&thread, "replacement", Replacement, 92, nullptr, 0, &runtime, nullptr, 0) == ULT_ERROR_STATE);
+    }
+    releaseSelection.release();
+    original.join();
+    CHECK(originalGeneration.load() == 73 && originalResult == ULT_OK && originalStatus == 73);
+    CHECK(contender == ULT_ERROR_STATE && hostThreads.load() == 0);
+    CHECK(sceUltUlthreadCreate(&thread, "replacement", Replacement, 92, nullptr, 0, &runtime, nullptr, 0) == ULT_OK);
+    Await(replacementStarted);
+    CHECK(sceUltUlthreadTryJoin(&thread, &contenderStatus) == ULT_ERROR_AGAIN && contenderStatus == -2);
+    releaseReplacement.release();
+    CHECK(sceUltUlthreadJoin(&thread, &contenderStatus) == ULT_OK && contenderStatus == 92);
+    CHECK(sceUltUlthreadRuntimeDestroy(&runtime) == ULT_OK);
+    CHECK(sceUltFinalize() == ULT_OK);
+}
+
+void CleanupSetup() {
+    Runtime runtime;
+    Thread thread;
+    Create(runtime, thread);
+    failCleanupSetup.store(true);
+    std::int32_t status = -1;
+    bool threw = false;
+    try {
+        sceUltUlthreadJoin(&thread, &status);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw && status == -1 && joinCalls.load() == 0);
+    std::thread replacement([&] { Finish(runtime, thread); });
+    replacement.join();
+}
+#endif
+
 }
 
 extern "C" {
+
+#ifdef ULT_LIFECYCLE_INTERPOSE
+int __real_pthread_mutex_lock(pthread_mutex_t* mutex);
+int __real_pthread_mutex_unlock(pthread_mutex_t* mutex);
+void* __real__ZN12ThreadCancel11CleanupMarkEv();
+
+int __wrap_pthread_mutex_lock(pthread_mutex_t* mutex) {
+    if (actor == 2 && mutex == gMutex.native_handle()) {
+        actor = 0;
+        registryAttempt.release();
+        Await(releaseRegistryAttempt);
+    }
+    return __real_pthread_mutex_lock(mutex);
+}
+
+int __wrap_pthread_mutex_unlock(pthread_mutex_t* mutex) {
+    const int result = __real_pthread_mutex_unlock(mutex);
+    if (actor == 1 && mutex == gMutex.native_handle() && pauseSelection.exchange(false)) {
+        selected.release();
+        Await(releaseSelection);
+    }
+    return result;
+}
+
+void* __wrap__ZN12ThreadCancel11CleanupMarkEv() {
+    if (failCleanupSetup.exchange(false)) throw std::runtime_error("Injected cleanup setup failure");
+    return __real__ZN12ThreadCancel11CleanupMarkEv();
+}
+#endif
 
 int APS5_VABI scePthreadCreate(Pthread* value, const PthreadAttr*, PthreadEntry entry, void* argument, const char*) {
     const int failure = createFailure;
     createFailure = 0;
     if (failure == 1) return 11;
     if (failure == 2) throw std::runtime_error("Injected prepublication creation failure");
+#ifdef ULT_LIFECYCLE_INTERPOSE
+    if (gateCreate) {
+        gateCreate = false;
+        creating.release();
+        Await(releaseCreate);
+    }
+#endif
     auto state = std::make_unique<HostThread>();
+    state->generation = static_cast<UltUlthreadState*>(argument)->_arg;
     auto* raw = state.get();
     state->thread = std::thread([=] {
         raw->result = entry(argument);
@@ -160,6 +302,14 @@ int APS5_VABI scePthreadCreate(Pthread* value, const PthreadAttr*, PthreadEntry 
 
 int APS5_VABI scePthreadJoin(Pthread value, void** result) {
     const int call = joinCalls.fetch_add(1);
+#ifdef ULT_LIFECYCLE_INTERPOSE
+    if (actor == 1) {
+        CHECK(value != nullptr);
+        const auto generation = reinterpret_cast<HostThread*>(value)->generation;
+        originalGeneration.store(generation);
+        if (generation != 73) return 22;
+    }
+#endif
     if (gateJoin) {
         if (call != 0) return 22;
         joining.release();
@@ -188,5 +338,10 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[1], "tryjoin-owner") == 0) Ownership(true);
     else if (std::strcmp(argv[1], "join-error") == 0) JoinFailure(1);
     else if (std::strcmp(argv[1], "join-exception") == 0) JoinFailure(2);
+#ifdef ULT_LIFECYCLE_INTERPOSE
+    else if (std::strcmp(argv[1], "publication") == 0) Publication();
+    else if (std::strcmp(argv[1], "generation") == 0) Generation();
+    else if (std::strcmp(argv[1], "cleanup-setup") == 0) CleanupSetup();
+#endif
     else CHECK(false);
 }
