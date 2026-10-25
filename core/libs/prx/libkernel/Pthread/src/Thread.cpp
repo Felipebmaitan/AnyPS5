@@ -1082,6 +1082,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
 
 int APS5_VABI JoinThread_nid_no_patch(Pthread thread, void** retval, const KernelTimespec* abstime) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
+    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
     if (thread == CurrentGuestState().current) return SCE_KERNEL_ERROR_EDEADLK;
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
     if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
@@ -1139,6 +1140,7 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
 
 int APS5_VABI scePthreadDetach(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
+    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
     {
         std::lock_guard lock(thread->_join_mtx);
         if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
@@ -1232,6 +1234,7 @@ void APS5_VABI scePthreadYield() {
 
 int APS5_VABI scePthreadCancel(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_ESRCH;
+    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
     thread->cancelPending.store(true);
     for (;;) {
         {
