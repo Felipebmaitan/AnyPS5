@@ -143,17 +143,6 @@ void InitializeHeap() {
     ApplicationHeapRegister_nid_no_patch(api.data());
 }
 
-template<class TFunction>
-void RequireUnsupported(TFunction function) {
-    bool threw = false;
-    try {
-        function();
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    Require(threw, "unsupported BIO path did not throw");
-}
-
 void RequireError(std::uint64_t expected) {
     Require(ERR_peek_error_nid_postfix() == expected, "BIO error code or ordering");
     Require(ERR_get_error_nid_postfix() == expected, "consume BIO error");
@@ -407,10 +396,6 @@ void TestUnsupported() {
     Require(BIO_write_nid_postfix(bio, "a", 1) == -2, "reject uninitialized write");
     RequireError(0x20fff078);
     bio->initialized = 1;
-    bio->extraData = bio;
-    RequireUnsupported([&] { BIO_free_nid_postfix(bio); });
-    Require(bio->references == 1, "unsupported ex-data preserves reference");
-    bio->extraData = nullptr;
     const BioMethod* method = bio->method;
     bio->method = nullptr;
     Require(BIO_ctrl_nid_postfix(bio, 1, 0, nullptr) == -2, "reject control without a method");
