@@ -1041,5 +1041,64 @@ class UnwrapTest(unittest.TestCase):
         self.assertEqual(err.errors, "backslashreplace")
 
 
+class JobManagerModuleRefusalTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.build = self.root / "build"
+        self.helper = self.build / "tests" / "job_manager_reference.prx"
+        self.helper.parent.mkdir(parents=True)
+        self.helper.write_bytes(b"reference helper")
+        self.relinker = self.root / "relinker.exe"
+        self.relinker.touch()
+        self.toolchain = self.root / "toolchain"
+        self.toolchain.mkdir()
+        self.module = self.root / "module.self"
+
+    def invoke(self, output):
+        import run_job_manager_reference
+        arguments = ["run_job_manager_reference.py", "--module", str(self.module),
+                     "--build", str(self.build), "--relinker", str(self.relinker),
+                     "--toolchain", str(self.toolchain), "--output", str(output)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(run_job_manager_reference.subprocess, "run") as process, \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = run_job_manager_reference.main()
+        return code, stdout.getvalue(), stderr.getvalue(), process
+
+    def test_module_refusals_stop_reference_setup_with_a_diagnostic(self):
+        malformed_elf = bytearray(build_container(default_segments(), default_records(), default_payloads()))
+        malformed_elf[ELF_HEADER_OFFSET + 4] = 1
+        cases = ((b"short", "file is smaller than the SELF header area"),
+                 (bytes(FIRST_REGION), "not a SELF container (magic 0x0)"),
+                 (bytes(malformed_elf), "inner ELF is not 64-bit little-endian"))
+        for index, (data, diagnostic) in enumerate(cases):
+            with self.subTest(diagnostic=diagnostic):
+                self.module.write_bytes(data)
+                output = self.build / ".." / f"artifacts-{index}"
+                code, stdout, stderr, process = self.invoke(output)
+                self.assertEqual(code, 2)
+                self.assertEqual(stderr, diagnostic + "\n")
+                self.assertEqual(stdout, f"Artifacts: {output.resolve()}\n")
+                self.assertNotIn("Traceback", stderr)
+                self.assertEqual(self.module.read_bytes(), data)
+                self.assertEqual((output / "libs" / "jobref.prx").read_bytes(), b"reference helper")
+                self.assertFalse((output / "sce_module" / "libSceJobManager.prx").exists())
+                self.assertFalse((output / "relink.log").exists())
+                self.assertFalse((output / "results.json").exists())
+                process.assert_called_once()
+                self.assertEqual(process.call_args.args[0][0], str(self.build.resolve() / "core/libs/nid_patcher.exe"))
+
+    def test_missing_reference_helper_keeps_existing_error_handling(self):
+        self.helper.unlink()
+        self.module.write_bytes(b"short")
+        code, stdout, stderr, process = self.invoke(self.root / "artifacts")
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "Build the job_manager_reference target first\n")
+        process.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
