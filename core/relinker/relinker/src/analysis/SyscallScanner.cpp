@@ -1,4 +1,5 @@
 #include <relinker/analysis/SyscallScanner.hpp>
+#include <relinker/analysis/CodeInstructionCollector.hpp>
 #include <codegen/IInstructionScanner.hpp>
 #include <codegen/x86/DecodedInstruction.hpp>
 #include <algorithm>
@@ -261,6 +262,7 @@ public:
     SyscallScanner(Domain::IProgress& progress, const bool trapSdkStubs) : progress(progress), trapSdkStubs(trapSdkStubs) {}
 
     std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>& codeSection, FileByteOffset codeSectionOffset, FileByteOffset codeSectionSize, std::string_view input, const std::vector<CodeRange>& unwindRanges) override;
+    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, std::string_view input) override;
 
 private:
     Domain::IProgress& progress;
@@ -342,9 +344,31 @@ std::unique_ptr<ISyscallScanner> MakeSyscallScanner(Domain::IProgress& progress,
     return std::make_unique<SyscallScanner>(progress, trapSdkStubs);
 }
 
+std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, std::string_view input) {
+    if (std::none_of(headers.begin(), headers.end(), [](const auto& header) { return header.Type == 0x61000000; })) return {};
+    std::vector<CodeRange> ranges;
+    CodeInstructionCollector().Collect(bytes, headers, [&](auto completed, auto total) { progress.Report({Domain::ProgressStage::Decode, std::string(input), completed, total}); }, nullptr, {}, &ranges);
+    std::vector<RelinkPatch> patches;
+    for (const auto& range : ranges) {
+        const auto header = std::find_if(headers.begin(), headers.end(), [&](const auto& candidate) {
+            return candidate.Type == 1 && (candidate.Flags & 1) != 0 && range.Begin >= candidate.MappedAddress && range.Begin - candidate.MappedAddress < candidate.FileSize && range.End - range.Begin <= candidate.FileSize - (range.Begin - candidate.MappedAddress);
+        });
+        if (header == headers.end()) throw RelinkerException("Referenced code range exceeds executable segment", range.Begin);
+        const auto offset = header->Offset + (range.Begin - header->MappedAddress);
+        if (offset > bytes.size() || range.End - range.Begin > bytes.size() - offset) throw RelinkerException("Referenced code range exceeds image", range.Begin);
+        const std::vector<std::uint8_t> code(bytes.begin() + offset, bytes.begin() + offset + (range.End - range.Begin));
+        for (const auto trapped : ScanCodeSectionForSyscalls(code, range.Begin, code.size(), input, {})) {
+            if (trapped > code.size() || code.size() - trapped < 2) throw RelinkerException("Syscall trap patch exceeds referenced code range", range.Begin + trapped);
+            patches.push_back({offset + trapped, {0x0f, 0x0b}});
+        }
+    }
+    return patches;
+}
+
 class NullSyscallScanner : public ISyscallScanner {
 public:
     std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>&, FileByteOffset, FileByteOffset, std::string_view, const std::vector<CodeRange>&) override { return {}; }
+    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>&, const std::vector<ProgramHeader>&, std::string_view) override { return {}; }
 };
 
 std::unique_ptr<ISyscallScanner> MakeNullSyscallScanner() {

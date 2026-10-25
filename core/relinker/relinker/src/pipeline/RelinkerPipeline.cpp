@@ -446,6 +446,8 @@ RelinkResult RelinkerPipeline::Relink() {
         }
     }
 
+    for (auto& patch : syscallScanner->ScanReferencedTailForSyscalls(raw, programHeaders)) syscallPatches.push_back(std::move(patch));
+
 
     std::vector<std::pair<ByteCount, std::string>> exportedSymbols;
     std::vector<VirtualAddress> exportedFunctions;

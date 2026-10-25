@@ -238,7 +238,7 @@ def main():
             run(relinker, work, "sce-data-pointer-after-code-" + target, fixture(plt_at=PLT_BEFORE_CODE, data_pointer=True),
                 target=target)
             run(relinker, work, "sce-entry-after-code-" + target, fixture(plt_at=PLT_BEFORE_CODE, gap_entry=True),
-                target=target)
+                unsupported_tls(target), target=target)
             run(relinker, work, "sce-function-before-plt-" + target,
                 fixture(plt_at=PLT_BEFORE_CODE, early_function=True), target=target)
             run(relinker, work, "sce-code-after-plt-" + target, fixture(plt_at=PLT_BEFORE_CODE, function_tls=True),

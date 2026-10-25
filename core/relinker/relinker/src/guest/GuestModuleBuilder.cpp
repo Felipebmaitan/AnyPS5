@@ -431,6 +431,13 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
+        for (const auto& patch : syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, Io::Utf8Path(image.SourcePath))) {
+            if (!image.PatchedRanges.empty()) {
+                const GamePatch::WriterRange trap{patch.Offset, patch.Bytes.size(), "syscall trap"};
+                GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.Traps = std::span<const GamePatch::WriterRange>(&trap, 1)});
+            }
+            std::copy(patch.Bytes.begin(), patch.Bytes.end(), image.Bytes.begin() + patch.Offset);
+        }
         const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;

@@ -245,6 +245,13 @@ void scanning() {
     });
     require(instructions.size() == code.size(), "Progress changed image code analysis");
     require(updates > 10 && previous == 10000, "Missing intermediate image analysis progress");
+    std::vector<Domain::CodeRange> unpublished{{7, 9}};
+    reject([&] {
+        Relinker::CodeInstructionCollector().Collect(image, {header}, [](auto completed, auto total) {
+            if (completed == total) throw Domain::RelinkerException("cancelled");
+        }, nullptr, {}, &unpublished);
+    });
+    require(unpublished == std::vector<Domain::CodeRange>{{7, 9}}, "Cancelled analysis published ranges");
     code[70000] = 0x0f;
     code[70001] = 0x05;
     progress.Events.clear();
