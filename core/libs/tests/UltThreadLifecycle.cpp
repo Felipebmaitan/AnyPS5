@@ -1,5 +1,6 @@
 #include "prx/libSceUlt/include/Api.hpp"
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -38,6 +39,11 @@ std::binary_semaphore releaseJoin{0};
 bool gateJoin = false;
 int createFailure = 0;
 int joinFailure = 0;
+int sentinelExecutions = 0;
+
+void APS5_VABI Sentinel(void*) {
+    ++sentinelExecutions;
+}
 
 #ifdef ULT_LIFECYCLE_INTERPOSE
 thread_local int actor = 0;
@@ -139,6 +145,8 @@ void JoinFailure(int failure) {
     Runtime runtime;
     Thread thread;
     Create(runtime, thread);
+    void* const before = ThreadCancel::CleanupMark();
+    if (failure == 3) pthread_cleanup_push_nid_postfix(Sentinel, nullptr);
     joinFailure = failure;
     std::int32_t status = -1;
     bool threw = false;
@@ -148,10 +156,14 @@ void JoinFailure(int failure) {
     } catch (const std::runtime_error&) {
         threw = true;
     }
-    CHECK(threw == (failure == 2));
+    CHECK(threw == (failure >= 2));
     if (!threw) CHECK(result == ULT_ERROR_STATE);
     CHECK(status == -1 && hostThreads.load() == 1);
-    Finish(runtime, thread);
+    if (failure == 3) {
+        CHECK(sentinelExecutions == 1 && ThreadCancel::CleanupMark() == before);
+        std::thread replacement([&] { Finish(runtime, thread); });
+        replacement.join();
+    } else Finish(runtime, thread);
 }
 
 #ifdef ULT_LIFECYCLE_INTERPOSE
@@ -248,7 +260,7 @@ extern "C" {
 #ifdef ULT_LIFECYCLE_INTERPOSE
 int __real_pthread_mutex_lock(pthread_mutex_t* mutex);
 int __real_pthread_mutex_unlock(pthread_mutex_t* mutex);
-void* __real__ZN12ThreadCancel11CleanupMarkEv();
+void APS5_VABI __real___pthread_cleanup_push_imp_nid_postfix(void (APS5_VABI* routine)(void*), void* argument, void* info);
 
 int __wrap_pthread_mutex_lock(pthread_mutex_t* mutex) {
     if (actor == 2 && mutex == gMutex.native_handle()) {
@@ -268,9 +280,9 @@ int __wrap_pthread_mutex_unlock(pthread_mutex_t* mutex) {
     return result;
 }
 
-void* __wrap__ZN12ThreadCancel11CleanupMarkEv() {
+void APS5_VABI __wrap___pthread_cleanup_push_imp_nid_postfix(void (APS5_VABI* routine)(void*), void* argument, void* info) {
     if (failCleanupSetup.exchange(false)) throw std::runtime_error("Injected cleanup setup failure");
-    return __real__ZN12ThreadCancel11CleanupMarkEv();
+    __real___pthread_cleanup_push_imp_nid_postfix(routine, argument, info);
 }
 #endif
 
@@ -319,6 +331,11 @@ int APS5_VABI scePthreadJoin(Pthread value, void** result) {
     joinFailure = 0;
     if (failure == 1) return 22;
     if (failure == 2) throw std::runtime_error("Injected precommit join failure");
+    if (failure == 3) {
+        __pthread_cleanup_pop_imp_nid_postfix(1);
+        __pthread_cleanup_pop_imp_nid_postfix(1);
+        throw std::runtime_error("Injected failure after cancellation cleanup");
+    }
     CHECK(value != nullptr);
     std::unique_ptr<HostThread> state(reinterpret_cast<HostThread*>(value));
     state->thread.join();
@@ -338,6 +355,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[1], "tryjoin-owner") == 0) Ownership(true);
     else if (std::strcmp(argv[1], "join-error") == 0) JoinFailure(1);
     else if (std::strcmp(argv[1], "join-exception") == 0) JoinFailure(2);
+    else if (std::strcmp(argv[1], "join-cleanup-exception") == 0) JoinFailure(3);
 #ifdef ULT_LIFECYCLE_INTERPOSE
     else if (std::strcmp(argv[1], "publication") == 0) Publication();
     else if (std::strcmp(argv[1], "generation") == 0) Generation();

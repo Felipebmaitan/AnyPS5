@@ -130,6 +130,7 @@ void* APS5_VABI ulthreadRunner(void* arg) {
 
 void APS5_VABI releaseUlthreadJoin(void* argument) {
     auto& state = *static_cast<std::shared_ptr<UltUlthreadState>*>(argument);
+    if (!state) return;
     {
         std::lock_guard lock(gMutex);
         state->_joining = false;
@@ -150,21 +151,21 @@ int joinUlthread(void* ulthread, std::int32_t* status, bool blocking) {
         state->_joining = true;
     }
     CleanupHandler cleanup{};
-    void* mark = nullptr;
     bool cleanupRegistered = false;
     void* result = nullptr;
     int joined;
     try {
-        mark = ThreadCancel::CleanupMark();
         __pthread_cleanup_push_imp_nid_postfix(releaseUlthreadJoin, &state, &cleanup);
         cleanupRegistered = true;
         joined = scePthreadJoin(state->_thread, &result);
     } catch (...) {
-        if (cleanupRegistered) ThreadCancel::CleanupRestore(mark);
-        releaseUlthreadJoin(&state);
+        if (state) {
+            if (cleanupRegistered) __pthread_cleanup_pop_imp_nid_postfix(1);
+            else releaseUlthreadJoin(&state);
+        }
         throw;
     }
-    ThreadCancel::CleanupRestore(mark);
+    __pthread_cleanup_pop_imp_nid_postfix(0);
     if (joined != 0) {
         releaseUlthreadJoin(&state);
         return ULT_ERROR_STATE;
