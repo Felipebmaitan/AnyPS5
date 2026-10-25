@@ -815,11 +815,20 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     CurrentGuestState().current = nullptr;
 }
 
+using FinalThreadReleaseTestHook = void (*)(Pthread);
+static std::atomic<PthreadPrivate*> finalThreadReleaseTestTarget{nullptr};
+static std::atomic<FinalThreadReleaseTestHook> finalThreadReleaseTestHook{nullptr};
+
 static void ReleaseThread(PthreadPrivate* thread) {
     if (thread->_adopted)
         return;
     if (thread->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
+    auto* expected = thread;
+    if (finalThreadReleaseTestTarget.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) {
+        if (const auto hook = finalThreadReleaseTestHook.exchange(nullptr, std::memory_order_acq_rel))
+            hook(reinterpret_cast<Pthread>(thread));
+    }
 #ifdef _WIN32
     if (thread->wakeEvent)
         CloseHandle(static_cast<HANDLE>(thread->wakeEvent));
@@ -832,9 +841,15 @@ static void ReleaseThread(PthreadPrivate* thread) {
 class GuestThreadReference {
 public:
     GuestThreadReference() = default;
-    void Retain(PthreadPrivate* value) {
-        value->references.fetch_add(1, std::memory_order_relaxed);
-        thread = value;
+    bool Retain(PthreadPrivate* value) {
+        auto references = value->references.load(std::memory_order_relaxed);
+        while (references != 0) {
+            if (value->references.compare_exchange_weak(references, references + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                thread = value;
+                return true;
+            }
+        }
+        return false;
     }
     void Reset() {
         if (!thread) return;
@@ -849,6 +864,11 @@ public:
 private:
     PthreadPrivate* thread = nullptr;
 };
+
+extern "C" void APS5_Test_SetFinalThreadReleaseHook(Pthread thread, FinalThreadReleaseTestHook hook) {
+    finalThreadReleaseTestHook.store(hook, std::memory_order_relaxed);
+    finalThreadReleaseTestTarget.store(static_cast<PthreadPrivate*>(thread), std::memory_order_release);
+}
 
 static std::mutex joinedLock;
 static std::map<Pthread*, PthreadPrivate*> joinedThreads;
@@ -1106,7 +1126,7 @@ int APS5_VABI JoinThread_nid_no_patch(Pthread thread, void** retval, const Kerne
     GuestThreadReference reference;
     auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
-    reference.Retain(thread);
+    if (!reference.Retain(thread)) return SCE_KERNEL_ERROR_ESRCH;
     if (thread == CurrentGuestState().current) return SCE_KERNEL_ERROR_EDEADLK;
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
     if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
@@ -1115,7 +1135,7 @@ int APS5_VABI JoinThread_nid_no_patch(Pthread thread, void** retval, const Kerne
     ThreadCancel::Check();
     registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
-    reference.Retain(thread);
+    if (!reference.Retain(thread)) return SCE_KERNEL_ERROR_ESRCH;
     {
         std::unique_lock lock(thread->_join_mtx);
         if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
@@ -1174,7 +1194,7 @@ int APS5_VABI scePthreadDetach(Pthread thread) {
     GuestThreadReference reference;
     auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
-    reference.Retain(thread);
+    if (!reference.Retain(thread)) return SCE_KERNEL_ERROR_ESRCH;
     {
         std::lock_guard lock(thread->_join_mtx);
         if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
@@ -1272,7 +1292,7 @@ int APS5_VABI scePthreadCancel(Pthread thread) {
     GuestThreadReference reference;
     auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
-    reference.Retain(thread);
+    if (!reference.Retain(thread)) return SCE_KERNEL_ERROR_ESRCH;
     registered.unlock();
     thread->cancelPending.store(true);
     for (;;) {
