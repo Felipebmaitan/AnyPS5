@@ -38,8 +38,19 @@ int main() {
         Require(scePthreadCreate(&thread, nullptr, Wait, &worker, "released") == SCE_OK);
         while (!worker.started.load()) std::this_thread::yield();
         Require(scePthreadDetach(thread) == SCE_OK);
+        std::atomic<bool> finished{false};
+        std::thread observer([&] {
+            while (!finished.load()) {
+                int priority = 0;
+                const int result = scePthreadGetprio(thread, &priority);
+                Require(result == SCE_OK || result == SCE_KERNEL_ERROR_ESRCH);
+                std::this_thread::yield();
+            }
+        });
         worker.release.store(true);
         WaitUntilReleased(thread);
+        finished.store(true);
+        observer.join();
         Require(scePthreadJoin(thread, nullptr) == SCE_KERNEL_ERROR_ESRCH);
         Require(scePthreadDetach(thread) == SCE_KERNEL_ERROR_ESRCH);
         Require(scePthreadCancel(thread) == SCE_KERNEL_ERROR_ESRCH);

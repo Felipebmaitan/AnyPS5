@@ -829,6 +829,27 @@ static void ReleaseThread(PthreadPrivate* thread) {
     delete thread;
 }
 
+class GuestThreadReference {
+public:
+    GuestThreadReference() = default;
+    void Retain(PthreadPrivate* value) {
+        value->references.fetch_add(1, std::memory_order_relaxed);
+        thread = value;
+    }
+    void Reset() {
+        if (!thread) return;
+        auto* retained = thread;
+        thread = nullptr;
+        ReleaseThread(retained);
+    }
+    ~GuestThreadReference() { Reset(); }
+    GuestThreadReference(const GuestThreadReference&) = delete;
+    GuestThreadReference& operator=(const GuestThreadReference&) = delete;
+
+private:
+    PthreadPrivate* thread = nullptr;
+};
+
 static std::mutex joinedLock;
 static std::map<Pthread*, PthreadPrivate*> joinedThreads;
 
@@ -1082,16 +1103,26 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
 
 int APS5_VABI JoinThread_nid_no_patch(Pthread thread, void** retval, const KernelTimespec* abstime) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
-    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
+    GuestThreadReference reference;
+    auto registered = LockRegisteredGuestThread(thread);
+    if (!registered) return SCE_KERNEL_ERROR_ESRCH;
+    reference.Retain(thread);
     if (thread == CurrentGuestState().current) return SCE_KERNEL_ERROR_EDEADLK;
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
     if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
+    registered.unlock();
+    reference.Reset();
     ThreadCancel::Check();
+    registered = LockRegisteredGuestThread(thread);
+    if (!registered) return SCE_KERNEL_ERROR_ESRCH;
+    reference.Retain(thread);
     {
         std::unique_lock lock(thread->_join_mtx);
         if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
+        if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
         if (thread->_joining) return SCE_KERNEL_ERROR_EOPNOTSUPP;
         thread->_joining = true;
+        registered.unlock();
         while (!thread->_finished.load()) {
             std::optional<std::uint64_t> deadline;
             if (abstime != nullptr) {
@@ -1140,13 +1171,17 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
 
 int APS5_VABI scePthreadDetach(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
-    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
+    GuestThreadReference reference;
+    auto registered = LockRegisteredGuestThread(thread);
+    if (!registered) return SCE_KERNEL_ERROR_ESRCH;
+    reference.Retain(thread);
     {
         std::lock_guard lock(thread->_join_mtx);
         if (thread->_joined.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
         if (thread->_detached || thread->_joining) return SCE_KERNEL_ERROR_EINVAL;
         thread->_detached = true;
     }
+    registered.unlock();
 #ifdef _WIN32
     ReleaseThread(thread);
 #else
@@ -1234,7 +1269,11 @@ void APS5_VABI scePthreadYield() {
 
 int APS5_VABI scePthreadCancel(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_ESRCH;
-    if (!LockRegisteredGuestThread(thread)) return SCE_KERNEL_ERROR_ESRCH;
+    GuestThreadReference reference;
+    auto registered = LockRegisteredGuestThread(thread);
+    if (!registered) return SCE_KERNEL_ERROR_ESRCH;
+    reference.Retain(thread);
+    registered.unlock();
     thread->cancelPending.store(true);
     for (;;) {
         {
@@ -1284,7 +1323,7 @@ KernelCpumask APS5_VABI sceKernelGetAvailableCpumask(void) {
 
 int APS5_VABI scePthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
     if (!thread || !mask) return SCE_KERNEL_ERROR_EINVAL;
-    const auto registered = LockRegisteredGuestThread(thread);
+    auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
     *mask = thread->affinity.load(std::memory_order_relaxed);
     return SCE_OK;
@@ -1292,7 +1331,7 @@ int APS5_VABI scePthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 
 int APS5_VABI scePthreadGetname(Pthread thread, char* name) {
     if (!thread || !name) return SCE_KERNEL_ERROR_EINVAL;
-    const auto registered = LockRegisteredGuestThread(thread);
+    auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
     std::lock_guard lock(thread->nameLock);
     const std::size_t length = std::min<std::size_t>(thread->name.size(), THREAD_NAME_CAPACITY - 1);
@@ -1303,7 +1342,7 @@ int APS5_VABI scePthreadGetname(Pthread thread, char* name) {
 
 int APS5_VABI scePthreadGetprio(Pthread thread, int* prio) {
     if (!thread || !prio) return SCE_KERNEL_ERROR_EINVAL;
-    const auto registered = LockRegisteredGuestThread(thread);
+    auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
     *prio = thread->priority.load(std::memory_order_relaxed);
     return SCE_OK;
@@ -1315,7 +1354,7 @@ int APS5_VABI scePthreadGetthreadid(void) {
 
 int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     if (!thread || !name) return SCE_KERNEL_ERROR_EINVAL;
-    const auto registered = LockRegisteredGuestThread(thread);
+    auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
     std::lock_guard lock(thread->nameLock);
     thread->name = name;
@@ -1329,7 +1368,7 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
 
 int APS5_VABI scePthreadSetaffinity(Pthread thread, KernelCpumask mask) {
     if (!thread || mask == 0) return SCE_KERNEL_ERROR_EINVAL;
-    const auto registered = LockRegisteredGuestThread(thread);
+    auto registered = LockRegisteredGuestThread(thread);
     if (!registered) return SCE_KERNEL_ERROR_ESRCH;
     thread->affinity.store(mask, std::memory_order_relaxed);
     return SCE_OK;
