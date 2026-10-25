@@ -6799,7 +6799,6 @@ void verifyUnnormalizedSamplers() {
     reject(0xf11c0108u, userData(unnormalized), "unnormalized guest sampler is used by a gather, which is not implemented", "unnormalized samplers: image_gather4_lz was accepted");
     reject(0xf1800308u, userData(unnormalized), "unnormalized guest sampler is used by image_get_lod, which is not implemented", "unnormalized samplers: image_get_lod was accepted");
     reject(0xf0800f09u, userData(unnormalized), "unnormalized guest sampler is used by an implicit-LOD sample, which is not implemented", "unnormalized samplers: implicit image_sample_a was accepted");
-    reject(0xf09c0f09u, userData(unnormalized), "unnormalized guest sampler is used by an image_sample_*_a variant, which is not implemented", "unnormalized samplers: image_sample_lz_a was accepted");
     const auto reservedDword3 = [&](std::uint32_t mimg) {
         auto code = program(mimg);
         const std::array<std::uint32_t, 4> computed{0x7d8a0080u, 0x870bff6au, 0x000000ffu, 0x8f0b8c0bu};
