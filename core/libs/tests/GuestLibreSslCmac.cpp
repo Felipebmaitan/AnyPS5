@@ -1,3 +1,4 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
 #include "prx/libSceLibreSsl/include/Cmac.hpp"
 #include "prx/libSceLibreSsl/ErrorQueue.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"

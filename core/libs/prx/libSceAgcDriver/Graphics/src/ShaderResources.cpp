@@ -646,7 +646,7 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     context.memoryProperties2(context.physical, &properties);
     const auto sampled = SampledTextureMemory();
     const auto storage = storageCacheBytes();
-    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
+    const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage, storage);
     const bool fresh = cache.budgetDevice != context.physical;
     const auto storageLimit = storageBudget(context);
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt) || SampledBudgetReportDue(cache.reportedStorage, storageLimit, now - cache.reportedAt))) {
@@ -1196,12 +1196,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             reportGuestAllocation(viewed, viewedBytes);
         }
     }
-    if (DepthPlanesStale() || written) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped));
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if ((DepthPlanesStale() || written) && (written || !layers || disabled)) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), written ? DepthPlaneScope::Whole : DepthPlaneScope::Overlapped));
     if (written && DepthSurfaceOverlaps(context.device, viewed.baseAddress, viewedBytes)) {
         const auto storage = WrittenStorageBytes(viewed, mip);
         RetireCoveredDepthSurfaces(context.device, storage.bytes, storage.extents);
     }
-    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
@@ -1289,16 +1289,16 @@ std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     const auto budget = reported->heapBudget[*heap];
     const auto usage = reported->heapUsage[*heap];
     const auto reserved = usage - std::min<std::uint64_t>(usage, sampledBytes + storageBytes) + sampledBytes + budget / 8u;
-    const auto cap = std::min<std::uint64_t>(TextureCacheBudget(memory), budget / 4u);
+    const auto cap = std::min<std::uint64_t>(memory.memoryHeaps[*heap].size / 2u, budget / 2u);
     return std::max<std::uint64_t>(512ull << 20u, std::min<std::uint64_t>(cap, budget > reserved ? budget - reserved : 0u));
 }
 
-std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes) {
+std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes, std::uint64_t storageBytes) {
     const auto heap = largestDeviceLocalHeap(memory);
     if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
     const auto budget = reported->heapBudget[*heap];
     const auto usage = reported->heapUsage[*heap];
-    const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + TextureCacheBudget(memory) + budget / 8u;
+    const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + std::max(TextureCacheBudget(memory), storageBytes) + budget / 8u;
     return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
 }
 
@@ -3366,6 +3366,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         }
     }
     return OwnRefreshFallback::Count;
+}
+
+bool AnyPendingCpuWrites(const Context& context) {
+    if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+    return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -5666,8 +5671,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
-            const auto slow = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, GuestMemory::CollectWrites(begin, bytes));
-            const bool same = slow == buffer || (slow != nullptr && slow->Bytes().size() == fast.size() && std::memcmp(slow->Bytes().data(), fast.data(), fast.size()) == 0) || (slow == nullptr && std::memcmp(fast.data(), reinterpret_cast<const void*>(begin), bytes) == 0);
+            VkDeviceSize slowOffset = 0;
+            const auto slow = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, GuestMemory::CollectWrites(begin, bytes), &slowOffset);
+            const bool same = (slow == buffer && slowOffset == offset) || (slow != nullptr && slow->Bytes().size() >= slowOffset + fast.size() && std::memcmp(slow->Bytes().data() + slowOffset, fast.data(), fast.size()) == 0) || (slow == nullptr && std::memcmp(fast.data(), reinterpret_cast<const void*>(begin), bytes) == 0);
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
@@ -5680,7 +5686,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 offset = slice.offset;
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
-                buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);

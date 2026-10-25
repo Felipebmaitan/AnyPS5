@@ -45,13 +45,3 @@ static_assert(sizeof(LibreSslCipherContext) == 168 && offsetof(LibreSslCipherCon
 
 struct LibreSslCmac;
 
-extern "C" {
-LibreSslCmac* APS5_VABI CMAC_CTX_new_nid_postfix();
-void APS5_VABI CMAC_CTX_free_nid_postfix(LibreSslCmac* context);
-int APS5_VABI CMAC_Init_nid_postfix(LibreSslCmac* context, const void* key, std::size_t keyLength, const LibreSslCipher* cipher, void* engine);
-int APS5_VABI CMAC_Update_nid_postfix(LibreSslCmac* context, const void* data, std::size_t length);
-int APS5_VABI CMAC_Final_nid_postfix(LibreSslCmac* context, unsigned char* output, std::size_t* length);
-const LibreSslCipher* APS5_VABI EVP_aes_128_cbc_nid_postfix();
-const LibreSslCipher* APS5_VABI EVP_aes_192_cbc_nid_postfix();
-const LibreSslCipher* APS5_VABI EVP_aes_256_cbc_nid_postfix();
-}

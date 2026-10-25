@@ -1,3 +1,4 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
@@ -8,33 +9,8 @@
 #include <source_location>
 #include <string>
 
-struct Bn {
-    std::uint64_t* d;
-    int top;
-    int dmax;
-    int neg;
-    int flags;
-};
-
-struct BnCtx;
-
-extern "C" {
-Bn* APS5_VABI BN_new_nid_postfix(void);
-void APS5_VABI BN_free_nid_postfix(Bn*);
-BnCtx* APS5_VABI BN_CTX_new_nid_postfix(void);
-void APS5_VABI BN_CTX_free_nid_postfix(BnCtx*);
-void APS5_VABI BN_CTX_start_nid_postfix(BnCtx*);
-void APS5_VABI BN_CTX_end_nid_postfix(BnCtx*);
-Bn* APS5_VABI BN_bin2bn_nid_postfix(const unsigned char*, int, Bn*);
-int APS5_VABI BN_bn2bin_nid_postfix(const Bn*, unsigned char*);
-int APS5_VABI BN_hex2bn_nid_postfix(Bn**, const char*);
-int APS5_VABI BN_num_bits_nid_postfix(const Bn*);
-int APS5_VABI BN_set_word_nid_postfix(Bn*, std::uint64_t);
-int APS5_VABI BN_add_word_nid_postfix(Bn*, std::uint64_t);
-int APS5_VABI BN_sub_word_nid_postfix(Bn*, std::uint64_t);
-int APS5_VABI BN_mul_nid_postfix(Bn*, const Bn*, const Bn*, BnCtx*);
-Bn* APS5_VABI BN_mod_inverse_nid_postfix(Bn*, const Bn*, const Bn*, BnCtx*);
-}
+using Bn = Bignum;
+using BnCtx = BignumContext;
 
 static_assert(sizeof(Bn) == 24);
 static_assert(offsetof(Bn, top) == 8);

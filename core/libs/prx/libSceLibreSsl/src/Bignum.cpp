@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libc/include/Api.hpp"
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -8,24 +10,11 @@
 #include <vector>
 #include "prx/libc/include/General.hpp"
 
-extern "C" {
-void* APS5_VABI malloc_nid_postfix(std::size_t size);
-void* APS5_VABI calloc_nid_postfix(std::size_t count, std::size_t size);
-void APS5_VABI free_nid_postfix(void* pointer);
-}
-
-namespace {
-struct Bignum {
-    std::uint64_t* d;
-    int top;
-    int dmax;
-    int neg;
-    int flags;
-};
-
 struct BignumContext {
     std::vector<std::size_t> marks;
 };
+
+namespace {
 
 static_assert(sizeof(Bignum) == 24);
 static_assert(offsetof(Bignum, d) == 0);

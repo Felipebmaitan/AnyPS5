@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "prx/libSceLibreSsl/include/Cmac.hpp"
 #include "prx/libSceLibreSsl/include/Error.hpp"
 #include "prx/libc/include/General.hpp"
@@ -6,12 +8,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <mbedtls/aes.h>
-
-extern "C" {
-void* APS5_VABI malloc_nid_postfix(std::size_t);
-void* APS5_VABI calloc_nid_postfix(std::size_t, std::size_t);
-void APS5_VABI free_nid_postfix(void*);
-}
 
 struct LibreSslCmac {
     LibreSslCipherContext cipherContext;

@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "prx/libSceLibreSsl/include/Bio.hpp"
 #include "prx/libSceLibreSsl/ErrorQueue.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
@@ -25,18 +27,6 @@
 using LibreSsl::Bio;
 using LibreSsl::BioBuffer;
 using LibreSsl::BioMethod;
-
-extern "C" {
-const BioMethod* APS5_VABI BIO_s_mem_nid_postfix();
-Bio* APS5_VABI BIO_new_nid_postfix(const BioMethod*);
-Bio* APS5_VABI BIO_new_mem_buf_nid_postfix(const void*, int);
-int APS5_VABI BIO_free_nid_postfix(Bio*);
-std::int64_t APS5_VABI BIO_ctrl_nid_postfix(Bio*, int, std::int64_t, void*);
-int APS5_VABI BIO_write_nid_postfix(Bio*, const void*, int);
-int APS5_VABI BIO_puts_nid_postfix(Bio*, const char*);
-void* APS5_VABI calloc_nid_postfix(std::size_t, std::size_t);
-void APS5_VABI free_nid_postfix(void*);
-}
 
 #ifdef ANYPS5_BIO_DYNAMIC
 namespace {

@@ -1,3 +1,5 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "prx/libSceLibreSsl/include/Bio.hpp"
 #include "prx/libSceLibreSsl/ErrorQueue.hpp"
 #include "prx/libc/include/General.hpp"
@@ -6,11 +8,6 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-
-extern "C" {
-void* APS5_VABI calloc_nid_postfix(std::size_t, std::size_t);
-void APS5_VABI free_nid_postfix(void*);
-}
 
 namespace {
 
