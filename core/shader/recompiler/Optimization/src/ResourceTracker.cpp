@@ -1950,7 +1950,6 @@ private:
         image.dimensionQueryOnly = image.dimensionQueryOnly && op == IrOpcode::ImageQueryDimensions;
         if (m_program.Resources().stage == IrShaderStage::Compute && op == IrOpcode::ImageSampleRaw && !ImageSampleExplicitLod(memory.imageSampleFlags, IrShaderStage::Compute)) {
             image.emulatedCompare |= image.depthCompare ? EmulatedCompare::Unsupported : EmulatedCompare::ConvertedSampleUnsupported;
-            if (image.depthCompare && !image.remappedDepth1D) image.flatLineCompatible = false;
         }
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
