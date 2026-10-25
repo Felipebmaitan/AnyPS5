@@ -2514,7 +2514,7 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    foreach(computeDerivativeFixture IN ITEMS image_cache_bits image_texel_status image_plane_address_on_cube image_plane_compare_on_line)
+    foreach(computeDerivativeFixture IN ITEMS image_cache_bits image_texel_status image_plane_address_on_cube image_plane_compare_on_line image_one_dimensional_compare image_repacked_float image_volume_address_on_line image_sample_unnormalized)
         set(computeDerivativeRefusalTest agc_driver_${computeDerivativeFixture}_without_compute_derivatives)
         add_test(NAME ${computeDerivativeRefusalTest} COMMAND agc_driver_${computeDerivativeFixture}_tests --without-compute-derivatives)
         set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES
