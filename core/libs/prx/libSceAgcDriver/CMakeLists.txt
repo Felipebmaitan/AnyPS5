@@ -3084,12 +3084,15 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_driver_image_sample_unnormalized_implicit_computed_offset COMMAND agc_driver_image_sample_unnormalized_tests --implicit-computed-offset)
+    set_tests_properties(agc_driver_image_sample_unnormalized_implicit_computed_offset PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     set_tests_properties(agc_driver_compute_implicit_lod PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_compute_implicit_lod_masked_quad_coordinate COMMAND agc_driver_compute_implicit_lod_tests --masked-quad-coordinate)
     set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate agc_driver_image_sample_unnormalized_implicit_computed_offset PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
