@@ -2514,6 +2514,16 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    foreach(computeDerivativeFixture IN ITEMS image_cache_bits image_texel_status image_plane_address_on_cube image_plane_compare_on_line)
+        set(computeDerivativeRefusalTest agc_driver_${computeDerivativeFixture}_without_compute_derivatives)
+        add_test(NAME ${computeDerivativeRefusalTest} COMMAND agc_driver_${computeDerivativeFixture}_tests --without-compute-derivatives)
+        set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
