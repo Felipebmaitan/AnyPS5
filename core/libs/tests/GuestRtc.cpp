@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +15,7 @@
 #include <string_view>
 #include <initializer_list>
 #include <limits>
+#include <random>
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -64,7 +64,7 @@ static void SetCompiledSdkVersion(std::byte* process, std::uint32_t version) {
 }
 
 static void EnterTitleDirectory(const char* titleId) {
-    const auto directory = std::filesystem::temp_directory_path() / ("rtc-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto directory = std::filesystem::temp_directory_path() / ("rtc-test-" + std::to_string(std::random_device{}()));
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
     std::filesystem::current_path(directory);
     if (titleId == nullptr) return;
