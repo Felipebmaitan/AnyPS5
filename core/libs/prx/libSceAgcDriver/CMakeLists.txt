@@ -2514,24 +2514,6 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    foreach(computeDerivativeFixture IN ITEMS image_cache_bits image_texel_status image_plane_address_on_cube image_plane_compare_on_line image_one_dimensional_compare image_repacked_float image_volume_address_on_line image_sample_unnormalized)
-        set(computeDerivativeRefusalTest agc_driver_${computeDerivativeFixture}_without_compute_derivatives)
-        add_test(NAME ${computeDerivativeRefusalTest} COMMAND agc_driver_${computeDerivativeFixture}_tests --without-compute-derivatives)
-        set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        if(WIN32)
-            set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-        endif()
-    endforeach()
-    set_tests_properties(agc_driver_compute_implicit_lod PROPERTIES TIMEOUT 30)
-    add_test(NAME agc_driver_compute_implicit_lod_masked_quad_coordinate COMMAND agc_driver_compute_implicit_lod_tests --masked-quad-coordinate)
-    set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES
-        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    if(WIN32)
-        set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -3091,6 +3073,25 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_driver_queued_index_read_order PROPERTIES TIMEOUT 60)
+
+    foreach(computeDerivativeFixture IN ITEMS image_cache_bits image_texel_status image_plane_address_on_cube image_plane_compare_on_line image_one_dimensional_compare image_repacked_float image_volume_address_on_line image_sample_unnormalized)
+        set(computeDerivativeRefusalTest agc_driver_${computeDerivativeFixture}_without_compute_derivatives)
+        add_test(NAME ${computeDerivativeRefusalTest} COMMAND agc_driver_${computeDerivativeFixture}_tests --without-compute-derivatives)
+        set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${computeDerivativeRefusalTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_driver_compute_implicit_lod PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_driver_compute_implicit_lod_masked_quad_coordinate COMMAND agc_driver_compute_implicit_lod_tests --masked-quad-coordinate)
+    set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;ANYPS5_REQUIRE_VULKAN=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_compute_implicit_lod_masked_quad_coordinate PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
     foreach(agcTest IN ITEMS agc_spirv_narrow_constant_store_tests agc_spirv13_image_tests agc_spirv_optimizer_tests agc_driver_constant_store_tests)
         if(NOT TARGET ${agcTest})
