@@ -148,22 +148,53 @@ def padded_call(kind, body, padding=0):
     return image
 
 
-def adjacent_segment(kind):
-    image = fixture("entry")
+def extra_segment(image, address, body):
     headers = bytes(image[64:400])
     image.extend(bytes(0x1000 - len(image)))
     image[0xD00:0xD00 + len(headers)] = headers
     struct.pack_into("<Q", image, 32, 0xD00)
-    struct.pack_into("<Q", image, 24, 0x10F0)
     struct.pack_into("<H", image, 56, 7)
+    struct.pack_into("<IIQQQQQQ", image, 0xD00 + 6 * 56, 1, 5, 0xC00, address, address, len(body), len(body), 0x100)
+    image[0xC00:0xC00 + len(body)] = body
+    return image
+
+
+def adjacent_segment(kind):
+    image = fixture("entry")
+    struct.pack_into("<Q", image, 24, 0x10F0)
     image[0x4F0:0x500] = b"\x90" * 16
     if kind == "call":
         image[0x4FB:0x500] = b"\xe8" + struct.pack("<i", 0x1050 - 0x1100)
         image[0x450] = 0xC3
     elif kind == "jump":
         image[0x4F0:0x4F5] = b"\xe9" + struct.pack("<i", 0x1100 - 0x10F5)
-    struct.pack_into("<IIQQQQQQ", image, 0xD00 + 6 * 56, 1, 5, 0xC00, 0x1100, 0x1100, len(TLS), len(TLS), 0x100)
-    image[0xC00:0xC00 + len(TLS)] = TLS
+    elif kind == "zeros":
+        image[0x4F0:0x4F8] = b"\x48\x8d\x05" + struct.pack("<i", 0x2208 - 0x10F7) + b"\x90"
+        image[0x4F8:0x500] = bytes(8)
+    return extra_segment(image, 0x1100, TLS)
+
+
+def flow_roundtrip(padding, body):
+    image = fixture("entry")
+    image[0x400] = 0xC3
+    image[0x430:0x480] = b"\xcc" * 0x50
+    image[0x430:0x435] = b"\xe9" + struct.pack("<i", 0x3000 - 0x1035)
+    image[0x440:0x440 + len(body)] = body
+    helper = b"\x48\x8d\x05" + struct.pack("<i", 0x2208 - 0x3007)
+    helper += b"\xe8" + struct.pack("<i", 0x1000 - 0x300C)
+    helper += bytes([padding]) * 4
+    helper += b"\xe9" + struct.pack("<i", 0x1040 - 0x3015)
+    return extra_segment(image, 0x3000, helper)
+
+
+def lea_observer(function):
+    image = fixture("symbol")
+    struct.pack_into("<Q", image, 0xA40, 0x1050)
+    image[0xA3C] = 0x12 if function else 0x11
+    image[0x400:0x410] = b"\x8d\x05" + struct.pack("<i", 0x1054 - 0x1006) + b"\xc3" + b"\x90" * 9
+    struct.pack_into("<Q", image, 24, TAIL)
+    image[0x430:0x440] = b"\xe8" + struct.pack("<i", 0x1000 - 0x1035) + bytes.fromhex("0f b6 00 c3") + b"\xcc" * 7
+    image[0x450:0x450 + len(TLS)] = TLS
     return image
 
 
@@ -184,6 +215,13 @@ def main():
             struct.pack_into("<QQ", image, 120 + 32, 240, 240)
             convert(relinker, work, "no-tail-identical-tags", image, "linux")
         for system in systems:
+            converted = convert(relinker, work, system + "-lea-observer-data", lea_observer(False), system)
+            assert output_bytes(converted.read_bytes(), system, 0x1054, 1) == b"\x25"
+            if os.name == "nt" and system == "windows":
+                run = subprocess.run([str(converted)], capture_output=True, timeout=10)
+                assert run.returncode == 37, (run.returncode, run.stderr)
+            convert(relinker, work, system + "-lea-observer-overlap", lea_observer(True), system,
+                    "Code analysis: reference enters a trailing instruction")
             convert(relinker, work, system + "-external-array", imported_array(), system, module=True)
             if system != "linux":
                 for plt in (0x180, 0x210):
@@ -193,7 +231,23 @@ def main():
                     struct.pack_into("<QQ", image, 120 + 32, 240, 240)
                     converted = convert(relinker, work, f"{system}-plt-{plt:x}", image, system)
                     assert TLS not in converted.read_bytes()
+            if system == "linux":
+                for root in ("entry", "none"):
+                    image = fixture(root)
+                    struct.pack_into("<qQqQ", image, 0x650, 0x6100003B, 24, 0, 0)
+                    struct.pack_into("<QQ", image, 176 + 32, 112, 112)
+                    convert(relinker, work, "tail-identical-tags-" + root, image, system)
             for module in (False, True):
+                for padding in (0, 0x90):
+                    name = f"{system}-{module}-roundtrip-{padding}"
+                    convert(relinker, work, name + "-syscall", flow_roundtrip(padding, SYSCALL), system,
+                            "Forbidden syscall instruction at code offset 0x1040", module)
+                    converted = convert(relinker, work, name, flow_roundtrip(padding, TLS), system, module=module)
+                    actual = output_bytes(converted.read_bytes(), system, 0x1040, len(TLS))
+                    assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), name
+                    if os.name == "nt" and system == "windows" and not module:
+                        run = subprocess.run([str(converted)], capture_output=True, timeout=10)
+                        assert run.returncode == 42, (name, run.returncode, run.stderr)
                 for kind in ("direct", "rip", "register"):
                     for padding in (0, 0x90):
                         name = f"{system}-{module}-padded-{kind}-{padding}"
@@ -205,7 +259,7 @@ def main():
                         if os.name == "nt" and system == "windows" and not module:
                             run = subprocess.run([str(converted)], capture_output=True, timeout=10)
                             assert run.returncode == 42, (name, run.returncode, run.stderr)
-                for kind in ("fallthrough", "call", "jump"):
+                for kind in ("fallthrough", "call", "jump", "zeros"):
                     name = f"{system}-{module}-adjacent-{kind}"
                     converted = convert(relinker, work, name, adjacent_segment(kind), system, module=module)
                     actual = output_bytes(converted.read_bytes(), system, 0x1100, len(TLS))
@@ -247,13 +301,24 @@ def main():
                     converted = convert(relinker, work, f"{system}-{module}-{root}-raw", image, system, module=module)
                     actual = output_bytes(converted.read_bytes(), system, TAIL, len(TLS))
                     assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), root
-                for reference in ("relocation", "lea"):
+                for reference in ("relocation", "lea", "lea32", "lea16", "lea-address32", "lea16-high"):
                     for interior in (1, 4, 8):
                         image = fixture("entry", relocated=reference == "relocation")
                         if reference == "relocation":
                             struct.pack_into("<q", image, 0xA90, TAIL + interior)
                         else:
-                            image[0x400:0x408] = b"\x48\x8d\x05" + struct.pack("<i", TAIL + interior - 0x1007) + b"\xc3"
+                            prefix = {"lea": b"\x48", "lea32": b"", "lea16": b"\x66", "lea-address32": b"\x67\x48", "lea16-high": b"\x66"}[reference]
+                            code = prefix + b"\x8d\x05" + struct.pack("<i", TAIL + interior - (0x1006 + len(prefix))) + b"\xc3"
+                            image[0x400:0x400 + len(code)] = code
+                            if reference == "lea16-high":
+                                struct.pack_into("<Q", image, 24, TAIL + 0x10000)
+                                for header in range(6):
+                                    at = 64 + header * 56
+                                    if struct.unpack_from("<I", image, at)[0] == 0x61000000:
+                                        continue
+                                    for field in (16, 24):
+                                        value = struct.unpack_from("<Q", image, at + field)[0]
+                                        struct.pack_into("<Q", image, at + field, value + 0x10000)
                         convert(relinker, work, f"{system}-{module}-{reference}-interior-{interior}", image, system,
                                 "Code analysis: reference enters a trailing instruction", module)
                 for opcode in ("0f34", "cd80", "0f07"):

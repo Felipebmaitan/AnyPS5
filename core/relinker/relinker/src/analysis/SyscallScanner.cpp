@@ -346,8 +346,7 @@ std::unique_ptr<ISyscallScanner> MakeSyscallScanner(Domain::IProgress& progress,
 
 std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, std::string_view input) {
     if (std::none_of(headers.begin(), headers.end(), [](const auto& header) { return header.Type == 0x61000000; })) return {};
-    std::vector<CodeRange> ranges;
-    CodeInstructionCollector().Collect(bytes, headers, [&](auto completed, auto total) { progress.Report({Domain::ProgressStage::Decode, std::string(input), completed, total}); }, nullptr, {}, &ranges);
+    const auto ranges = CodeInstructionCollector().CollectTailReachableRanges(bytes, headers, [&](auto completed, auto total) { progress.Report({Domain::ProgressStage::Decode, std::string(input), completed, total}); });
     std::vector<RelinkPatch> patches;
     for (const auto& range : ranges) {
         const auto header = std::find_if(headers.begin(), headers.end(), [&](const auto& candidate) {

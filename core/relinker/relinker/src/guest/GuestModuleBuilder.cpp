@@ -407,6 +407,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         for (const auto& function : unwindFunctions) unwindRanges.emplace_back(function.Begin, function.End);
         std::sort(unwindRanges.begin(), unwindRanges.end());
         bool hasCodeTail = false;
+        std::map<FileByteOffset, std::vector<std::uint8_t>> syscallPatches;
         for (const auto& header : codeHeaders) {
             std::vector<std::uint8_t> code(image.Bytes.begin() + header.Offset, image.Bytes.begin() + header.Offset + header.FileSize);
             if (sceImage)
@@ -426,21 +427,17 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             for (const auto offset : syscallScanner.ScanCodeSectionForSyscalls(scanCode, header.MappedAddress, scanCode.size(), Io::Utf8Path(image.SourcePath), scanUnwindRanges)) {
                 if (offset > code.size() || code.size() - offset < 2u)
                     throw Domain::RelinkerException("Syscall trap patch exceeds guest executable segment", header.MappedAddress + offset);
-                if (!image.PatchedRanges.empty()) {
-                    const GamePatch::WriterRange trap{header.Offset + offset, 2, "syscall trap"};
-                    GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.Traps = std::span<const GamePatch::WriterRange>(&trap, 1)});
-                }
-                image.Bytes[header.Offset + offset] = 0x0F;
-                image.Bytes[header.Offset + offset + 1] = 0x0B;
+                syscallPatches.emplace(header.Offset + offset, std::vector<std::uint8_t>{0x0f, 0x0b});
             }
         }
         const auto tailPatches = hasCodeTail ? syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, Io::Utf8Path(image.SourcePath)) : std::vector<RelinkPatch>{};
-        for (const auto& patch : tailPatches) {
+        for (const auto& patch : tailPatches) syscallPatches.emplace(patch.Offset, patch.Bytes);
+        for (const auto& [offset, patch] : syscallPatches) {
             if (!image.PatchedRanges.empty()) {
-                const GamePatch::WriterRange trap{patch.Offset, patch.Bytes.size(), "syscall trap"};
+                const GamePatch::WriterRange trap{offset, patch.size(), "syscall trap"};
                 GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.Traps = std::span<const GamePatch::WriterRange>(&trap, 1)});
             }
-            std::copy(patch.Bytes.begin(), patch.Bytes.end(), image.Bytes.begin() + patch.Offset);
+            std::copy(patch.begin(), patch.end(), image.Bytes.begin() + offset);
         }
         const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;

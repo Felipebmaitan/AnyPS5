@@ -449,8 +449,12 @@ RelinkResult RelinkerPipeline::Relink() {
         }
     }
 
-    if (hasCodeTail)
-        for (auto& patch : syscallScanner->ScanReferencedTailForSyscalls(raw, programHeaders)) syscallPatches.push_back(std::move(patch));
+    if (hasCodeTail) {
+        std::set<FileByteOffset> trapOffsets;
+        for (const auto& patch : syscallPatches) trapOffsets.insert(patch.Offset);
+        for (auto& patch : syscallScanner->ScanReferencedTailForSyscalls(raw, programHeaders))
+            if (trapOffsets.insert(patch.Offset).second) syscallPatches.push_back(std::move(patch));
+    }
 
 
     std::vector<std::pair<ByteCount, std::string>> exportedSymbols;
