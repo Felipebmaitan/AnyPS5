@@ -132,15 +132,16 @@ def imported_array():
 
 def main():
     relinker = Path(sys.argv[1]).resolve()
+    systems = [sys.argv[2]] if len(sys.argv) > 2 else ["linux", "windows", "macos"]
     with tempfile.TemporaryDirectory(prefix="anyps5-referenced-code-") as directory:
         work = Path(directory)
-        for root in ("entry", "branch", "indirect"):
+        for root in (("entry", "branch", "indirect") if "windows" in systems else ()):
             converted = convert(relinker, work, "unwind-control-" + root, fixture(root, unwind=True), "windows")
             assert output_bytes(converted.read_bytes(), "windows", TAIL, 1) == b"\xe9"
             if os.name == "nt":
                 run = subprocess.run([str(converted)], capture_output=True, timeout=10)
                 assert run.returncode == 42, (root, run.returncode, run.stderr)
-        for system in ("linux", "windows", "macos"):
+        for system in systems:
             convert(relinker, work, system + "-external-array", imported_array(), system, module=True)
             if system != "linux":
                 for plt in (0x180, 0x210):
@@ -197,7 +198,7 @@ def main():
                 for root in ("none", "data-pointer"):
                     converted = convert(relinker, work, f"{system}-{module}-{root}", fixture(root, LOOKALIKE, relocated=True), system, module=module)
                     assert output_bytes(converted.read_bytes(), system, TAIL, len(LOOKALIKE)) == LOOKALIKE
-    print("Referenced SCE code tests passed; native Windows execution " + ("passed" if os.name == "nt" else "not run"))
+    print("Referenced SCE code tests passed; native Windows execution " + ("passed" if os.name == "nt" and "windows" in systems else "not run"))
 
 
 if __name__ == "__main__":

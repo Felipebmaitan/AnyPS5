@@ -800,8 +800,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_code_extent.py $<TARGET_FILE:relinker>)
         add_test(NAME sce_relro COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_relro.py $<TARGET_FILE:relinker>)
-        add_test(NAME sce_referenced_code COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_referenced_code.py $<TARGET_FILE:relinker>)
+        foreach(system linux windows macos)
+            add_test(NAME sce_referenced_code_${system} COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_referenced_code.py $<TARGET_FILE:relinker> ${system})
+        endforeach()
 
         add_test(NAME sce_module_code_extent COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_module_code_extent.py $<TARGET_FILE:relinker>)
