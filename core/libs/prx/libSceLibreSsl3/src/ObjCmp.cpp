@@ -1,8 +1,8 @@
+#include "prx/libSceLibreSsl3/libSceLibreSsl3.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include "prx/libc/include/general/VabiMacros.hpp"
 
 namespace {
 struct Object {
