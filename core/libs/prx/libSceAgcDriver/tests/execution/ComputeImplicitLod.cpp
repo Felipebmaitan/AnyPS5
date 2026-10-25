@@ -43,6 +43,12 @@ alignas(256) constexpr std::array<std::uint32_t, 16> CompareCode{
     0x80000201, 0xbf8c3f70, 0xf0a00108, 0x00a20d02, 0xbf8c3f70, 0xe0701014, 0x80010d01, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 23> MaskedQuadCode{
+    0x34020085, 0x8f1a1819, 0x4a02021a, 0xe0301004, 0x80000301, 0xe0301008, 0x80000401, 0xbf8c3f70,
+    0x7e1002ff, 0xdeadbeef, 0xbefe03ff, 0x55555555, 0xbeff03ff, 0x55555555, 0x7e060280, 0xf0800108,
+    0x00820803, 0xbf8c3f70, 0xbefe03c1, 0xbeff03c1, 0xe0701000, 0x80010801, 0xbf810000,
+};
+
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
@@ -100,6 +106,15 @@ void FillInput() {
     }
 }
 
+void FillMaskedQuadInput() {
+    Input.fill(0xdeadbeefu);
+    for (std::uint32_t tid = 0; tid < Invocations; ++tid) {
+        const float u = static_cast<float>((tid & 1u) == 0u ? 2u : 4u) / static_cast<float>(Size);
+        Input[tid * Words + 1u] = std::bit_cast<std::uint32_t>(u);
+        Input[tid * Words + 2u] = std::bit_cast<std::uint32_t>(0.25f);
+    }
+}
+
 std::uint32_t LineImplicitLevel(std::uint32_t tid) {
     const auto pattern = (tid / 32u) % 4u;
     return pattern == 0u ? 0u : (pattern - 1u) * 2u;
@@ -143,6 +158,14 @@ void CheckLine(const std::string& run) {
     }
 }
 
+void CheckMaskedQuad(const std::string& run) {
+    for (std::uint32_t tid = 0; tid < Invocations; ++tid) {
+        const auto expected = (tid & 1u) == 0u ? std::bit_cast<std::uint32_t>(LevelMark(2u)) : 0xdeadbeefu;
+        Require(Output[tid * Words] == expected, "compute implicit LOD " + run + ": invocation " + std::to_string(tid) + ((tid & 1u) == 0u ? " did not sample mip 2 from its inactive neighbor's preserved coordinate" : " overwrote its inactive output sentinel"));
+        for (std::uint32_t word = 1u; word < Words; ++word) Require(Output[tid * Words + word] == 0xdeadbeefu, "compute implicit LOD " + run + ": a masked-quad store overwrote another output word");
+    }
+}
+
 std::vector<std::uint32_t> UserData(std::uint32_t groupThreads, bool line = false) {
     std::vector<std::uint32_t> userData(25, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(sizeof(Input)));
@@ -159,10 +182,11 @@ std::vector<std::uint32_t> UserData(std::uint32_t groupThreads, bool line = fals
     return userData;
 }
 
-bool Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, std::uint32_t groupThreads, const ShaderRecompiler::SpirvTarget& target, bool zeroUnusedDims = false, bool line = false) {
+bool Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, std::uint32_t groupThreads, const ShaderRecompiler::SpirvTarget& target, bool zeroUnusedDims = false, bool line = false, bool maskedQuad = false) {
+    if (maskedQuad) std::printf("compute implicit LOD masked quad coordinate: wave%u subgroup%u threads%u spanned requested %u\n", waveSize, target.subgroupSize, groupThreads, static_cast<unsigned>(target.spannedWaves));
     Output.fill(0xdeadbeefu);
     const auto userData = UserData(groupThreads, line);
-    const auto code = line ? std::span<const std::uint32_t>(CompareCode) : std::span<const std::uint32_t>(Code);
+    const auto code = maskedQuad ? std::span<const std::uint32_t>(MaskedQuadCode) : line ? std::span<const std::uint32_t>(CompareCode) : std::span<const std::uint32_t>(Code);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const auto unused = zeroUnusedDims ? 0u : 1u;
     const ShaderRecompiler::ShaderComputeStageInfo compute{{groupThreads, unused, unused}, 0u, {true, false, false}, false, 1};
@@ -185,7 +209,7 @@ bool Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, std::uint32_t 
         }
         throw;
     }
-    Require(std::ranges::any_of(compiled.bindings, [](const auto& binding) {
+    if (!maskedQuad) Require(std::ranges::any_of(compiled.bindings, [](const auto& binding) {
         return binding.kind == ShaderRecompiler::DescriptorKind::Sampler && std::ranges::find(binding.samplerDepthCompare, true) != binding.samplerDepthCompare.end();
     }), "compute implicit LOD: R32_FLOAT comparison did not select a native comparison sampler");
     const bool dualHalfFallback = waveSize == 64u && target.subgroupSize == 32u && target.spannedWaves && groupThreads == 64u;
@@ -202,8 +226,9 @@ bool Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, std::uint32_t 
     }
     device.Dispatch(compiled, Invocations / groupThreads, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
-    const auto run = "wave" + std::to_string(waveSize) + " subgroup" + std::to_string(target.subgroupSize) + " threads" + std::to_string(groupThreads) + (zeroUnusedDims ? " zero unused dimensions" : "") + (target.spannedWaves ? " spanned requested" : "") + (line ? " native DIM2D comparison on 1D" : "");
-    if (line) CheckLine(run);
+    const auto run = "wave" + std::to_string(waveSize) + " subgroup" + std::to_string(target.subgroupSize) + " threads" + std::to_string(groupThreads) + (zeroUnusedDims ? " zero unused dimensions" : "") + (target.spannedWaves ? " spanned requested" : "") + (line ? " native DIM2D comparison on 1D" : "") + (maskedQuad ? " masked quad coordinate" : "");
+    if (maskedQuad) CheckMaskedQuad(run);
+    else if (line) CheckLine(run);
     else Check(run);
     std::printf("compute implicit LOD %s passed\n", run.c_str());
     return true;
@@ -250,14 +275,31 @@ void CheckRefusals(const ShaderRecompiler::SpirvTarget& target) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool maskedQuad = argc == 2 && std::string_view(argv[1]) == "--masked-quad-coordinate";
+        Require(argc == 1 || maskedQuad, "compute implicit LOD: unexpected argument");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         FillTexture();
-        FillInput();
         const auto wave32 = device->ComputeTarget(32);
         const auto wave64 = device->ComputeTarget(64);
+        if (maskedQuad) {
+            FillMaskedQuadInput();
+            if (!Run(*device, 32, 128, wave32, false, false, true)) return VulkanTestSkipped;
+            if (!Run(*device, 64, 128, wave64, false, false, true)) return VulkanTestSkipped;
+            if (wave32.subgroupSize == 32u) {
+                if (wave64.subgroupSize != 32u && !Run(*device, 64, 128, wave32, false, false, true)) return VulkanTestSkipped;
+                auto requested = wave32;
+                requested.spannedWaves = true;
+                if (!Run(*device, 64, 64, requested, false, false, true)) return VulkanTestSkipped;
+            } else {
+                std::puts("skipped masked-quad wave64 dual-half cases, a 32-lane compute subgroup is unavailable");
+                return VulkanTestSkipped;
+            }
+            return 0;
+        }
+        FillInput();
         if (!Run(*device, 32, 128, wave32)) return VulkanTestSkipped;
         if (!Run(*device, 64, 128, wave64)) return VulkanTestSkipped;
         if (wave32.subgroupSize == 32u) {
