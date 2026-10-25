@@ -77,6 +77,18 @@ alignas(256) constexpr std::array<std::uint32_t, 45> OffsetCode{
     0xe0701038, 0x80001201, 0xe070103c, 0x80001301, 0xbf810000,
 };
 
+alignas(256) constexpr auto ImplicitOffsetCode = [] {
+    static_assert(OffsetCode[8] == 0x7e0a02ffu && OffsetCode[9] == 0x402ccccdu && OffsetCode[12] == 0xf0dc0f08u && OffsetCode[14] == 0xf0d00f08u && OffsetCode[15] == 0x00610c02u && OffsetCode[16] == 0xf0dc0f0au && OffsetCode[18] == 0x00000403u);
+    std::array<std::uint32_t, OffsetCode.size() + 1u> code{};
+    std::copy_n(OffsetCode.begin(), 14u, code.begin());
+    code[12] = 0xf0c00f08u;
+    code[14] = 0xf0d40f0au;
+    code[15] = OffsetCode[15];
+    code[16] = 0x00040305u;
+    std::copy(OffsetCode.begin() + 16u, OffsetCode.end(), code.begin() + 17u);
+    return code;
+}();
+
 enum class Offset { None, Lane, Constant };
 constexpr std::int32_t ConstantOffsetU = -3;
 constexpr std::int32_t ConstantOffsetV = 2;
@@ -93,6 +105,7 @@ const Program Explicit{ExplicitCode, {"image_sample_lz", "image_sample_l 2.7", "
 const Program LevelZero{LevelZeroCode, {"image_sample_lz", "", ""}, {Offset::None, Offset::None, Offset::None}, 1};
 const Program Gradient{GradientCode, {"image_sample_d (4, 0, 0, 4)", "", ""}, {Offset::None, Offset::None, Offset::None}, 1};
 const Program Offsets{OffsetCode, {"image_sample_lz_o", "image_sample_l_o 2.7", "image_sample_lz_o (-3, 2) NSA"}, {Offset::Lane, Offset::Lane, Offset::Constant}};
+const Program ImplicitOffsets{ImplicitOffsetCode, {"image_sample_o", "image_sample_b_o 2.7 NSA", "image_sample_lz_o (-3, 2) NSA"}, {Offset::Lane, Offset::Lane, Offset::Constant}};
 
 alignas(256) constexpr std::array<std::uint32_t, 34> ConstantCode{
     0x34020086, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xbf8c3f70, 0xf09c0608, 0x00610802,
@@ -315,7 +328,8 @@ void ExpectFailure(AgcDriver::VulkanDevice& device, const ShaderRecompiler::Spir
 int main(int argc, char** argv) {
     try {
         const bool forced = argc == 2 && std::string_view(argv[1]) == "--without-compute-derivatives";
-        Require(argc == 1 || forced, "image sample unnormalized: unexpected arguments");
+        const bool implicitComputedOffset = argc == 2 && std::string_view(argv[1]) == "--implicit-computed-offset";
+        Require(argc == 1 || forced || implicitComputedOffset, "image sample unnormalized: unexpected arguments");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         auto target = device->Target();
@@ -328,6 +342,21 @@ int main(int argc, char** argv) {
         target.supportedCapabilities = capabilities;
         target.supportedExtensions = extensions;
         FillTexture(SingleLevel, 1);
+        if (implicitComputedOffset) {
+            target.nonConstantImageOffsets = false;
+            const auto texture = TextureDescriptor(SingleLevel.data(), 0u, 0u);
+            if (!HasComputeDerivatives(target)) {
+                ExpectFailure(*device, target, ImplicitOffsets, texture, Samplers[0].words, "require enabled ComputeDerivativeGroupLinearKHR and SPV_KHR_compute_shader_derivatives", "an implicit computed-offset sample without compute derivatives");
+                std::puts("skipped unnormalized implicit computed offsets, compute derivatives are unavailable");
+                return VulkanTestSkipped;
+            }
+            const auto coordinates = OffsetCoordinates();
+            for (const auto& sampler : Samplers) {
+                Check(ImplicitOffsets, sampler, 0u, "1-level image without native computed offsets", coordinates, Run(*device, target, ImplicitOffsets, texture, sampler.words, coordinates));
+            }
+            std::puts("unnormalized implicit computed-offset plain, bias and explicit NSA controls passed");
+            return 0;
+        }
         FillTexture(MultiLevel, StorageLevels);
         const auto coordinates = Coordinates(0u);
         const auto levelOneCoordinates = Coordinates(1u);
