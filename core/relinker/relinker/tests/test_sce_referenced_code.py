@@ -187,6 +187,13 @@ def flow_roundtrip(padding, body):
     return extra_segment(image, 0x3000, helper)
 
 
+def prefix_zeros(body, padding):
+    image = fixture("fallthrough", body)
+    image[0x400:0x408] = b"\x48\x8d\x05" + struct.pack("<i", 0x2208 - 0x1007) + b"\x90"
+    image[0x408:0x410] = bytes([padding]) * 8
+    return image
+
+
 def lea_observer(function):
     image = fixture("symbol")
     struct.pack_into("<Q", image, 0xA40, 0x1050)
@@ -195,6 +202,30 @@ def lea_observer(function):
     struct.pack_into("<Q", image, 24, TAIL)
     image[0x430:0x440] = b"\xe8" + struct.pack("<i", 0x1000 - 0x1035) + bytes.fromhex("0f b6 00 c3") + b"\xcc" * 7
     image[0x450:0x450 + len(TLS)] = TLS
+    return image
+
+
+def null_symbol(root, indexed, stale, body=TLS, shifted=False):
+    image = fixture(root, body, relocated=True)
+    struct.pack_into("<Q", image, 0xA88, ((1 if indexed else 0) << 32) | 1)
+    if indexed:
+        struct.pack_into("<Q", image, 0x648, 48)
+    struct.pack_into("<Q", image, 0x800, stale)
+    if shifted:
+        delta = 0x2F000
+        struct.pack_into("<Q", image, 24, 0x1000 + delta)
+        for header in range(6):
+            at = 64 + header * 56
+            if struct.unpack_from("<I", image, at)[0] == 0x61000000:
+                continue
+            for field in (16, 24):
+                value = struct.unpack_from("<Q", image, at + field)[0]
+                struct.pack_into("<Q", image, at + field, value + delta)
+        for at in (0xA80, 0xA90):
+            struct.pack_into("<Q", image, at, struct.unpack_from("<Q", image, at)[0] + delta)
+        for at in range(0x600, 0x6A0, 16):
+            if struct.unpack_from("<Q", image, at)[0] in (25, 26):
+                struct.pack_into("<Q", image, at + 8, 0x2200 + delta)
     return image
 
 
@@ -221,7 +252,7 @@ def main():
                 run = subprocess.run([str(converted)], capture_output=True, timeout=10)
                 assert run.returncode == 37, (run.returncode, run.stderr)
             convert(relinker, work, system + "-lea-observer-overlap", lea_observer(True), system,
-                    "Code analysis: reference enters a trailing instruction")
+                    "Code analysis: reference enters an analyzed instruction")
             convert(relinker, work, system + "-external-array", imported_array(), system, module=True)
             if system != "linux":
                 for plt in (0x180, 0x210):
@@ -237,7 +268,33 @@ def main():
                     struct.pack_into("<qQqQ", image, 0x650, 0x6100003B, 24, 0, 0)
                     struct.pack_into("<QQ", image, 176 + 32, 112, 112)
                     convert(relinker, work, "tail-identical-tags-" + root, image, system)
+            for indexed in (False, True):
+                for stale in (0, 0xDEADBEEF):
+                    for root in ("init-array", "indirect"):
+                        name = f"{system}-null-{indexed}-{stale}-{root}"
+                        convert(relinker, work, name + "-syscall", null_symbol(root, indexed, stale, SYSCALL), system,
+                                "Forbidden syscall instruction at code offset 0x1030")
+                        converted = convert(relinker, work, name, null_symbol(root, indexed, stale), system)
+                        actual = output_bytes(converted.read_bytes(), system, TAIL, len(TLS))
+                        assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), name
+                        if system != "linux":
+                            assert output_bytes(converted.read_bytes(), system, 0x2200, 8) == struct.pack("<Q", TAIL), name
+                        if os.name == "nt" and system == "windows":
+                            native = convert(relinker, work, name + "-native", null_symbol(root, indexed, stale, shifted=True), system,
+                                             flags=("--windows-fixed-base", "0x30000"))
+                            run = subprocess.run([str(native)], capture_output=True, timeout=10)
+                            assert run.returncode == 42, (name, run.returncode, run.stderr)
             for module in (False, True):
+                for padding in (0, 0x90):
+                    name = f"{system}-{module}-prefix-zeros-{padding}"
+                    convert(relinker, work, name + "-syscall", prefix_zeros(SYSCALL, padding), system,
+                            "Forbidden syscall instruction at code offset 0x1010", module)
+                    converted = convert(relinker, work, name, prefix_zeros(TLS, padding), system, module=module)
+                    actual = output_bytes(converted.read_bytes(), system, 0x1010, len(TLS))
+                    assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), name
+                    if os.name == "nt" and system == "windows" and not module:
+                        run = subprocess.run([str(converted)], capture_output=True, timeout=10)
+                        assert run.returncode == 42, (name, run.returncode, run.stderr)
                 for padding in (0, 0x90):
                     name = f"{system}-{module}-roundtrip-{padding}"
                     convert(relinker, work, name + "-syscall", flow_roundtrip(padding, SYSCALL), system,
@@ -320,7 +377,7 @@ def main():
                                         value = struct.unpack_from("<Q", image, at + field)[0]
                                         struct.pack_into("<Q", image, at + field, value + 0x10000)
                         convert(relinker, work, f"{system}-{module}-{reference}-interior-{interior}", image, system,
-                                "Code analysis: reference enters a trailing instruction", module)
+                                "Code analysis: reference enters an analyzed instruction", module)
                 for opcode in ("0f34", "cd80", "0f07"):
                     convert(relinker, work, f"{system}-{module}-forbidden-{opcode}", fixture("entry", bytes.fromhex(opcode) + b"\xc3"), system,
                             "Forbidden syscall instruction at code offset 0x1030", module)
@@ -329,6 +386,15 @@ def main():
                 truncated[0x4FF] = 0x0F
                 convert(relinker, work, f"{system}-{module}-truncated", truncated, system,
                         "Instruction truncated after two-byte opcode escape", module)
+                inline = bytes.fromhex("49 63 d6 4c 63 d1 4d 63 c0 b8 dd 01 00 00 48 89 de 0f 05 48 89 c1 0f 93 c2 48 f7 d8 84 d2 48 0f 45 c1 48 85 c0")
+                converted = convert(relinker, work, f"{system}-{module}-inline-trap", fixture("entry", inline + TLS), system,
+                                    module=module, flags=("--trap-sdk-syscall-stubs",))
+                data = converted.read_bytes()
+                assert output_bytes(data, system, TAIL + 17, 2) == bytes.fromhex("0f 0b")
+                actual = output_bytes(data, system, TAIL + len(inline), len(TLS))
+                assert (actual == TLS if system == "linux" else actual[:1] == b"\xe9"), (system, module, actual.hex())
+                converted = convert(relinker, work, f"{system}-{module}-intentional-trap", fixture("entry", bytes.fromhex("0f 0b") + TLS), system, module=module)
+                assert output_bytes(converted.read_bytes(), system, TAIL + 2, len(TLS)) == TLS
                 sdk = bytes.fromhex("48 c7 c0 01 00 00 00 49 89 ca 0f 05 c3")
                 trapped = convert(relinker, work, f"{system}-{module}-trap", fixture("entry", sdk), system,
                                   module=module, flags=("--trap-sdk-syscall-stubs",))

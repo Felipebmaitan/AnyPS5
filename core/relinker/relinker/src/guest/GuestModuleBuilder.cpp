@@ -433,6 +433,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         const auto tailPatches = hasCodeTail ? syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, Io::Utf8Path(image.SourcePath)) : std::vector<RelinkPatch>{};
         for (const auto& patch : tailPatches) syscallPatches.emplace(patch.Offset, patch.Bytes);
         for (const auto& [offset, patch] : syscallPatches) {
+            for (const auto& header : codeHeaders) {
+                if (offset < header.Offset || offset - header.Offset >= header.FileSize) continue;
+                image.Dynamic.SyscallContinuations.push_back(header.MappedAddress + (offset - header.Offset) + patch.size());
+                break;
+            }
             if (!image.PatchedRanges.empty()) {
                 const GamePatch::WriterRange trap{offset, patch.size(), "syscall trap"};
                 GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.Traps = std::span<const GamePatch::WriterRange>(&trap, 1)});

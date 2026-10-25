@@ -31,6 +31,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteMacOs(const Relinker::GuestIma
     input.Headers = &guest.Headers;
     input.Image = &image;
     input.Message = message;
+    input.SyscallContinuations = guest.Dynamic.SyscallContinuations;
 
     const auto tls = std::find_if(guest.Headers.begin(), guest.Headers.end(), [](const auto& header) { return header.Type == 7; });
     std::map<std::uint64_t, std::uint64_t> targets;

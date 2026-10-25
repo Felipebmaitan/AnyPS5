@@ -259,7 +259,7 @@ def main():
             run(relinker, work, "gap-callback-syscall-" + target,
                 fixture(sce_block=False, gap_callback_syscall_undecodable=True), "Forbidden syscall instruction", target=target)
         run(relinker, work, "sce-tls-rewrite-over-lea-target", entry_overlap_fixture(),
-            "TLS rewrite would overwrite an executable entry point (offset 0x304)")
+            "Code analysis: reference enters an analyzed instruction (offset 0x304)")
     print("SCE code extent tests passed")
 
 

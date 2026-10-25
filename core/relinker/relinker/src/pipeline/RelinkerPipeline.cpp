@@ -649,6 +649,13 @@ RelinkResult RelinkerPipeline::Relink() {
         }
     }
 
+    for (const auto& patch : syscallPatches) {
+        for (const auto& header : programHeaders) {
+            if (header.Type != PT_LOAD || (header.Flags & 1) == 0 || patch.Offset < header.Offset || patch.Offset - header.Offset >= header.FileSize) continue;
+            dynSection.SyscallContinuations.push_back(header.MappedAddress + (patch.Offset - header.Offset) + patch.Bytes.size());
+            break;
+        }
+    }
     patches.insert(patches.end(), std::make_move_iterator(syscallPatches.begin()), std::make_move_iterator(syscallPatches.end()));
     progress.Report({Domain::ProgressStage::Imports, {}, 1, 1});
     return RelinkResult{std::move(entries), std::move(programHeaders), std::move(dynSection), gotVAddr, std::move(patches)};

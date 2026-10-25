@@ -41,17 +41,17 @@ public:
 
 }
 
-std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges) const {
-    return collect(bytes, headers, progress, entryRoots, message, tailReachableRanges, false);
+std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, const std::vector<Domain::VirtualAddress>& extraEntries) const {
+    return collect(bytes, headers, progress, entryRoots, message, tailReachableRanges, false, extraEntries);
 }
 
 std::vector<Domain::CodeRange> CodeInstructionCollector::CollectTailReachableRanges(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
     std::vector<Domain::CodeRange> ranges;
-    collect(bytes, headers, progress, nullptr, {}, &ranges, true);
+    collect(bytes, headers, progress, nullptr, {}, &ranges, true, {});
     return ranges;
 }
 
-std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, bool allowIdenticalDynamicTags) const {
+std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, bool allowIdenticalDynamicTags, const std::vector<Domain::VirtualAddress>& extraEntries) const {
     std::uint64_t lastProgress = 0;
     const auto report = [&](std::uint64_t completed) {
         if (completed <= lastProgress) return;
@@ -162,10 +162,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
     std::map<std::uint64_t, std::uint64_t> tables;
     const auto inTable = [&](std::uint64_t address) { const auto after = tables.upper_bound(address); return after != tables.begin() && address < std::prev(after)->second; };
     const auto addRoot = [&](std::uint64_t address) { if (isCode(address) && !inTable(address)) roots.insert(address); };
-    const auto addStrongRoot = [&](std::uint64_t address) {
+    const auto addStrongRoot = [&](std::uint64_t address, bool authoritative = true) {
         if (!isCode(address)) return;
         if (inTable(address)) throw Domain::RelinkerException("Code analysis: code entry point lies inside a data table", address);
-        if (inTail(address)) flowRoots.insert(address);
+        if (!tailHeaders.empty() && (authoritative || inTail(address))) flowRoots.insert(address);
         strongRoots.insert(address);
         roots.insert(address);
     };
@@ -363,7 +363,11 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
             } else if (type == 1 || type == 6 || type == 7) {
                 if (index != 0 && index >= symbolCount) throw Domain::RelinkerException("Code analysis: invalid relocation symbol", slot);
                 const auto symbol = symbols + index * 24;
-                if (index == 0 || Io::ReadU16(bytes, symbol + 6) == 0) importSlots.insert(slot);
+                const bool nullSymbol = index == 0 || (index < symbolCount && std::all_of(bytes.begin() + symbol, bytes.begin() + symbol + 24, [](const std::uint8_t byte) { return byte == 0; }));
+                if (nullSymbol) {
+                    if (!pointers.Values.emplace(slot, addend).second) throw Domain::RelinkerException("Code analysis: duplicate pointer relocation", slot);
+                    addPointerRoot(addend);
+                } else if (Io::ReadU16(bytes, symbol + 6) == 0) importSlots.insert(slot);
                 else {
                     const auto target = Io::ReadU64(bytes, symbol + 8) + addend;
                     const auto [recorded, inserted] = pointers.Values.emplace(slot, target);
@@ -376,9 +380,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
     readRelocations(relaOffset, relaSize, false);
     readRelocations(pltOffset, pltSize, true);
     const auto addFlowRoot = [&](std::uint64_t address, bool authoritative) {
-        addStrongRoot(address);
+        addStrongRoot(address, false);
         if (authoritative && isCode(address)) flowRoots.insert(address);
     };
+    for (const auto entry : extraEntries) addFlowRoot(entry, true);
     const auto addTransferRoot = [&](std::uint64_t address, const Codegen::DecodedInstructionInfo& info, bool authoritative) {
         if (info.HasBranchTarget && !info.HasRipRelativeDisp) {
             addFlowRoot(address + info.Length + static_cast<std::uint64_t>(info.BranchDisp), authoritative);
@@ -636,7 +641,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
             previousEnd = address + decoder.DecodeInstruction(bytes.data() + header->Offset + offset, header->FileSize - offset).Length;
             const auto reference = dataTargets.upper_bound(address);
             if ((inTail(address) || decodedInstructions[1].contains(address)) && reference != dataTargets.end() && *reference < previousEnd)
-                throw Domain::RelinkerException("Code analysis: reference enters a trailing instruction", *reference);
+                throw Domain::RelinkerException("Code analysis: reference enters an analyzed instruction", *reference);
         }
     }
     std::vector<Domain::CodeRange> tailRanges;
