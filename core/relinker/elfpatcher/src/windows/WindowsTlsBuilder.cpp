@@ -1,4 +1,5 @@
 #include <elfpatcher/windows/WindowsTlsBuilder.hpp>
+#include <elfpatcher/windows/WindowsGuestGs.hpp>
 #include <elfpatcher/general/ElfConstants.hpp>
 #include <elfpatcher/windows/WindowsStubEmitter.hpp>
 #include <elfpatcher/windows/WindowsTlsTemplateBuilder.hpp>
@@ -97,15 +98,17 @@ void patchAccess(std::vector<PeSection>& sections, const TlsAccess& access, cons
     throw Domain::RelinkerException("TLS instruction is outside the PE image", access.Rva);
 }
 
-void trapInstruction(std::vector<PeSection>& sections, const std::uint32_t rva, const std::size_t length) {
+void patchGsJump(std::vector<PeSection>& sections, const std::uint32_t rva, const std::size_t length, const std::uint32_t target) {
     for (auto& section : sections) {
         if (rva < section.Rva || rva - section.Rva >= section.Data.size())
             continue;
         const auto offset = rva - section.Rva;
         if (length > section.Data.size() - offset)
             throw Domain::RelinkerException("Guest GS instruction crosses a PE section boundary", rva);
-        std::fill_n(section.Data.begin() + offset, length, 0x90);
-        std::copy(std::begin(kStubOpUd2), std::end(kStubOpUd2), section.Data.begin() + offset);
+        WindowsStubEmitter jump(rva);
+        jump.Rip({0xe9}, target);
+        const auto bytes = jump.TakeBytes();
+        std::copy(bytes.begin(), bytes.end(), section.Data.begin() + offset);
         return;
     }
     throw Domain::RelinkerException("Guest GS instruction is outside the PE image", rva);
@@ -120,6 +123,7 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
 
     std::vector<TlsAccess> accesses;
     std::vector<GsTrap> gsTraps;
+    PeSection gsSection{".ggs", nextRva, SectionRead | SectionExecute | 0x40u, {}};
     std::vector<std::uint32_t> branchTargets;
     std::set<Domain::VirtualAddress> entryRoots;
     const auto instructions = Relinker::CodeInstructionCollector().Collect(source, headers, [&](auto completed, auto total) { report(7000 * completed / total); }, &entryRoots, message);
@@ -155,10 +159,18 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
                     branchTargets.push_back(static_cast<std::uint32_t>(target));
             }
 
+            const bool gsSelector = info.HasModRm && info.ModRmRegField == 5 && !info.IsTwoByteOpcode && (info.Opcode == 0x8c || info.Opcode == 0x8e);
+            const bool gsStack = info.IsTwoByteOpcode && (info.Opcode == 0xa8 || info.Opcode == 0xa9);
+            const bool gsBaseRegister = info.IsTwoByteOpcode && info.Opcode == 0xae && info.HasModRm && (info.ModRmByte >> 6) == 3 &&
+                (info.ModRmRegField == 1 || info.ModRmRegField == 3) && std::find(bytes, bytes + info.OpcodeOffset, 0xf3) != bytes + info.OpcodeOffset;
+            if (gsSelector || gsStack || gsBaseRegister)
+                throw Domain::RelinkerException("Unsupported Windows guest GS state instruction", header.Offset + offset);
             if (info.SegmentPrefix == 0x65 && !insidePrevious) {
                 if (info.HasMemoryOperand) {
+                    image.RequireNoRelocation(*instruction, info.Length);
                     const auto entry = entryRoots.upper_bound(*instruction);
-                    gsTraps.push_back({rva, info.Length, entry != entryRoots.end() && *entry - *instruction < info.Length ? std::optional<Domain::FileByteOffset>(header.Offset + *entry - header.MappedAddress) : std::nullopt});
+                    WindowsGuestGs::Append(gsSection, rva, bytes, info);
+                    gsTraps.push_back({rva, info.Length, entry != entryRoots.end() && *entry - *instruction < kJumpSize ? std::optional<Domain::FileByteOffset>(header.Offset + *entry - header.MappedAddress) : std::nullopt});
                 }
                 continue;
             }
@@ -231,13 +243,19 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
     report(9000);
     std::sort(branchTargets.begin(), branchTargets.end());
     branchTargets.erase(std::unique(branchTargets.begin(), branchTargets.end()), branchTargets.end());
+    std::size_t gsIndex = 0;
     for (const auto& [rva, length, entry] : gsTraps) {
         const auto target = std::upper_bound(branchTargets.begin(), branchTargets.end(), rva);
-        if (target != branchTargets.end() && *target < rva + length)
+        if (target != branchTargets.end() && *target < rva + 5)
             throw Domain::RelinkerException("Branch enters a guest GS instruction", *target);
         if (entry)
             throw Domain::RelinkerException("GS trap would overwrite an executable entry point", *entry);
-        trapInstruction(sections, rva, length);
+        patchGsJump(sections, rva, length, CheckedRva(static_cast<std::uint64_t>(gsSection.Rva) + 16 + gsIndex * 64 + 24));
+        ++gsIndex;
+    }
+    if (!gsSection.Data.empty()) {
+        nextRva = AlignRva(static_cast<std::uint64_t>(nextRva) + gsSection.Data.size());
+        sections.push_back(std::move(gsSection));
     }
     if (tls == nullptr) {
         if (!accesses.empty())

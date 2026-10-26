@@ -9,7 +9,7 @@ from test_windows_tls_protected_entries import make_image, pe_bytes_at
 
 
 GS_LOAD_AND_RETURN = bytes.fromhex("65 48 8b 04 25 28 00 00 00 c3")
-TRAPPED = bytes.fromhex("0f 0b 90 90 90 90 90 90 90 c3")
+
 
 
 def gs_image(root):
@@ -41,7 +41,8 @@ def main():
         for name in ("safe", "access-start"):
             result, output = convert(name)
             assert result.returncode == 0 and output.exists(), (name, result.returncode, result.stderr)
-            assert pe_bytes_at(output.read_bytes(), 0x10210, len(TRAPPED)) == TRAPPED, name
+            patched = pe_bytes_at(output.read_bytes(), 0x10210, len(GS_LOAD_AND_RETURN))
+            assert patched[0] == 0xe9 and patched[5:] == GS_LOAD_AND_RETURN[5:], name
 
     print("Windows GS trap entry-point tests passed")
 

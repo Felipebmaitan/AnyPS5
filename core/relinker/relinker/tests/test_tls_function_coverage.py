@@ -788,10 +788,14 @@ def main():
                 source.write_bytes(make_image("register", "unwind", body=instruction + b"\xc3"))
                 result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
                                         capture_output=True, text=True, timeout=30)
+                if trapped and (args.group == "gs_traps_implicit" or len(instruction) < 5):
+                    assert result.returncode == 2 and "Unsupported Windows guest GS instruction" in result.stderr and not output.exists(), (name, result)
+                    continue
                 assert result.returncode == 0, (name, result.stdout, result.stderr)
                 patched = pe_bytes_at(output.read_bytes(), 0x11240, len(instruction) + 1)
                 if trapped:
-                    expected = b"\x0f\x0b" + b"\x90" * (len(instruction) - 2) + b"\xc3"
+                    expected = patched[:5] + instruction[5:] + b"\xc3"
+                    assert patched[0] == 0xe9, (name, patched.hex())
                 else:
                     expected = instruction + b"\xc3"
                 assert patched == expected, (name, patched.hex())
@@ -817,7 +821,7 @@ def main():
                                     capture_output=True, text=True, timeout=30)
             assert result.returncode == 0, ("gs-without-pt-tls", result.stdout, result.stderr)
             patched = pe_bytes_at(output.read_bytes(), 0x11240, len(instruction) + 1)
-            assert patched == b"\x0f\x0b" + b"\x90" * (len(instruction) - 2) + b"\xc3", ("gs-without-pt-tls", patched.hex())
+            assert patched[0] == 0xe9 and patched[5:] == instruction[5:] + b"\xc3", ("gs-without-pt-tls", patched.hex())
         if args.group in ("all", "gs_non_memory"):
             check_gs_traps([
                 ("gs-lea", bytes.fromhex("65 8d 05 11 11 11 11"), False),
