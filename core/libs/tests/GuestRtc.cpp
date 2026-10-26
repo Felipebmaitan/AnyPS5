@@ -762,10 +762,11 @@ int main(int argc, char** argv) {
 
     RtcTick now{};
     Require(sceRtcGetCurrentTick(&now) == 0 && now.tick > leapDayTick);
+    const RtcTick fixed{leapDayTick};
     RtcTick local{};
     RtcTick back{};
-    Require(sceRtcConvertUtcToLocalTime(&now, &local) == 0);
-    Require(sceRtcConvertLocalTimeToUtc(&local, &back) == 0 && back.tick == now.tick);
+    Require(sceRtcConvertUtcToLocalTime(&fixed, &local) == 0);
+    Require(sceRtcConvertLocalTimeToUtc(&local, &back) == 0 && back.tick == fixed.tick);
 
     char rfc2822[32];
     tick.tick = leapDayTick;
