@@ -6826,7 +6826,7 @@ void verifyUnnormalizedSamplers() {
     require(proven(plain, false), "unnormalized samplers: a normalized S# was flagged");
     require(plain.variantId == accepted.variantId && plain.spirv == accepted.spirv, "unnormalized samplers: the unnormalized S# compiled another variant");
 
-    for (const std::uint32_t mimg : {0xf0900f08u, 0xf0800f08u, 0xf0940f08u, 0xf0840f08u, 0xf0880f08u}) {
+    for (const std::uint32_t mimg : {0xf0900f08u, 0xf0800f08u, 0xf0940f08u, 0xf0840f08u, 0xf0880f08u, 0xf0980f08u}) {
         const auto address = nextAddress += 0x1000u;
         const auto result = recompile(program(mimg), userData(unnormalized), address);
         require(proven(result, true), "unnormalized samplers: a compute image_sample_l, image_sample, image_sample_b, image_sample_cl or image_sample_d was not flagged");
@@ -6834,6 +6834,12 @@ void verifyUnnormalizedSamplers() {
         if (mimg == 0xf0900f08u || mimg == 0xf0880f08u) continue;
         const auto normalizedResult = recompile(program(mimg), userData(normalized), address);
         require(proven(normalizedResult, false) && normalizedResult.variantId == result.variantId && normalizedResult.PipelineVariantId() != result.PipelineVariantId(), "unnormalized samplers: a normalized compute sample did not get its own specialization of the shared artifact");
+        if (mimg == 0xf0980f08u) {
+            require(sampleMasks(normalizedResult.spirv.Words()) == std::vector<std::uint32_t>{spv::ImageOperandsGradMask | spv::ImageOperandsMinLodMask}, "unnormalized samplers: a normalized zero-bias clamp lost its minimum-LOD gradients");
+            const auto implicitMasks = sampleMasks(normalizedResult.spirv.Words(), spv::OpImageSampleImplicitLod);
+            require(implicitMasks.empty() || implicitMasks == std::vector<std::uint32_t>{spv::ImageOperandsBiasMask | spv::ImageOperandsMinLodMask}, "unnormalized samplers: a normalized biased clamp lost its bias or minimum LOD");
+            continue;
+        }
         const bool clamp = mimg == 0xf0840f08u;
         const auto opcode = clamp ? spv::OpImageSampleExplicitLod : spv::OpImageSampleImplicitLod;
         const auto mask = mimg == 0xf0940f08u ? spv::ImageOperandsBiasMask : clamp ? spv::ImageOperandsGradMask | spv::ImageOperandsMinLodMask : spv::ImageOperandsMaskNone;

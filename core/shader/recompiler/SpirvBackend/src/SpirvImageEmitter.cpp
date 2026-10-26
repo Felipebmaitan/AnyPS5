@@ -1570,9 +1570,10 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     std::uint32_t operandMask = 0;
     std::vector<std::uint32_t> operands;
-    const bool computeImplicitClamp = state.program.Resources().stage == IrShaderStage::Compute && !explicitLod && setup.layout.clamp != NoImageComponent && setup.layout.bias == NoImageComponent;
+    const bool computeImplicitClamp = state.program.Resources().stage == IrShaderStage::Compute && !explicitLod && setup.layout.clamp != NoImageComponent;
+    std::uint32_t clampGradX = 0;
+    std::uint32_t clampGradY = 0;
     if (computeImplicitClamp) {
-        opcode = setup.dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
         const auto count = setup.dimensionInfo.spatialComponents;
         const auto type = count == 1u ? TypeF32(state) : TypeF32Vector(state, count);
         auto coord = setup.coord;
@@ -1586,9 +1587,14 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
                 state.module.AddFunction(words);
             }
         }
+        clampGradX = Unary(state, spv::OpDPdx, type, coord);
+        clampGradY = Unary(state, spv::OpDPdy, type, coord);
+    }
+    if (computeImplicitClamp && setup.layout.bias == NoImageComponent) {
+        opcode = setup.dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
         operandMask |= spv::ImageOperandsGradMask;
-        operands.push_back(Unary(state, spv::OpDPdx, type, coord));
-        operands.push_back(Unary(state, spv::OpDPdy, type, coord));
+        operands.push_back(clampGradX);
+        operands.push_back(clampGradY);
     } else if (HasFlag(mem, RdnaImageSampleFlagDerivative)) {
         operandMask |= spv::ImageOperandsGradMask;
         operands.push_back(CoordF32(ctx, access, setup.layout.gradX, setup.dimensionInfo.spatialComponents, AddressDimension(access).spatialComponents, true));
@@ -1655,16 +1661,31 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     const auto emitSample = [&](std::uint32_t coord, std::uint32_t mask, const std::vector<std::uint32_t>& arguments, std::uint32_t sampleOpcode) {
         const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler);
-        const auto sample = state.module.AllocateId();
-        std::vector<std::uint32_t> words = {sampleOpcode, resultType, sample, sampled, coord};
-        if (setup.dref) {
-            words.push_back(drefValue);
+        const auto emit = [&](std::uint32_t op, std::uint32_t operandsMask, const std::vector<std::uint32_t>& operands) {
+            const auto value = state.module.AllocateId();
+            std::vector<std::uint32_t> words{op, resultType, value, sampled, coord};
+            if (setup.dref) words.push_back(drefValue);
+            if (operandsMask != 0u) {
+                words.push_back(operandsMask);
+                words.insert(words.end(), operands.begin(), operands.end());
+            }
+            state.module.AddFunction(words);
+            return value;
+        };
+        const auto sample = emit(sampleOpcode, mask, arguments);
+        if (computeImplicitClamp && (mask & spv::ImageOperandsBiasMask) != 0u) {
+            std::vector<std::uint32_t> zeroBiasOperands{clampGradX, clampGradY};
+            zeroBiasOperands.insert(zeroBiasOperands.end(), arguments.begin() + 1, arguments.end());
+            const auto zeroBiasMask = (mask & ~spv::ImageOperandsBiasMask) | spv::ImageOperandsGradMask;
+            const auto zeroBiasSample = emit(setup.dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod, zeroBiasMask, zeroBiasOperands);
+            const auto zeroBias = Binary(state, spv::OpFOrdEqual, TypeBool(state), arguments.front(), ZeroF32(state));
+            auto condition = zeroBias;
+            if (!setup.dref) {
+                condition = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4u), condition, zeroBias, zeroBias, zeroBias, zeroBias);
+            }
+            return Select(state, resultType, condition, zeroBiasSample, sample);
         }
-        if (mask != 0u) {
-            words.push_back(mask);
-            words.insert(words.end(), arguments.begin(), arguments.end());
-        }
-        state.module.AddFunction(words);
         return sample;
     };
     std::uint32_t sample = 0;
