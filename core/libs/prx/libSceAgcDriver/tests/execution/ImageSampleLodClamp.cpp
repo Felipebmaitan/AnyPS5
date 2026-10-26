@@ -50,6 +50,20 @@ alignas(256) constexpr auto ExplicitGradientCode = [] {
     return code;
 }();
 
+alignas(256) constexpr auto ZeroBiasCode = [] {
+    static_assert(Code[26] == 0xf0840f08u && Code[27] == 0x00610c09u);
+    std::array<std::uint32_t, Code.size() + 4u> code{};
+    std::copy_n(Code.begin(), 26u, code.begin());
+    code[26] = 0x7e200280u;
+    code[27] = 0x7e220309u;
+    code[28] = 0x7e24030au;
+    code[29] = 0x7e26030bu;
+    std::copy(Code.begin() + 26u, Code.end(), code.begin() + 30u);
+    code[30] = 0xf0980f08u;
+    code[31] = 0x00610c10u;
+    return code;
+}();
+
 struct Sample {
     std::uint32_t level;
     std::uint32_t gradient;
@@ -187,8 +201,10 @@ void Check(bool implicit, bool affine) {
 
 int main(int argc, char** argv) {
     try {
-        const bool affine = argc == 2 && std::string(argv[1]) == "--implicit-affine-quads";
-        Require(argc == 1 || affine, "image sample LOD clamp: unexpected argument");
+        const std::string argument = argc == 2 ? argv[1] : "";
+        const bool zeroBias = argument == "--implicit-zero-bias" || argument == "--implicit-affine-zero-bias";
+        const bool affine = argument == "--implicit-affine-quads" || argument == "--implicit-affine-zero-bias";
+        Require(argc == 1 || (argc == 2 && (affine || zeroBias)), "image sample LOD clamp: unexpected argument");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!TargetHasCapability(device->Target(), spv::CapabilityMinLod)) {
@@ -197,7 +213,7 @@ int main(int argc, char** argv) {
         }
         FillInput(affine);
         FillTexture();
-        const bool implicit = Run(*device, Code);
+        const bool implicit = Run(*device, zeroBias ? std::span<const std::uint32_t>(ZeroBiasCode) : std::span<const std::uint32_t>(Code));
         if (!implicit) {
             Require(Run(*device, ExplicitGradientCode), "image sample explicit-gradient LOD clamp unexpectedly requires compute derivatives");
         }
