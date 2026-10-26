@@ -1912,7 +1912,7 @@ private:
         return static_cast<std::uint32_t>(m_info.images.size() - 1);
     }
 
-    void Merge(ImageResource& image, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {
+    static void Merge(ImageResource& image, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {
         const auto access = ImageOpcodeInfoOf(op).access;
         const bool atomic = access == ImageAccess::Atomic;
         const bool write = access == ImageAccess::Write || atomic;
@@ -1948,9 +1948,6 @@ private:
         image.flatLineCompatible = image.flatLineCompatible && flatLineAccess && !memory.imagePacked && memory.imageByElements == 0u;
         image.flatVolumeLineCompatible = image.flatVolumeLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
         image.dimensionQueryOnly = image.dimensionQueryOnly && op == IrOpcode::ImageQueryDimensions;
-        if (m_program.Resources().stage == IrShaderStage::Compute && op == IrOpcode::ImageSampleRaw && !ImageSampleExplicitLod(memory.imageSampleFlags, IrShaderStage::Compute)) {
-            image.emulatedCompare |= image.depthCompare ? EmulatedCompare::Unsupported : EmulatedCompare::ConvertedSampleUnsupported;
-        }
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;
