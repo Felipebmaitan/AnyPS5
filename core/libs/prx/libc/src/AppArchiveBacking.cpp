@@ -18,6 +18,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #endif
 
 namespace {
@@ -38,6 +41,9 @@ public:
             const auto error = GetLastError();
             if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) Fail(error);
         }
+#elif defined(__linux__)
+        writer = memfd_create("app0.zar backing", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (writer < 0) Fail(errno);
 #else
         std::error_code directoryError;
         const auto directory = std::filesystem::temp_directory_path(directoryError);
@@ -105,7 +111,13 @@ public:
         }
         return descriptor;
 #else
-        const int reader = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#ifdef __linux__
+        if (fcntl(writer, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) Fail(errno);
+        const auto readerPath = std::filesystem::path("/proc/self/fd") / std::to_string(writer);
+#else
+        const auto& readerPath = path;
+#endif
+        const int reader = open(readerPath.c_str(), O_RDONLY | O_CLOEXEC);
         if (reader < 0) Fail(errno);
         struct stat first{};
         struct stat second{};
@@ -115,12 +127,14 @@ public:
             close(reader);
             Fail(error);
         }
+#ifndef __linux__
         if (unlink(path.c_str()) != 0) {
             const int error = errno;
             close(reader);
             Fail(error);
         }
         path.clear();
+#endif
         return reader;
 #endif
     }

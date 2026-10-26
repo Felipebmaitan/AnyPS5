@@ -6,6 +6,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/AppArchive.hpp"
+#include "prx/libc/include/HostErrno.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
@@ -71,7 +72,7 @@ public:
 #if defined(__linux__) || defined(__APPLE__)
 class ScopedDescriptor {
 public:
-    explicit ScopedDescriptor(int value) noexcept : descriptor(fcntl(value, F_DUPFD_CLOEXEC, 0)), error(descriptor < 0 ? errno : 0) {}
+    explicit ScopedDescriptor(int value, bool duplicate) noexcept : descriptor(duplicate ? fcntl(value, F_DUPFD_CLOEXEC, 0) : value), error(descriptor < 0 ? errno : 0) {}
     ~ScopedDescriptor() {
         const int savedError = errno;
         if (descriptor >= 0) close(descriptor);
@@ -216,6 +217,18 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     } catch (const std::system_error& error) {
         if (error.code() == std::errc::not_enough_memory) return failed(GuestNoMemory);
         if (error.code() == std::errc::permission_denied) return failed(GuestAccess);
+        const auto condition = error.code().default_error_condition();
+        if (condition.category() == std::generic_category()) {
+            switch (condition.value()) {
+            case EMFILE:
+            case ENFILE:
+            case ENOSPC:
+            case EFBIG:
+            case EINTR:
+                return failed(GuestErrnoFromHost_nid_no_patch(condition.value()));
+            default: break;
+            }
+        }
         return failed(GuestIoError);
     } catch (const std::bad_alloc&) {
         return failed(GuestNoMemory);
@@ -224,7 +237,9 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     }
     const int sourceDescriptor = archive.descriptor >= 0 ? archive.descriptor : descriptor;
 #if defined(__linux__) || defined(__APPLE__)
-    const ScopedDescriptor pinnedDescriptor(sourceDescriptor);
+    const bool archiveBacked = archive.descriptor >= 0;
+    const ScopedDescriptor pinnedDescriptor(sourceDescriptor, !archiveBacked);
+    if (archiveBacked) archive.descriptor = -1;
     if (pinnedDescriptor.Get() < 0) return failed(pinnedDescriptor.Error());
     const int mappingDescriptor = pinnedDescriptor.Get();
     const int descriptorFlags = fcntl(mappingDescriptor, F_GETFL);

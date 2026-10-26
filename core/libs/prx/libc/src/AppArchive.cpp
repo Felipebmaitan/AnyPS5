@@ -14,13 +14,6 @@
 #include <string_view>
 #include <system_error>
 
-#include <fcntl.h>
-#ifdef _WIN32
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
-
 namespace {
 
 struct Archive {
@@ -83,16 +76,6 @@ struct OpenFile {
     AppArchiveNode node;
     std::uint64_t position = 0;
     std::mutex mutex;
-    int backing = -1;
-
-    ~OpenFile() {
-        if (backing < 0) return;
-#ifdef _WIN32
-        _close(backing);
-#else
-        close(backing);
-#endif
-    }
 };
 
 std::mutex g_descriptorMutex;
@@ -256,13 +239,7 @@ bool AppArchiveMappingDescriptor_nid_no_patch(int descriptor, int* backing) {
     if (!file) return false;
     if (backing == nullptr) throw std::invalid_argument("AppArchiveMappingDescriptor: null output");
     std::lock_guard lock(file->mutex);
-    if (file->backing < 0) file->backing = AppArchiveMaterialize_nid_no_patch(file->node);
-#ifdef _WIN32
-    *backing = _dup(file->backing);
-#else
-    *backing = fcntl(file->backing, F_DUPFD_CLOEXEC, 0);
-#endif
-    if (*backing < 0) throw std::system_error(errno, std::generic_category(), "pin app0.zar mapping backing");
+    *backing = AppArchiveMaterialize_nid_no_patch(file->node);
     return true;
 }
 

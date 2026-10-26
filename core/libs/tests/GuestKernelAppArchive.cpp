@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <barrier>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,7 +39,9 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include <csignal>
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -708,6 +711,68 @@ std::size_t MappingHandleCount() {
 #endif
 }
 
+#if defined(__linux__)
+class MappingDescriptorLimit {
+public:
+    MappingDescriptorLimit() {
+        Check(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+        Check(saved.rlim_cur >= 1 && fcntl(STDIN_FILENO, F_GETFD) >= 0);
+        auto limit = saved;
+        limit.rlim_cur = 1;
+        Check(setrlimit(RLIMIT_NOFILE, &limit) == 0);
+    }
+    ~MappingDescriptorLimit() {
+        Check(setrlimit(RLIMIT_NOFILE, &saved) == 0);
+    }
+private:
+    rlimit saved{};
+};
+
+void MappingStorageIndependence(const std::filesystem::path& root) {
+    const auto verify = [] {
+        const auto name = std::to_string(BigSize) + ".bin";
+        for (const int kind : {1, 2}) {
+            for (const bool upgrade : {false, true}) {
+                const int archive = sceKernelOpen(("/app0/Mapped/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+                const int plain = sceKernelOpen(("/app0/Reference/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+                Check(archive >= 0 && plain >= 0);
+                const auto reference = TryMapping(plain, MapPage, upgrade ? 1 : 5, kind, 0);
+                Check(reference.address != MapFailed);
+                const auto mapping = TryMapping(archive, MapPage, upgrade ? 1 : 5, kind, 0);
+                Check(mapping.address != MapFailed);
+                if (upgrade) {
+                    Check(mprotect_nid_postfix(reference.address, MapPage, 5) == 0);
+                    Check(mprotect_nid_postfix(mapping.address, MapPage, 5) == 0);
+                }
+                Check(std::memcmp(mapping.address, reference.address, MapPage) == 0);
+                Check(sceKernelClose(archive) == 0 && sceKernelClose(plain) == 0);
+                Check(munmap_nid_postfix(mapping.address, MapPage) == 0 && munmap_nid_postfix(reference.address, MapPage) == 0);
+            }
+        }
+    };
+    {
+        MappingTemporaryDirectory temporary(root / "missing-backing-directory");
+        verify();
+    }
+    for (const auto* candidate : {"/dev/shm", "/run/lock"}) {
+        struct statvfs status{};
+        if (statvfs(candidate, &status) != 0 || (status.f_flag & ST_NOEXEC) == 0) continue;
+        const auto directory = std::filesystem::path(candidate) /
+            ("anyps5-archive-map-storage-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::error_code error;
+        if (!std::filesystem::create_directory(directory, error)) continue;
+        {
+            MappingTemporaryDirectory temporary(directory);
+            verify();
+        }
+        Check(std::filesystem::is_empty(directory) && std::filesystem::remove(directory));
+        std::puts("archive executable mappings passed with noexec temporary storage");
+        return;
+    }
+    std::puts("no writable noexec temporary filesystem available; missing-directory backing independence passed");
+}
+#endif
+
 void MappingFailures(const std::filesystem::path& root, bool damaged) {
     MappingFixture(root);
     if (damaged) {
@@ -720,13 +785,33 @@ void MappingFailures(const std::filesystem::path& root, bool damaged) {
     MappingTemporaryDirectory temporary(damaged ? directory : root / "missing");
     const int fd = sceKernelOpen(("/app0/Mapped/" + std::to_string(BigSize) + ".bin").c_str(), SCE_KERNEL_O_RDONLY, 0);
     Check(fd >= 0 && sceKernelLseek(fd, 27, 0) == 27);
-    const auto initialFailure = TryMapping(fd, MapPage, 1, 2, 0);
-    Check(initialFailure.address == MapFailed && initialFailure.error == 5);
+#if defined(__linux__)
+    const int reference = damaged ? -1 : sceKernelOpen(("/app0/Reference/" + std::to_string(BigSize) + ".bin").c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(damaged || reference >= 0);
+#endif
+    const auto failedMapping = [&] {
+#if defined(__linux__)
+        if (!damaged) {
+            MappingDescriptorLimit limit;
+            const auto actual = TryMapping(fd, MapPage, 1, 2, 0);
+            const auto expected = TryMapping(reference, MapPage, 1, 2, 0);
+            Check(actual.address == expected.address && actual.error == expected.error);
+            return actual;
+        }
+#endif
+        return TryMapping(fd, MapPage, 1, 2, 0);
+    };
+    int expectedError = 5;
+#if defined(__linux__)
+    if (!damaged) expectedError = 24;
+#endif
+    const auto initialFailure = failedMapping();
+    Check(initialFailure.address == MapFailed && initialFailure.error == expectedError);
     Check(std::filesystem::is_empty(directory));
     const auto before = MappingHandleCount();
     for (int iteration = 0; iteration < 8; ++iteration) {
-        const auto result = TryMapping(fd, MapPage, 1, 2, 0);
-        Check(result.address == MapFailed && result.error == 5);
+        const auto result = failedMapping();
+        Check(result.address == MapFailed && result.error == expectedError);
         Check(std::filesystem::is_empty(directory));
     }
     Check(MappingHandleCount() == before);
@@ -742,6 +827,35 @@ void MappingFailures(const std::filesystem::path& root, bool damaged) {
         Check(sceKernelClose(fd) == 0);
     }
     Check(std::filesystem::is_empty(directory));
+#if defined(__linux__)
+    if (reference >= 0) Check(sceKernelClose(reference) == 0);
+#endif
+}
+
+void MappingDescriptorReplacement() {
+    const auto path = "/app0/Mapped/" + std::to_string(BigSize) + ".bin";
+    const int archive = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDONLY, 0);
+    const int foreign = sceKernelOpen("/app0/Override.bin", SCE_KERNEL_O_RDONLY, 0);
+    Check(archive >= 0 && foreign >= 0);
+    const int first = dup_nid_postfix(foreign);
+    const int second = dup_nid_postfix(foreign);
+    Check(first >= 0 && second >= 0);
+    Check(sceKernelClose(first) == 0 && sceKernelClose(second) == 0);
+    const auto initial = TryMapping(archive, MapPage, 1, 2, 0);
+    Check(initial.address != MapFailed && static_cast<char*>(initial.address)[0] == 0);
+    Check(dup2_nid_postfix(foreign, first) == first && dup2_nid_postfix(foreign, second) == second);
+    const auto later = TryMapping(archive, MapPage, 1, 2, 0);
+    Check(later.address != MapFailed && static_cast<char*>(later.address)[0] == 0);
+    const auto expected = AppArchiveFixture::Pattern(MapPage);
+    Check(std::memcmp(initial.address, expected.data(), MapPage) == 0 && std::memcmp(later.address, expected.data(), MapPage) == 0);
+    Check(sceKernelClose(archive) == 0);
+    for (const int descriptor : {first, second}) {
+        char buffer[5]{};
+        Check(sceKernelPread(descriptor, buffer, sizeof(buffer), 0) == 5 && std::memcmp(buffer, "loose", 5) == 0);
+        Check(sceKernelClose(descriptor) == 0);
+    }
+    Check(sceKernelClose(foreign) == 0);
+    Check(munmap_nid_postfix(initial.address, MapPage) == 0 && munmap_nid_postfix(later.address, MapPage) == 0);
 }
 
 void MappingPlacement(const char* path) {
@@ -845,6 +959,10 @@ void MappingConcurrent() {
 
 void Mappings(const std::filesystem::path& root) {
     MappingFixture(root);
+#if defined(__linux__)
+    MappingStorageIndependence(root);
+#endif
+    MappingDescriptorReplacement();
     MappingConcurrent();
     MappingRanges();
     MappingProtections();
