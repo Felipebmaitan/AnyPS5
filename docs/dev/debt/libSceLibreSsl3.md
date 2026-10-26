@@ -2,7 +2,7 @@
 
 ### Functional
 
-- [ERR_load_crypto_strings and ERR_peek_last_error](../../../core/libs/prx/libSceLibreSsl3/Export.cpp) share libSceLibreSsl's string registry and calling-thread queue. This relationship and PS5 equivalence are unverified; the public contracts follow LibreSSL 3.4.1 at OpenBSD commit `078b3d1df8ca2011c1605cd40418c58fa0f5b143`. `ERR_print_errors_cb` remains throwing: the public callback contract is known, but PS5 thread identifiers and diagnostic metadata have not been established.
+- [ERR_load_crypto_strings and ERR_peek_last_error](../../../core/libs/prx/libSceLibreSsl3/Export.cpp) have no console execution verification. [Firmware 13.42 modules run on a PC](https://github.com/boykopovar/AnyPS5/pull/9535#issuecomment-6407060914) retained numeric-only output after loaders and matched queue order/overflow; whether the two firmware modules share a queue was not tested. This implementation reads libSceLibreSsl's calling-thread queue. `ERR_print_errors_cb` remains throwing because guest thread identifiers and diagnostic metadata are unverified.
 
 ### Unknown function info
 
@@ -11,4 +11,4 @@
 ### Functional
 
 - [CRYPTO_memcmp](../../../core/libs/prx/libSceLibreSsl3/Export.cpp) follows the public [LibreSSL signature and equality contract](https://man.openbsd.org/CRYPTO_memcmp.3), without PS5 verification. The exact nonzero result for unequal buffers is unspecified by that contract. Content-independent execution of its volatile byte reads still depends on the compiler; inspect optimized code when changing toolchains. Closes when: measured on a PS5 and the supported toolchains' generated code is checked.
-- [MD5 and SHA1](../../../core/libs/prx/libSceLibreSsl3/src/Digest.cpp) (libSceLibreSsl3) - follow LibreSSL's [md5.c, sha1.c](https://github.com/libressl/openbsd/tree/bc9483725c5815efb64b6d9acc52fc5fba139212/src/lib/libcrypto) and hash through libSceLibreSsl's `MD5_*` and `SHA1_*`. A null digest buffer throws: LibreSSL up to 3.8 returns a static buffer, later versions do not check it. Nothing is checked on the console
+- [MD5 and SHA1](../../../core/libs/prx/libSceLibreSsl3/src/Digest.cpp) (libSceLibreSsl3) - follow LibreSSL's [md5.c, sha1.c](https://github.com/libressl/openbsd/tree/bc9483725c5815efb64b6d9acc52fc5fba139212/src/lib/libcrypto) and hash through libSceLibreSsl's `MD5_*` and `SHA1_*`. A null digest buffer, which LibreSSL 4.0.0 does not check, throws. Nothing is checked on the console
