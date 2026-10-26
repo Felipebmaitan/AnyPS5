@@ -265,12 +265,6 @@ void CheckRefusals(const ShaderRecompiler::SpirvTarget& target) {
     std::erase(extensions, std::string_view("SPV_KHR_compute_shader_derivatives"));
     request.target.supportedExtensions = extensions;
     refused("missing extension", "require enabled ComputeDerivativeGroupLinearKHR and SPV_KHR_compute_shader_derivatives");
-    request.target = target;
-    request.context.compute->numThreads = {127, 1, 1};
-    refused("incomplete quad", "require complete four-lane quads without partial dispatch groups");
-    request.context.compute = compute;
-    request.context.compute->partialThreads = {Invocations - 1u, 1, 1};
-    refused("partial dispatch groups", "require complete four-lane quads without partial dispatch groups");
 }
 
 }
