@@ -50,19 +50,24 @@ alignas(256) constexpr auto ExplicitGradientCode = [] {
     return code;
 }();
 
-alignas(256) constexpr auto ZeroBiasCode = [] {
+constexpr auto BiasCode(std::uint32_t bias) {
     static_assert(Code[26] == 0xf0840f08u && Code[27] == 0x00610c09u);
-    std::array<std::uint32_t, Code.size() + 4u> code{};
+    std::array<std::uint32_t, Code.size() + 5u> code{};
     std::copy_n(Code.begin(), 26u, code.begin());
-    code[26] = 0x7e200280u;
-    code[27] = 0x7e220309u;
-    code[28] = 0x7e24030au;
-    code[29] = 0x7e26030bu;
-    std::copy(Code.begin() + 26u, Code.end(), code.begin() + 30u);
-    code[30] = 0xf0980f08u;
-    code[31] = 0x00610c10u;
+    code[26] = 0x7e2002ffu;
+    code[27] = bias;
+    code[28] = 0x7e220309u;
+    code[29] = 0x7e24030au;
+    code[30] = 0x7e26030bu;
+    std::copy(Code.begin() + 26u, Code.end(), code.begin() + 31u);
+    code[31] = 0xf0980f08u;
+    code[32] = 0x00610c10u;
     return code;
-}();
+}
+
+alignas(256) constexpr auto ZeroBiasCode = BiasCode(0u);
+alignas(256) constexpr auto PositiveBiasCode = BiasCode(0x3f800000u);
+alignas(256) constexpr auto NegativeBiasCode = BiasCode(0xbf800000u);
 
 struct Sample {
     std::uint32_t level;
@@ -177,13 +182,14 @@ std::uint32_t Wrap(std::uint32_t coordinate, std::int32_t offset, std::uint32_t 
     return static_cast<std::uint32_t>(((static_cast<std::int32_t>(coordinate) + offset) % extent + extent) % extent);
 }
 
-void Check(bool implicit, bool affine) {
+void Check(bool implicit, bool affine, std::int32_t bias = 0) {
     constexpr std::array<const char*, 4> names{"image_sample_d_cl", "image_sample_cl", "image_sample_d_cl_o (1, 2)", "image_sample_d_cl_o (-1, -2)"};
     constexpr std::array<std::array<std::int32_t, 2>, 4> offsets{{{0, 0}, {0, 0}, {1, 2}, {-1, -2}}};
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const auto sample = SampleOf(tid, affine);
         const std::uint32_t clamped = std::max(sample.level, sample.clamp);
-        const std::array<std::uint32_t, 4> levels{clamped, std::max(affine ? 2u : 0u, sample.clamp), clamped, clamped};
+        const auto implicitLevel = static_cast<std::uint32_t>(std::clamp((affine ? 2 : 0) + bias, 0, static_cast<std::int32_t>(Levels - 1u)));
+        const std::array<std::uint32_t, 4> levels{clamped, std::max(implicitLevel, sample.clamp), clamped, clamped};
         for (std::uint32_t index = 0; index < levels.size(); ++index) {
             if (index == 1u && !implicit) continue;
             const std::uint32_t level = levels[index];
@@ -221,6 +227,14 @@ int main(int argc, char** argv) {
         if (!implicit) {
             std::puts("image sample explicit-gradient LOD clamp tests passed");
             return VulkanTestSkipped;
+        }
+        if (zeroBias && affine) {
+            FillInput(true);
+            Require(Run(*device, PositiveBiasCode), "image sample positive-bias LOD clamp unexpectedly requires compute derivatives");
+            Check(true, true, 1);
+            FillInput(true);
+            Require(Run(*device, NegativeBiasCode), "image sample negative-bias LOD clamp unexpectedly requires compute derivatives");
+            Check(true, true, -1);
         }
         std::puts("image sample LOD clamp tests passed");
         return 0;
