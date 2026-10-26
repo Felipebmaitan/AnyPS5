@@ -1570,7 +1570,26 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     std::uint32_t operandMask = 0;
     std::vector<std::uint32_t> operands;
-    if (HasFlag(mem, RdnaImageSampleFlagDerivative)) {
+    const bool computeImplicitClamp = state.program.Resources().stage == IrShaderStage::Compute && !explicitLod && setup.layout.clamp != NoImageComponent && setup.layout.bias == NoImageComponent;
+    if (computeImplicitClamp) {
+        opcode = setup.dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
+        const auto count = setup.dimensionInfo.spatialComponents;
+        const auto type = count == 1u ? TypeF32(state) : TypeF32Vector(state, count);
+        auto coord = setup.coord;
+        if (setup.dimensionInfo.coordinateComponents != count) {
+            coord = state.module.AllocateId();
+            if (count == 1u) {
+                state.module.AddFunction(spv::OpCompositeExtract, type, coord, setup.coord, 0u);
+            } else {
+                std::vector<std::uint32_t> words{spv::OpVectorShuffle, type, coord, setup.coord, setup.coord};
+                for (std::uint32_t index = 0; index < count; ++index) words.push_back(index);
+                state.module.AddFunction(words);
+            }
+        }
+        operandMask |= spv::ImageOperandsGradMask;
+        operands.push_back(Unary(state, spv::OpDPdx, type, coord));
+        operands.push_back(Unary(state, spv::OpDPdy, type, coord));
+    } else if (HasFlag(mem, RdnaImageSampleFlagDerivative)) {
         operandMask |= spv::ImageOperandsGradMask;
         operands.push_back(CoordF32(ctx, access, setup.layout.gradX, setup.dimensionInfo.spatialComponents, AddressDimension(access).spatialComponents, true));
         operands.push_back(CoordF32(ctx, access, setup.layout.gradY, setup.dimensionInfo.spatialComponents, AddressDimension(access).spatialComponents, true));

@@ -6834,8 +6834,10 @@ void verifyUnnormalizedSamplers() {
         if (mimg == 0xf0900f08u || mimg == 0xf0880f08u) continue;
         const auto normalizedResult = recompile(program(mimg), userData(normalized), address);
         require(proven(normalizedResult, false) && normalizedResult.variantId == result.variantId && normalizedResult.PipelineVariantId() != result.PipelineVariantId(), "unnormalized samplers: a normalized compute sample did not get its own specialization of the shared artifact");
-        const auto mask = mimg == 0xf0940f08u ? spv::ImageOperandsBiasMask : mimg == 0xf0840f08u ? spv::ImageOperandsMinLodMask : spv::ImageOperandsMaskNone;
-        require(sampleMasks(normalizedResult.spirv.Words(), spv::OpImageSampleImplicitLod) == std::vector<std::uint32_t>{mask} && sampleMasks(normalizedResult.spirv.Words()).empty(), "unnormalized samplers: a normalized compute sample did not preserve its implicit LOD operands");
+        const bool clamp = mimg == 0xf0840f08u;
+        const auto opcode = clamp ? spv::OpImageSampleExplicitLod : spv::OpImageSampleImplicitLod;
+        const auto mask = mimg == 0xf0940f08u ? spv::ImageOperandsBiasMask : clamp ? spv::ImageOperandsGradMask | spv::ImageOperandsMinLodMask : spv::ImageOperandsMaskNone;
+        require(sampleMasks(normalizedResult.spirv.Words(), opcode) == std::vector<std::uint32_t>{mask} && sampleMasks(normalizedResult.spirv.Words(), clamp ? spv::OpImageSampleImplicitLod : spv::OpImageSampleExplicitLod).empty(), "unnormalized samplers: a normalized compute sample lost its LOD operands or minimum-LOD gradients");
     }
 
     const auto reject = [&](std::uint32_t mimg, const std::array<std::uint32_t, 16>& data, const char* reason, const char* what) {
@@ -6920,9 +6922,10 @@ void verifyUnnormalizedSamplers() {
         expectFailure([&] { static_cast<void>(recompile(computed, userData(normalized))); }, "normalized guest sampler is used with a texel offset that is not a constant", "unnormalized texel offsets: a normalized computed offset was accepted without maintenance8");
         expectFailure([&] { static_cast<void>(recompile(computed, imageData(unnormalized, Type2D, Format11_11_10UInt, 0u))); }, "takes only images an unnormalized S# can sample", "unnormalized texel offsets: a computed offset sampled a converted image without maintenance8");
         const auto normalizedResult = recompile(computed, userData(normalized), 0u, true);
-        const bool explicitLod = mimg == 0xf0dc0f08u || mimg == 0xf0d00f08u;
+        const bool clamp = mimg == 0xf0c40f08u;
+        const bool explicitLod = mimg == 0xf0dc0f08u || mimg == 0xf0d00f08u || clamp;
         const auto opcode = explicitLod ? spv::OpImageSampleExplicitLod : spv::OpImageSampleImplicitLod;
-        const auto lodMask = explicitLod ? spv::ImageOperandsLodMask : mimg == 0xf0d40f08u ? spv::ImageOperandsBiasMask : mimg == 0xf0c40f08u ? spv::ImageOperandsMinLodMask : spv::ImageOperandsMaskNone;
+        const auto lodMask = clamp ? spv::ImageOperandsGradMask | spv::ImageOperandsMinLodMask : explicitLod ? spv::ImageOperandsLodMask : mimg == 0xf0d40f08u ? spv::ImageOperandsBiasMask : spv::ImageOperandsMaskNone;
         require(sampleMasks(normalizedResult.spirv.Words(), opcode) == std::vector<std::uint32_t>{lodMask | spv::ImageOperandsOffsetMask} && sampleMasks(normalizedResult.spirv.Words(), explicitLod ? spv::OpImageSampleImplicitLod : spv::OpImageSampleExplicitLod).empty(), "unnormalized texel offsets: a normalized computed offset lost its sample opcode or operands");
     }
 

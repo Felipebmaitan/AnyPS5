@@ -58,19 +58,21 @@ struct Sample {
     std::uint32_t y;
 };
 
-Sample SampleOf(std::uint32_t tid) {
+Sample SampleOf(std::uint32_t tid, bool affine = false) {
     const auto quad = tid / 4u;
-    return {tid % Levels, (tid / Levels) % Gradients, (tid / 3u) % Clamps, (quad * 7u + 3u) % Size, (quad * 5u + 1u) % Size};
+    const auto x = affine ? (quad * 3u) % 8u + (tid & 1u) * 4u : (quad * 7u + 3u) % Size;
+    const auto y = affine ? (quad * 5u) % 8u + ((tid >> 1u) & 1u) * 4u : (quad * 5u + 1u) % Size;
+    return {tid % Levels, (tid / Levels) % Gradients, (tid / 3u) % Clamps, x, y};
 }
 
 std::uint32_t Bits(float value) {
     return std::bit_cast<std::uint32_t>(value);
 }
 
-void FillInput() {
+void FillInput(bool affine) {
     Buffer.fill(0xdeadbeefu);
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
-        const auto sample = SampleOf(tid);
+        const auto sample = SampleOf(tid, affine);
         auto* words = &Buffer[tid * Words];
         for (std::uint32_t gradient = 0; gradient < Gradients; ++gradient) {
             words[gradient] = Bits(gradient == sample.gradient ? std::exp2(static_cast<float>(sample.level) - 0.25f) / static_cast<float>(Size) : 0.0f);
@@ -161,13 +163,13 @@ std::uint32_t Wrap(std::uint32_t coordinate, std::int32_t offset, std::uint32_t 
     return static_cast<std::uint32_t>(((static_cast<std::int32_t>(coordinate) + offset) % extent + extent) % extent);
 }
 
-void Check(bool implicit) {
+void Check(bool implicit, bool affine) {
     constexpr std::array<const char*, 4> names{"image_sample_d_cl", "image_sample_cl", "image_sample_d_cl_o (1, 2)", "image_sample_d_cl_o (-1, -2)"};
     constexpr std::array<std::array<std::int32_t, 2>, 4> offsets{{{0, 0}, {0, 0}, {1, 2}, {-1, -2}}};
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
-        const auto sample = SampleOf(tid);
+        const auto sample = SampleOf(tid, affine);
         const std::uint32_t clamped = std::max(sample.level, sample.clamp);
-        const std::array<std::uint32_t, 4> levels{clamped, sample.clamp, clamped, clamped};
+        const std::array<std::uint32_t, 4> levels{clamped, std::max(affine ? 2u : 0u, sample.clamp), clamped, clamped};
         for (std::uint32_t index = 0; index < levels.size(); ++index) {
             if (index == 1u && !implicit) continue;
             const std::uint32_t level = levels[index];
@@ -183,21 +185,23 @@ void Check(bool implicit) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool affine = argc == 2 && std::string(argv[1]) == "--implicit-affine-quads";
+        Require(argc == 1 || affine, "image sample LOD clamp: unexpected argument");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!TargetHasCapability(device->Target(), spv::CapabilityMinLod)) {
             std::puts("skipped, the device has no shaderResourceMinLod");
             return VulkanTestSkipped;
         }
-        FillInput();
+        FillInput(affine);
         FillTexture();
         const bool implicit = Run(*device, Code);
         if (!implicit) {
             Require(Run(*device, ExplicitGradientCode), "image sample explicit-gradient LOD clamp unexpectedly requires compute derivatives");
         }
-        Check(implicit);
+        Check(implicit, affine);
         if (!implicit) {
             std::puts("image sample explicit-gradient LOD clamp tests passed");
             return VulkanTestSkipped;
