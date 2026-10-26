@@ -11,6 +11,8 @@
 #include "prx/libkernel/File/include/KernelStatfs.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/GuestDirectory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,19 +25,23 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <typeinfo>
 #include <vector>
 
-extern "C" {
-
-using TerminateHandler = void (*)();
-
-}
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__linux__)
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -55,14 +61,6 @@ void Require(bool value, int line) {
     }
 }
 #define Check(value) Require((value), __LINE__)
-
-void OnMmapRefused() {
-    const auto* type = __cxa_current_exception_type_nid_postfix();
-    const auto* error = static_cast<const std::runtime_error*>(__cxa_current_primary_exception_nid_postfix());
-    const bool refused = type != nullptr && error != nullptr && std::strcmp(type->name(), typeid(std::runtime_error).name()) == 0 &&
-        std::strstr(error->what(), "mmap on a file read from app0.zar") != nullptr && std::strstr(error->what(), "not implemented") != nullptr;
-    std::_Exit(refused ? 0 : 1);
-}
 
 template <typename TCall> bool NotImplemented(TCall call) {
     try {
@@ -483,11 +481,402 @@ void NativeDirectoryIdentity(const std::filesystem::path& root) {
     std::filesystem::remove_all(renamed);
 }
 
+constexpr std::size_t MapPage = 16384;
+const auto MapFailed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
+
+void MappingFixture(const std::filesystem::path& root) {
+    std::map<std::string, std::vector<char>> files;
+    std::filesystem::create_directory(root / "app0" / "Reference");
+    for (const std::size_t size : {std::size_t{0}, std::size_t{3}, MapPage, MapPage + 77, BigSize}) {
+        const auto name = std::to_string(size) + ".bin";
+        auto bytes = AppArchiveFixture::Pattern(size);
+        std::ofstream plain(root / "app0" / "Reference" / name, std::ios::binary);
+        plain.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        Check(static_cast<bool>(plain));
+        files.emplace("Mapped/" + name, std::move(bytes));
+    }
+    files.emplace("Override.bin", std::vector<char>{'z'});
+    AppArchiveFixture::WriteArchive(root / "app0.zar", files);
+    std::ofstream overrideFile(root / "app0" / "Override.bin", std::ios::binary);
+    overrideFile << "loose";
+}
+
+struct MappingResult {
+    void* address;
+    int error;
+};
+
+MappingResult TryMapping(int fd, std::size_t length, int protection, int flags, std::int64_t offset, void* hint = nullptr) {
+    *__error_nid_postfix() = 0;
+    void* address = mmap_nid_postfix(hint, length, protection, flags, fd, offset);
+    return {address, address == MapFailed ? *__error_nid_postfix() : 0};
+}
+
+void MappingRanges() {
+    for (const std::size_t size : {std::size_t{0}, std::size_t{3}, MapPage, MapPage + 77, BigSize}) {
+        const auto name = std::to_string(size) + ".bin";
+        const int archive = sceKernelOpen(("/app0/Mapped/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+        const int plain = sceKernelOpen(("/app0/Reference/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+        Check(archive >= 0 && plain >= 0);
+        for (const auto offset : {std::int64_t{-1}, std::int64_t{1}, std::int64_t{4096}, std::int64_t{0},
+             static_cast<std::int64_t>(MapPage), static_cast<std::int64_t>((size + MapPage - 1) & ~(MapPage - 1)),
+             std::numeric_limits<std::int64_t>::max() & ~static_cast<std::int64_t>(MapPage - 1)}) {
+            for (const std::size_t length : {std::size_t{0}, std::size_t{1}, MapPage, MapPage + 1, std::numeric_limits<std::size_t>::max()}) {
+                for (const int kind : {1, 2}) {
+                    const auto left = TryMapping(archive, length, 1, kind, offset);
+                    const auto right = TryMapping(plain, length, 1, kind, offset);
+                    Check((left.address == MapFailed) == (right.address == MapFailed) && left.error == right.error);
+                    if (left.address == MapFailed) continue;
+                    Check((reinterpret_cast<std::uintptr_t>(left.address) & (MapPage - 1)) == 0);
+                    const auto rounded = (length + MapPage - 1) & ~(MapPage - 1);
+                    if (offset >= 0 && static_cast<std::uint64_t>(offset) < size) {
+                        const auto available = size - static_cast<std::size_t>(offset);
+                        const auto accessible = std::min(rounded, (available + 4095) & ~std::size_t{4095});
+                        Check(std::memcmp(left.address, right.address, accessible) == 0);
+                    }
+                    Check(munmap_nid_postfix(left.address, length) == 0);
+                    Check(munmap_nid_postfix(right.address, length) == 0);
+                }
+            }
+        }
+        Check(sceKernelClose(archive) == 0 && sceKernelClose(plain) == 0);
+    }
+}
+
+void MappingLifecycle(const char* path) {
+    const auto expected = AppArchiveFixture::Pattern(BigSize);
+    const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0 && sceKernelLseek(fd, 19, 0) == 19);
+    Check(TryMapping(fd, MapPage, 3, 1, 0).error == 13);
+    const auto shared = TryMapping(fd, MapPage * 3, 1, 1, 0);
+    Check(shared.address != MapFailed && std::memcmp(shared.address, expected.data(), MapPage * 3) == 0);
+    Check(mprotect_nid_postfix(shared.address, MapPage, 3) == -1 && *__error_nid_postfix() == 13);
+    Check(mprotect_nid_postfix(shared.address, MapPage, 0) == 0);
+    Check(mprotect_nid_postfix(shared.address, MapPage, 1) == 0);
+    Check(sceKernelPread(fd, shared.address, 1, 0) == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT));
+    Check(pread_nid_postfix(fd, shared.address, 1, 0) == -1 && *__error_nid_postfix() == 14);
+    Check(sceKernelLseek(fd, 0, 1) == 19);
+    const int duplicate = dup_nid_postfix(fd);
+    const int above = fcntl_nid_postfix(fd, DuplicateFrom, fd + 8);
+    Check(duplicate >= 0 && above >= fd + 8);
+    const auto privateCopy = TryMapping(duplicate, MapPage * 3, 1, 2, MapPage);
+    Check(privateCopy.address != MapFailed);
+    Check(mprotect_nid_postfix(privateCopy.address, MapPage * 3, 3) == 0);
+    auto* bytes = static_cast<char*>(privateCopy.address);
+    bytes[7] ^= 0x5a;
+    Check(static_cast<char*>(shared.address)[MapPage + 7] == expected[MapPage + 7]);
+    char source = 0;
+    Check(sceKernelPread(fd, &source, 1, MapPage + 7) == 1 && source == expected[MapPage + 7]);
+    Check(sceKernelClose(fd) == 0 && sceKernelClose(duplicate) == 0);
+    const auto survivor = TryMapping(above, MapPage, 3, 2, MapPage);
+    Check(survivor.address != MapFailed && static_cast<char*>(survivor.address)[7] == expected[MapPage + 7]);
+    Check(sceKernelClose(above) == 0);
+    Check(std::memcmp(shared.address, expected.data(), MapPage * 3) == 0);
+    Check(bytes[7] == static_cast<char>(expected[MapPage + 7] ^ 0x5a));
+    Check(munmap_nid_postfix(bytes + MapPage, MapPage) == 0);
+    Check(munmap_nid_postfix(static_cast<char*>(shared.address) + MapPage, MapPage) == 0);
+    VirtualQueryInfo info{};
+    Check(sceKernelVirtualQuery(bytes + MapPage, 0, &info, sizeof(info)) == SCE_KERNEL_ERROR_EACCES);
+    Check(bytes[MapPage * 2] == expected[MapPage * 3]);
+    Check(mprotect_nid_postfix(bytes + MapPage * 2, MapPage, 1) == 0);
+    Check(munmap_nid_postfix(bytes, MapPage) == 0 && munmap_nid_postfix(bytes + MapPage * 2, MapPage) == 0);
+    Check(munmap_nid_postfix(shared.address, MapPage) == 0);
+    Check(munmap_nid_postfix(static_cast<char*>(shared.address) + MapPage * 2, MapPage) == 0);
+    Check(munmap_nid_postfix(survivor.address, MapPage) == 0);
+    const int reopened = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    const int replacement = sceKernelOpen("/app0/Override.bin", SCE_KERNEL_O_RDONLY, 0);
+    Check(reopened >= 0 && replacement >= 0);
+    void* kernelMapping = nullptr;
+    Check(sceKernelMmap(nullptr, MapPage, 1, 1, reopened, MapPage, &kernelMapping) == 0);
+    Check(dup2_nid_postfix(replacement, reopened) == reopened);
+    Check(std::memcmp(kernelMapping, expected.data() + MapPage, MapPage) == 0);
+    Check(sceKernelClose(reopened) == 0 && sceKernelClose(replacement) == 0);
+    Check(munmap_nid_postfix(kernelMapping, MapPage) == 0);
+}
+
+bool CollectMapping(void* mapping) {
+#ifdef _WIN32
+    std::array<void*, 16> pages{};
+    std::size_t count = pages.size();
+    Check(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapping), MapPage, pages.data(), &count, true));
+    return count != 0;
+#else
+    bool written = false;
+    Check(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(reinterpret_cast<std::uintptr_t>(mapping), MapPage,
+        [](void* context, std::uintptr_t, std::uintptr_t) { *static_cast<bool*>(context) = true; }, &written));
+    return written;
+#endif
+}
+
+void MappingHostWrites(const char* path) {
+    const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    const auto mapping = TryMapping(fd, MapPage, 3, 2, 0);
+    Check(mapping.address != MapFailed);
+#ifdef _WIN32
+    bool watch = GuestArena::GuestArenaWriteWatched_nid_postfix();
+    Check(watch);
+#else
+    bool watch = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
+#endif
+    if (watch) {
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(mapping.address, MapPage);
+#ifndef _WIN32
+        watch = GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(mapping.address), MapPage);
+#endif
+        if (watch) CollectMapping(mapping.address);
+    }
+    Check(sceKernelPread(fd, mapping.address, MapPage, MapPage) == static_cast<std::int64_t>(MapPage));
+    const auto expected = AppArchiveFixture::Pattern(BigSize);
+    Check(std::memcmp(mapping.address, expected.data() + MapPage, MapPage) == 0);
+    if (watch) Check(CollectMapping(mapping.address));
+    {
+        GuestArena::HostWrite write(mapping.address, MapPage);
+        Check(write.Open());
+        Check(sceKernelPread(fd, mapping.address, MapPage, MapPage * 2) == static_cast<std::int64_t>(MapPage));
+    }
+    Check(std::memcmp(mapping.address, expected.data() + MapPage * 2, MapPage) == 0);
+    if (watch) {
+        Check(CollectMapping(mapping.address));
+#ifndef _WIN32
+        Check(GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapping.address, MapPage));
+#endif
+    }
+    Check(munmap_nid_postfix(mapping.address, MapPage) == 0 && sceKernelClose(fd) == 0);
+}
+
+#if defined(__linux__) || defined(_WIN32)
+std::int64_t MappingPartialRead(const char* path) {
+    const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    const auto mapping = TryMapping(fd, MapPage * 2, 3, 2, 0);
+    Check(mapping.address != MapFailed);
+    auto* bytes = static_cast<char*>(mapping.address);
+    Check(mprotect_nid_postfix(bytes + MapPage, MapPage, 1) == 0);
+    const auto read = sceKernelRead(fd, bytes + MapPage - 77, 154);
+    if (read > 0) {
+        Check(read == 77 && std::memcmp(bytes + MapPage - 77, AppArchiveFixture::Pattern(77).data(), 77) == 0);
+        Check(sceKernelLseek(fd, 0, 1) == read);
+    } else {
+#ifdef _WIN32
+        Check(read == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EINVAL));
+#else
+        Check(read == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT));
+#endif
+        Check(sceKernelLseek(fd, 0, 1) == 0);
+    }
+    Check(sceKernelClose(fd) == 0 && munmap_nid_postfix(mapping.address, MapPage * 2) == 0);
+    return read;
+}
+#endif
+
+class MappingTemporaryDirectory {
+public:
+    explicit MappingTemporaryDirectory(const std::filesystem::path& directory) {
+        for (const auto* name : {"TMP", "TEMP", "TMPDIR"}) {
+            const auto* value = std::getenv(name);
+            saved.emplace_back(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
+        }
+        Set(directory);
+    }
+    ~MappingTemporaryDirectory() {
+        for (const auto& [name, value] : saved) SetVariable(name.c_str(), value ? value->c_str() : nullptr);
+    }
+    void Set(const std::filesystem::path& directory) {
+        for (const auto& [name, value] : saved) SetVariable(name.c_str(), directory.string().c_str());
+    }
+private:
+    static void SetVariable(const char* name, const char* value) {
+#ifdef _WIN32
+        Check(_putenv_s(name, value == nullptr ? "" : value) == 0);
+#else
+        Check(value == nullptr ? unsetenv(name) == 0 : setenv(name, value, 1) == 0);
+#endif
+    }
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+};
+
+std::size_t MappingHandleCount() {
+#ifdef _WIN32
+    DWORD count = 0;
+    Check(GetProcessHandleCount(GetCurrentProcess(), &count));
+    return count;
+#elif defined(__linux__)
+    return static_cast<std::size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
+#else
+    return 0;
+#endif
+}
+
+void MappingFailures(const std::filesystem::path& root, bool damaged) {
+    MappingFixture(root);
+    if (damaged) {
+        std::fstream archive(root / "app0.zar", std::ios::binary | std::ios::in | std::ios::out);
+        const std::array<char, 8> garbage{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0};
+        archive.write(garbage.data(), garbage.size());
+    }
+    const auto directory = root / "backings";
+    std::filesystem::create_directory(directory);
+    MappingTemporaryDirectory temporary(damaged ? directory : root / "missing");
+    const int fd = sceKernelOpen(("/app0/Mapped/" + std::to_string(BigSize) + ".bin").c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0 && sceKernelLseek(fd, 27, 0) == 27);
+    const auto initialFailure = TryMapping(fd, MapPage, 1, 2, 0);
+    Check(initialFailure.address == MapFailed && initialFailure.error == 5);
+    Check(std::filesystem::is_empty(directory));
+    const auto before = MappingHandleCount();
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        const auto result = TryMapping(fd, MapPage, 1, 2, 0);
+        Check(result.address == MapFailed && result.error == 5);
+        Check(std::filesystem::is_empty(directory));
+    }
+    Check(MappingHandleCount() == before);
+    Check(sceKernelLseek(fd, 0, 1) == 27);
+    if (!damaged) {
+        temporary.Set(directory);
+        const auto mapping = TryMapping(fd, MapPage, 1, 1, 0);
+        Check(mapping.address != MapFailed);
+        Check(sceKernelClose(fd) == 0);
+        Check(static_cast<char*>(mapping.address)[7] == AppArchiveFixture::Pattern(BigSize)[7]);
+        Check(munmap_nid_postfix(mapping.address, MapPage) == 0);
+    } else {
+        Check(sceKernelClose(fd) == 0);
+    }
+    Check(std::filesystem::is_empty(directory));
+}
+
+void MappingPlacement(const char* path) {
+    const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    const auto aligned = TryMapping(fd, MapPage, 1, 2 | 0x1000000, MapPage);
+    Check(aligned.address != MapFailed && (reinterpret_cast<std::uintptr_t>(aligned.address) & ((1 << 21) - 1)) == 0);
+    Check(munmap_nid_postfix(aligned.address, MapPage) == 0);
+    void* placeholder = mmap_nid_postfix(nullptr, MapPage * 3, 3, 0x1002, -1, 0);
+    Check(placeholder != MapFailed);
+    auto* middle = static_cast<char*>(placeholder) + MapPage;
+    const auto fixed = TryMapping(fd, MapPage, 1, 0x11, MapPage, middle);
+    Check(fixed.address == middle);
+    Check(std::memcmp(middle, AppArchiveFixture::Pattern(BigSize).data() + MapPage, MapPage) == 0);
+    Check(munmap_nid_postfix(placeholder, MapPage * 3) == 0);
+    Check(sceKernelClose(fd) == 0);
+}
+
+void MappingProtections() {
+    const auto name = std::to_string(BigSize) + ".bin";
+    const int archive = sceKernelOpen(("/app0/Mapped/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+    const int plain = sceKernelOpen(("/app0/Reference/" + name).c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(archive >= 0 && plain >= 0);
+    for (const int protection : {0, 1, 2, 3, 4, 5, 6, 7, 8}) {
+        for (const int kind : {1, 2}) {
+            const auto left = TryMapping(archive, MapPage, protection, kind, 0);
+            const auto right = TryMapping(plain, MapPage, protection, kind, 0);
+            Check((left.address == MapFailed) == (right.address == MapFailed) && left.error == right.error);
+            if (left.address == MapFailed) continue;
+            if (kind == 2) {
+                Check(mprotect_nid_postfix(left.address, MapPage, 3) == 0);
+                Check(mprotect_nid_postfix(right.address, MapPage, 3) == 0);
+                Check(std::memcmp(left.address, right.address, MapPage) == 0);
+            }
+            Check(munmap_nid_postfix(left.address, MapPage) == 0 && munmap_nid_postfix(right.address, MapPage) == 0);
+        }
+    }
+    Check(sceKernelClose(archive) == 0 && sceKernelClose(plain) == 0);
+}
+
+void MappingTailProtections(const char* directory) {
+    const auto path = "/app0/" + std::string(directory) + "/" + std::to_string(MapPage + 77) + ".bin";
+    const int fd = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    const auto mapping = TryMapping(fd, MapPage * 2, 1, 1, 0);
+    Check(mapping.address != MapFailed);
+    auto* tail = static_cast<char*>(mapping.address) + MapPage;
+    Check(mprotect_nid_postfix(tail, MapPage, 3) == -1 && *__error_nid_postfix() == 13);
+    Check(mprotect_nid_postfix(tail, MapPage, 0) == 0 && mprotect_nid_postfix(tail, MapPage, 1) == 0);
+    Check(tail[76] == AppArchiveFixture::Pattern(MapPage + 77).back() && tail[77] == 0);
+    Check(sceKernelClose(fd) == 0 && munmap_nid_postfix(mapping.address, MapPage * 2) == 0);
+}
+
+void MappingEndOfFile(const char* directory) {
+    const auto path = "/app0/" + std::string(directory) + "/3.bin";
+    const int fd = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    for (const int kind : {1, 2}) {
+        const auto mapping = TryMapping(fd, MapPage, 1, kind, 0);
+        Check(mapping.address != MapFailed);
+        const auto* bytes = static_cast<const volatile char*>(mapping.address);
+        for (std::size_t offset = 3; offset < 4096; ++offset) Check(bytes[offset] == 0);
+#ifdef _WIN32
+        for (std::size_t offset = 4096; offset < MapPage; ++offset) Check(bytes[offset] == 0);
+#elif defined(__linux__)
+        const auto child = fork();
+        Check(child >= 0);
+        if (child == 0) {
+            const rlimit coreLimit{0, 0};
+            if (setrlimit(RLIMIT_CORE, &coreLimit) != 0) _exit(1);
+            std::signal(SIGBUS, SIG_DFL);
+            _exit(bytes[4096]);
+        }
+        int status = 0;
+        Check(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS);
+#endif
+        Check(munmap_nid_postfix(mapping.address, MapPage) == 0);
+    }
+    Check(sceKernelClose(fd) == 0);
+}
+
+void MappingConcurrent() {
+    const int fd = sceKernelOpen(("/app0/Mapped/" + std::to_string(BigSize) + ".bin").c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    std::barrier start(4);
+    std::vector<std::thread> threads;
+    for (int index = 0; index < 4; ++index) threads.emplace_back([&, index] {
+        start.arrive_and_wait();
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const auto mapping = TryMapping(fd, MapPage, index % 2 == 0 ? 3 : 1, index % 2 == 0 ? 2 : 1, MapPage * index);
+            Check(mapping.address != MapFailed);
+            const auto expected = AppArchiveFixture::Pattern(BigSize);
+            Check(std::memcmp(mapping.address, expected.data() + MapPage * index, MapPage) == 0);
+            if (index % 2 == 0) static_cast<char*>(mapping.address)[0] ^= 0x5a;
+            Check(munmap_nid_postfix(mapping.address, MapPage) == 0);
+        }
+    });
+    for (auto& thread : threads) thread.join();
+    Check(sceKernelLseek(fd, 0, 1) == 0 && sceKernelClose(fd) == 0);
+}
+
+void Mappings(const std::filesystem::path& root) {
+    MappingFixture(root);
+    MappingConcurrent();
+    MappingRanges();
+    MappingProtections();
+#if defined(__linux__) || defined(_WIN32)
+    const auto archivePartial = MappingPartialRead(("/app0/Mapped/" + std::to_string(BigSize) + ".bin").c_str());
+    const auto plainPartial = MappingPartialRead(("/app0/Reference/" + std::to_string(BigSize) + ".bin").c_str());
+#ifdef _WIN32
+    Check(archivePartial == 77 && plainPartial == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EINVAL));
+#else
+    Check(archivePartial == plainPartial);
+#endif
+#endif
+    for (const auto* directory : {"Mapped", "Reference"}) {
+        const auto path = "/app0/" + std::string(directory) + "/" + std::to_string(BigSize) + ".bin";
+        MappingLifecycle(path.c_str());
+        MappingHostWrites(path.c_str());
+        MappingPlacement(path.c_str());
+        MappingTailProtections(directory);
+        MappingEndOfFile(directory);
+    }
+    const int fd = sceKernelOpen("/app0/Override.bin", SCE_KERNEL_O_RDONLY, 0);
+    Check(fd >= 0);
+    const auto mapping = TryMapping(fd, 5, 1, 2, 0);
+    Check(mapping.address != MapFailed && std::memcmp(mapping.address, "loose", 5) == 0);
+    Check(munmap_nid_postfix(mapping.address, 5) == 0 && sceKernelClose(fd) == 0);
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: guest_kernel_app_archive_tests archive|plain\n");
+        std::fprintf(stderr, "usage: guest_kernel_app_archive_tests archive|plain|mmap|mmap-failure|mmap-damaged\n");
         return 2;
     }
     const std::string mode = argv[1];
@@ -500,13 +889,9 @@ int main(int argc, char** argv) {
         Status();
         Refusals();
     } else if (mode == "mmap") {
-        Archive(root);
-        const int fd = sceKernelOpen("/app0/Data/Small.txt", SCE_KERNEL_O_RDONLY, 0);
-        Check(fd >= 0);
-        _ZSt13set_terminatePFvvE_nid_postfix(OnMmapRefused);
-
-        (void)mmap_nid_postfix(nullptr, 16384, 1, 2, fd, 0);
-        return 1;
+        Mappings(root);
+    } else if (mode == "mmap-failure" || mode == "mmap-damaged") {
+        MappingFailures(root, mode == "mmap-damaged");
     } else if (mode == "plain") {
         WithoutArchive();
         NativeDirectoryIdentity(root);
