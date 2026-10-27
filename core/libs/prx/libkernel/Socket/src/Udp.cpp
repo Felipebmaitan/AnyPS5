@@ -145,6 +145,10 @@ struct Socket : KernelSocketPoll::NativeOwner {
     }
 };
 
+#ifdef _WIN32
+int WaitTransferReady(Socket& socket, bool send, int milliseconds);
+#endif
+
 template<typename TOperation>
 int Transfer(Socket& socket, bool send, int flags, int length, TOperation operation, bool timed = true) {
 #ifdef _WIN32
@@ -167,8 +171,13 @@ int Transfer(Socket& socket, bool send, int flags, int length, TOperation operat
                 (static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000) >> 32);
     };
     auto deadline = nextDeadline();
+    if (timeout != 0) ThreadCancel::IoNoRestart();
     int transferred = 0;
     for (;;) {
+        if (ThreadCancel::IoInterrupted()) {
+            WSASetLastError(WSAEINTR);
+            return transferred == 0 ? -1 : transferred;
+        }
         const int result = operation(transferred);
         if (result >= 0) {
             transferred += result;
@@ -187,12 +196,7 @@ int Transfer(Socket& socket, bool send, int flags, int length, TOperation operat
             milliseconds = static_cast<int>(std::min<std::int64_t>(
                 std::chrono::ceil<std::chrono::milliseconds>(remaining).count(), INT_MAX));
         }
-        fd_set ready;
-        FD_ZERO(&ready);
-        FD_SET(socket.value, &ready);
-        timeval wait{milliseconds < 0 ? 0 : milliseconds / 1000, milliseconds < 0 ? 0 : milliseconds % 1000 * 1000};
-        if (::select(0, send ? nullptr : &ready, send ? &ready : nullptr, nullptr, milliseconds < 0 ? nullptr : &wait) < 0)
-            return transferred == 0 ? -1 : transferred;
+        if (WaitTransferReady(socket, send, milliseconds) < 0) return transferred == 0 ? -1 : transferred;
     }
 #else
     static_cast<void>(socket);
@@ -200,7 +204,7 @@ int Transfer(Socket& socket, bool send, int flags, int length, TOperation operat
     static_cast<void>(flags);
     static_cast<void>(length);
     static_cast<void>(timed);
-    return operation(0);
+    return ThreadCancel::Native([&] { return operation(0); });
 #endif
 }
 
@@ -289,6 +293,39 @@ Waker& ThreadWaker() {
 std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
 std::set<int> closeOnExecDescriptors;
+#ifdef _WIN32
+int WaitTransferReady(Socket& socket, bool send, int milliseconds) {
+    int error = 0;
+    struct ErrorRestore {
+        int& error;
+        ~ErrorRestore() { WSASetLastError(error); }
+    } restore{error};
+    fd_set ready;
+    fd_set interrupted;
+    FD_ZERO(&ready);
+    FD_ZERO(&interrupted);
+    FD_SET(socket.value, &ready);
+    timeval timeout{milliseconds < 0 ? 0 : milliseconds / 1000, milliseconds < 0 ? 0 : milliseconds % 1000 * 1000};
+    if (!ThreadCancel::IoActive()) {
+        const int result = ::select(0, send ? nullptr : &ready, send ? &ready : nullptr, nullptr, milliseconds < 0 ? nullptr : &timeout);
+        error = result < 0 ? WSAGetLastError() : 0;
+        return result;
+    }
+    Waker waker;
+    ThreadCancel::IoWait operation([](void* opaque) noexcept {
+        auto& waker = *static_cast<Waker*>(opaque);
+        const char byte = 0;
+        ::send(waker.value, &byte, 1, 0);
+    }, &waker);
+    FD_SET(waker.value, &interrupted);
+    if (!send) FD_SET(socket.value, &interrupted);
+    if (ThreadCancel::IoInterrupted()) { error = WSAEINTR; return -1; }
+    const int result = ::select(0, &interrupted, send ? &ready : nullptr, nullptr, milliseconds < 0 ? nullptr : &timeout);
+    error = result < 0 ? WSAGetLastError() : 0;
+    if (ThreadCancel::IoInterrupted()) { error = WSAEINTR; return -1; }
+    return result;
+}
+#endif
 #ifdef _WIN32
 int ReserveNumber(NativeSocket) {
     const HANDLE placeholder = ::CreateFileW(L"NUL", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -888,77 +925,6 @@ int SocketSendFlags(Socket& socket, int flags) {
 }
 int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr* address, socklen_t* addressLength) {
 #ifdef _WIN32
-    const bool cancellable = ThreadCancel::IoActive();
-    bool nonblocking = (flags & GuestDontWait) != 0;
-    std::int64_t timeout = 0;
-    {
-        std::lock_guard lock(socket.modeMutex);
-        nonblocking = nonblocking || socket.options.nonblocking;
-        timeout = socket.options.receiveTimeout;
-    }
-    if (cancellable) {
-        if (timeout != 0) ThreadCancel::IoNoRestart();
-        const bool waitAll = socket.type == 1 && (flags & GuestWaitAll) != 0 && !nonblocking;
-        if (waitAll && (flags & GuestPeek) != 0) {
-            WSASetLastError(WSAEOPNOTSUPP);
-            return -1;
-        }
-        int transferred = 0;
-        for (;;) {
-            OVERLAPPED operation{};
-            operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!operation.hEvent) {
-                WSASetLastError(WSAENOBUFS);
-                return transferred != 0 ? transferred : -1;
-            }
-            struct Event {
-                HANDLE handle;
-                ~Event() {
-                    const int error = WSAGetLastError();
-                    CloseHandle(handle);
-                    WSASetLastError(error);
-                }
-            } event{operation.hEvent};
-            struct Pending {
-                Socket& socket;
-                OVERLAPPED& operation;
-                static void Interrupt(void* argument) noexcept {
-                    auto& pending = *static_cast<Pending*>(argument);
-                    CancelIoEx(reinterpret_cast<HANDLE>(pending.socket.value), &pending.operation);
-                }
-            } pending{socket, operation};
-            DWORD done = 0;
-            DWORD nativeFlags = static_cast<DWORD>(NativeReceiveFlags(flags & ~GuestWaitAll, socket.type));
-            int result = -1;
-            int error = WSAEINTR;
-            {
-                ThreadCancel::IoWait wait(Pending::Interrupt, &pending);
-                if (!ThreadCancel::IoInterrupted()) {
-                    WSABUF destination{static_cast<ULONG>(length - transferred),
-                        transferred == 0 ? static_cast<char*>(buffer) : static_cast<char*>(buffer) + transferred};
-                    const int started = address
-                        ? WSARecvFrom(socket.value, &destination, 1, &done, &nativeFlags, address, addressLength, &operation, nullptr)
-                        : WSARecv(socket.value, &destination, 1, &done, &nativeFlags, &operation, nullptr);
-                    error = started == 0 ? 0 : WSAGetLastError();
-                    if (error == WSA_IO_PENDING) {
-                        const auto milliseconds = nonblocking ? 0 : timeout == 0 ? INFINITE : static_cast<DWORD>(std::min<std::int64_t>(
-                            ((timeout >> 32) * 1000) + ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(timeout)) * 1000 + 0xffffffffu) >> 32), INFINITE - 1));
-                        const DWORD waited = WaitForSingleObject(operation.hEvent, milliseconds);
-                        if (waited != WAIT_OBJECT_0) Pending::Interrupt(&pending);
-                        const BOOL completed = WSAGetOverlappedResult(socket.value, &operation, &done, TRUE, &nativeFlags);
-                        error = completed ? 0 : WSAGetLastError();
-                        if (waited == WAIT_TIMEOUT && error == WSA_OPERATION_ABORTED) error = WSAEWOULDBLOCK;
-                    }
-                    if (error == WSA_OPERATION_ABORTED && ThreadCancel::IoInterrupted()) error = WSAEINTR;
-                    if (error == 0) result = static_cast<int>(done);
-                }
-            }
-            WSASetLastError(error);
-            if (result < 0) return transferred != 0 ? transferred : result;
-            transferred += result;
-            if (!waitAll || result == 0 || transferred == length || ThreadCancel::IoInterrupted()) return transferred;
-        }
-    }
     return Transfer(socket, false, flags, length, [&](int offset) {
         auto* destination = offset == 0 ? static_cast<char*>(buffer) : static_cast<char*>(buffer) + offset;
         return address ? ::recvfrom(socket.value, destination, length - offset, NativeReceiveFlags(flags, socket.type), address, addressLength)
