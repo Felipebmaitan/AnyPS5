@@ -617,7 +617,7 @@ static void CloseProgress() {
     int pipe[2]{};
     Require(pipe_nid_postfix(pipe) == 0, "create close-progress pipe");
     Require(write_nid_postfix(pipe[1], "x", 1) == 1, "seed close-progress pipe");
-    auto positioned = File::LockPositionedTransfer(pipe[1]);
+    GuestDescriptorAccess admission(pipe[1], GuestDescriptorAccess::Mode::Read);
     std::atomic<bool> closed{false};
     std::thread closer([&] {
         Require(close_nid_postfix(pipe[1]) == 0, "close positioned descriptor");
@@ -632,7 +632,7 @@ static void CloseProgress() {
     Require(scePthreadCreate(&reader, nullptr, Reader, &read, nullptr) == 0, "start drain reader");
     const bool drained = Observe([&] { return reader->_finished.load(); });
     const bool closeStayedBlocked = !closed.load();
-    positioned.unlock();
+    admission.Unlock();
     closer.join();
     Require(Observe([&] { return reader->_finished.load(); }), "drain reader did not finish");
     Require(scePthreadJoin(reader, nullptr) == 0, "join drain reader");

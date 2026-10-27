@@ -120,7 +120,7 @@ auto Native(TCall&& call) {
 }
 
 template <class TCall>
-auto Io(TCall&& call, bool restartable = true) {
+auto Io(TCall&& call, bool restartable = true, bool cancelZero = false) {
     Check();
     IoRestart restart(restartable);
     for (;;) {
@@ -129,11 +129,14 @@ auto Io(TCall&& call, bool restartable = true) {
             IoPoint point(restart);
             result = call();
         }
-        if (result >= 0) return result;
+        if (result > 0 || (result == 0 && !cancelZero)) return result;
         if (Requested()) { restart.Clear(); Check(); }
-        if (!restart.Ready()) return result;
+        if (result == 0 || !restart.Ready()) return result;
     }
 }
+
+template <class TCall>
+auto IoWrite(TCall&& call) { return Io(std::forward<TCall>(call), true, true); }
 
 template <class TLock>
 struct WaitLock {
