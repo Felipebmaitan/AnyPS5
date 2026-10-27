@@ -228,6 +228,10 @@ static int NativeSync(int descriptor) {
         const auto pipe = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
         if (pipe != INVALID_HANDLE_VALUE && GetFileType(pipe) == FILE_TYPE_PIPE) { errno = EINVAL; return -1; }
         if (::_commit(descriptor) == 0) return 0;
+        if (ThreadCancel::IoActive() && (ThreadCancel::IoInterrupted() || _doserrno == ERROR_OPERATION_ABORTED)) {
+            errno = EINTR;
+            return -1;
+        }
         const auto original = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
         if (original == INVALID_HANDLE_VALUE || GetFileType(original) != FILE_TYPE_DISK) { errno = EBADF; return -1; }
         handle = ReOpenFile(original, GENERIC_WRITE, share, 0);
@@ -282,16 +286,22 @@ std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descr
 std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t bytes) {
     const auto handle = WindowsDescriptorHandle_nid_no_patch(descriptor);
     const auto type = GetFileType(handle);
-    if (!ThreadCancel::IoActive() || (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK)) {
+    const auto nativeWrite = [&] {
         const auto result = ThreadCancel::Native([&] { return ::_write(descriptor, buffer, static_cast<unsigned int>(bytes)); });
-        if (result < 0 && ThreadCancel::IoActive() && _doserrno == ERROR_OPERATION_ABORTED) errno = EINTR;
+        if (result < 0 && ThreadCancel::IoActive()) {
+            if (_doserrno == ERROR_OPERATION_ABORTED) errno = EINTR;
+            else if (type == FILE_TYPE_PIPE && errno == ENOSPC && _doserrno == 0) errno = EAGAIN;
+            else if (type == FILE_TYPE_PIPE && (_doserrno == ERROR_BROKEN_PIPE || _doserrno == ERROR_NO_DATA)) errno = EPIPE;
+        }
         return result;
-    }
+    };
+    if (!ThreadCancel::IoActive() || (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK)) return nativeWrite();
     const bool pipe = type == FILE_TYPE_PIPE;
     DWORD mode = 0;
-    if (pipe && !GetNamedPipeHandleStateW(handle, &mode, nullptr, nullptr, nullptr, nullptr, 0)) {
+    if (pipe && ThreadCancel::Native([&] { return GetNamedPipeHandleStateW(handle, &mode, nullptr, nullptr, nullptr, nullptr, 0) ? 0 : -1; }) < 0) {
         const auto error = GetLastError();
-        errno = error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ? EPIPE : EIO;
+        if (error == ERROR_ACCESS_DENIED) return nativeWrite();
+        errno = ThreadCancel::IoInterrupted() ? EINTR : error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ? EPIPE : EIO;
         return -1;
     }
     const bool nonblocking = pipe && (mode & PIPE_NOWAIT) != 0;
@@ -305,7 +315,14 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
         if (pipe && amount != 0) {
             std::int64_t available = 0;
             bool eof = false, writable = false;
-            if (!GuestSockets::PipeWriteState(descriptor, &available, &eof, &writable)) { errno = EBADF; return transferred == 0 ? -1 : transferred; }
+            int checked;
+            try {
+                checked = ThreadCancel::Native([&] { return GuestSockets::PipeWriteState(descriptor, &available, &eof, &writable) ? 0 : -1; });
+            } catch (const std::runtime_error&) {
+                if (!ThreadCancel::IoInterrupted()) throw;
+                checked = -1;
+            }
+            if (checked < 0) { errno = ThreadCancel::IoInterrupted() ? EINTR : EBADF; return transferred == 0 ? -1 : transferred; }
             if (eof) { errno = EPIPE; return transferred == 0 ? -1 : transferred; }
             if (available == 0 || (bytes <= 512 && available < static_cast<std::int64_t>(amount))) {
                 if (nonblocking) { errno = EAGAIN; return transferred == 0 ? -1 : transferred; }
@@ -326,6 +343,7 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
                 error == ERROR_DISK_FULL || error == ERROR_HANDLE_DISK_FULL ? ENOSPC : EIO;
             return transferred == 0 ? -1 : transferred;
         }
+        if (nonblocking && transferred == 0 && amount != 0) { errno = EAGAIN; return -1; }
         if (nonblocking || done == 0) break;
     } while (transferred < bytes);
     return static_cast<std::int64_t>(transferred);
@@ -1242,7 +1260,7 @@ int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_
             const File::WriteSync sync(d);
             GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buf, nbytes);
             char empty = 0;
-            const auto result = NativePwrite(d, buf == nullptr ? &empty : buf, nbytes, offset);
+            const auto result = sync.Complete(NativePwrite(d, buf == nullptr ? &empty : buf, nbytes, offset));
             return result < 0 ? PosixFailure(SceErrorFromErrno(errno) & 0xffff) : result;
         });
     });
@@ -1607,7 +1625,7 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
     const File::WriteSync sync(d);
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buf, nbytes);
     char empty = 0;
-    const auto result = NativePwrite(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset);
+    const auto result = sync.Complete(NativePwrite(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1641,8 +1659,13 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* guestIov, int iovcn
     if (!write) {
         if (const auto archived = File::ReadArchivedIovecs(d, iov, iovcnt, offset)) return *archived;
     }
-    const auto positioned = File::IoPositionedTransfer(d);
+    auto positioned = File::IoPositionedTransfer(d);
     if (!positioned) return SceErrorFromErrno(errno);
+    const auto finish = [&](std::int64_t result) {
+        positioned->unlock();
+        const auto completed = sync.Complete(result);
+        return result > 0 && completed < 0 ? SceErrorFromErrno(errno) : completed;
+    };
     if (total == 0) {
         char none = 0;
         const auto result = offset != nullptr ? NativePositionedTransfer(d, &none, 0, *offset, write) : NativeTransferBuffer(d, &none, 0, write);
@@ -1663,7 +1686,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* guestIov, int iovcn
         }
         const auto result = offset != nullptr ? NativePositionedTransfer(d, gathered.data(), gathered.size(), *offset, true)
                                               : NativeTransferBuffer(d, gathered.data(), gathered.size(), true);
-        return result < 0 ? SceErrorFromErrno(errno) : result;
+        return finish(result < 0 ? SceErrorFromErrno(errno) : result);
     }
     const bool whole = write || offset != nullptr || NativeIsDisk(d);
     std::int64_t done = 0;
@@ -1672,13 +1695,13 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* guestIov, int iovcn
         for (std::size_t position = 0; position < iov[i].length;) {
             const auto chunk = std::min<std::size_t>(iov[i].length - position, std::numeric_limits<int>::max());
             const auto result = offset != nullptr ? NativePositionedTransfer(d, base + position, chunk, *offset + done, write) : NativeTransferBuffer(d, base + position, chunk, write);
-            if (result < 0) return done != 0 ? done : SceErrorFromErrno(errno);
+            if (result < 0) return finish(done != 0 ? done : SceErrorFromErrno(errno));
             done += result;
             position += static_cast<std::size_t>(result);
-            if (static_cast<std::size_t>(result) < chunk || (!whole && !NativePipeHasData(d))) return done;
+            if (static_cast<std::size_t>(result) < chunk || (!whole && !NativePipeHasData(d))) return finish(done);
         }
     }
-    return done;
+    return finish(done);
 }
 
 int64_t APS5_VABI sceKernelReadv(int d, const KernelIovec* iov, int iovcnt) {
@@ -1721,7 +1744,7 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
     const File::WriteSync sync(d);
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buf, nbytes);
-    const auto result = NativePwrite(d, buf, nbytes, offset);
+    const auto result = sync.Complete(NativePwrite(d, buf, nbytes, offset));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1753,9 +1776,9 @@ int64_t APS5_VABI sceKernelWritev(int d, const KernelIovec* guestIov, int iovcnt
     }
     const File::WriteSync sync(d);
     PrepareWriteIovecs(iov, iovcnt);
-    const auto sharedResult = File::WritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt);
+    const auto sharedResult = sync.Complete(File::WritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt));
     if (sharedResult != -2) return sharedResult < 0 ? SceErrorFromErrno(errno) : sharedResult;
-    const auto result = ThreadCancel::Native([&] { return static_cast<std::int64_t>(::writev(d, NativeIovecs(iov), iovcnt)); });
+    const auto result = sync.Complete(ThreadCancel::Native([&] { return static_cast<std::int64_t>(::writev(d, NativeIovecs(iov), iovcnt)); }));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
@@ -1783,12 +1806,15 @@ int64_t APS5_VABI sceKernelPwritev(int d, const KernelIovec* guestIov, int iovcn
     if (const auto error = PositionedGuestSocketError(d); error != 0) return error;
     const File::WriteSync sync(d);
     PrepareWriteIovecs(iov, iovcnt);
-    const auto sharedResult = File::PwritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt, offset);
+    const auto sharedResult = sync.Complete(File::PwritevSharedMemory_nid_no_patch(d, NativeIovecs(iov), iovcnt, offset));
     if (sharedResult != -2) return sharedResult < 0 ? SceErrorFromErrno(errno) : sharedResult;
 #ifdef __APPLE__
-    if (const auto appended = File::WritevAtEnd(d, NativeIovecs(iov), iovcnt); appended != -2) return appended < 0 ? SceErrorFromErrno(errno) : appended;
+    if (const auto appended = File::WritevAtEnd(d, NativeIovecs(iov), iovcnt); appended != -2) {
+        const auto result = sync.Complete(appended);
+        return result < 0 ? SceErrorFromErrno(errno) : result;
+    }
 #endif
-    const auto result = ThreadCancel::Native([&] { return static_cast<std::int64_t>(::pwritev(d, NativeIovecs(iov), iovcnt, static_cast<off_t>(offset))); });
+    const auto result = sync.Complete(ThreadCancel::Native([&] { return static_cast<std::int64_t>(::pwritev(d, NativeIovecs(iov), iovcnt, static_cast<off_t>(offset))); }));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

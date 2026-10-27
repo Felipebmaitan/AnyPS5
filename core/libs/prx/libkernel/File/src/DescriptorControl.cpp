@@ -5,6 +5,7 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/FileLock.hpp"
@@ -647,18 +648,25 @@ extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWrite
     g_synchronousWriteHook.store(hook);
 }
 
-void SyncWrites(int fd) {
+bool SyncWrites(int fd) {
     {
         std::lock_guard lock(g_mutex);
         const auto found = g_entries.find(fd);
-        if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return;
+        if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return true;
     }
-    if (Classify(fd, "write") != Kind::File) return;
+    if (Classify(fd, "write") != Kind::File) return true;
     const auto hook = g_synchronousWriteHook.load();
-    if (const int result = hook ? hook(fd) : sceKernelFsync(fd); result != 0)
+    if (const int result = ThreadCancel::Native([&] { return hook ? hook(fd) : sceKernelFsync(fd); }); result != 0) {
+        if (ThreadCancel::IoActive() && (ThreadCancel::IoInterrupted() || (static_cast<unsigned>(result) & 0xffff) == EINTR)) {
+            ThreadCancel::IoNoRestart();
+            errno = EINTR;
+            return false;
+        }
         throw std::runtime_error("write: syncing an O_FSYNC file failed, fd=" + std::to_string(fd) + ", error=" + std::to_string(result & 0xffff));
+    }
     std::lock_guard lock(g_mutex);
     ++g_synchronousWrites;
+    return true;
 }
 
 bool Appends(int fd) {

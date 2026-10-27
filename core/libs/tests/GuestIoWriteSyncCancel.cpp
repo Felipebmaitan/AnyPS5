@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <csignal>
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -54,7 +56,7 @@ static State* state = nullptr;
 static int Flush(int file) {
     Require(file == state->file, "flush used a different descriptor");
     ++state->calls;
-    if (state->scenario == "zero" || state->scenario == "error") return 0;
+    if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") return 0;
     state->entered.store(true);
     char token = 0;
 #ifdef _WIN32
@@ -82,17 +84,20 @@ static void Release() {
 #endif
 }
 
-static void APS5_VABI Cleanup(void*) {
+static void APS5_VABI Cleanup(void* opaque) {
+    Require(opaque == state, "cleanup argument ABI");
     Require(state->cleanups.fetch_add(1) == 0 && state->destructors.load() == 0, "cleanup order");
     if (state->scenario != "close") Require(fcntl_nid_postfix(state->file, 4, 0) == 0, "cleanup did not release descriptor admission");
 }
 
-static void APS5_VABI Destroy(void*) {
+static void APS5_VABI Destroy(void* opaque) {
+    Require(opaque == state, "TSD argument ABI");
     Require(state->cleanups.load() == 1 && state->destructors.fetch_add(1) == 0, "TSD order");
     state->finished.store(true);
 }
 
 static void APS5_VABI Handler(int) { ++state->signals; }
+static void APS5_VABI ExceptionHandler(int signal, void*) { Handler(signal); }
 
 static std::int64_t Write(std::size_t size) {
     const char bytes[] = {'a', 'b'};
@@ -104,7 +109,8 @@ static std::int64_t Write(std::size_t size) {
     return sceKernelWrite(state->file, bytes, size);
 }
 
-static void* APS5_VABI Writer(void*) {
+static void* APS5_VABI Writer(void* opaque) {
+    Require(opaque == state, "writer argument ABI");
     if (state->scenario == "disabled") Require(scePthreadSetcancelstate(GUEST_CANCEL_DISABLE, nullptr) == 0, "disable cancellation");
     Require(scePthreadSetspecific(state->key, state) == 0, "set flush TSD");
     CleanupHandler cleanup{};
@@ -135,10 +141,10 @@ int main(int argc, char** argv) {
         Require(state->file >= 0, "reopen read-only synchronous file");
     }
     File::FileSetSynchronousWriteHookForTest_nid_no_patch(Flush);
-    if (state->scenario == "zero" || state->scenario == "error") {
-        const auto result = Write(state->scenario == "zero" ? 0 : 2);
-        Require(result == (state->scenario == "zero" ? 0 : -1), "zero or failed write result");
-        Require(state->calls.load() == 0, "zero-progress write entered a flush");
+    if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") {
+        const auto result = Write(state->scenario == "error" ? 2 : 0);
+        Require(result == (state->scenario == "error" ? -1 : 0), "zero or failed write result");
+        Require(state->calls.load() == (state->scenario == "legacy" ? 1u : 0u), "zero-progress flush contract changed");
     } else {
 #ifdef _WIN32
         Require(CreatePipe(&state->input, &state->output, nullptr, 4096), "create native flush wait pipe");
@@ -148,10 +154,14 @@ int main(int argc, char** argv) {
         state->input = pipe[0]; state->output = pipe[1];
 #endif
         if (state->scenario == "signal") {
+#ifdef _WIN32
+            Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(ExceptionHandler)) == 0, "install flush exception handler");
+#else
             GuestSigaction action{};
             action.handler = reinterpret_cast<std::uintptr_t>(&Handler);
             action.flags = 2;
-            Require(sigaction_nid_postfix(30, &action, nullptr) == 0, "install restartable handler");
+            Require(sigaction_nid_postfix(2, &action, nullptr) == 0, "install restartable handler");
+#endif
         }
         Require(scePthreadKeyCreate(&state->key, reinterpret_cast<pthread_key_destructor_func_t>(Destroy)) == 0, "create flush TSD key");
         Pthread writer{};
@@ -162,7 +172,11 @@ int main(int argc, char** argv) {
         if (state->scenario == "close") {
             closer = std::thread([&] { Require(close_nid_postfix(state->file) == 0, "close flushing descriptor"); closed.store(true); });
         } else if (state->scenario == "signal") {
-            Require(pthread_kill_nid_postfix(writer, 30) == 0, "interrupt flushing writer");
+#ifdef _WIN32
+            Require(sceKernelRaiseException(writer, 30) == 0, "raise flush exception");
+#else
+            Require(::pthread_kill(writer->hostThread, SIGINT) == 0, "interrupt flushing writer");
+#endif
         } else if (state->scenario != "complete") {
             Require(scePthreadCancel(writer) == 0, "cancel flushing writer");
         }
@@ -181,6 +195,7 @@ int main(int argc, char** argv) {
         const bool canceled = state->scenario == "cancel" || state->scenario == "disabled" || state->api == "sce";
         Require(joined == (canceled ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "unexpected flush join result");
         Require(state->cleanups.load() == 1 && state->destructors.load() == 1 && state->calls.load() == 1, "flush repeated or cleanup lost");
+        Require(std::filesystem::file_size(path) == 2, "flush interruption changed write progress");
         if (canceled) Require(state->returned.load() == waiting, "canceled flush completion state");
         else if (state->scenario == "complete") Require(state->result == 2, "completed flush lost positive result");
         else Require(state->result == -1 && state->error == 4, "interrupted flush did not return EINTR");
