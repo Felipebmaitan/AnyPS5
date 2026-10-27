@@ -762,6 +762,9 @@ if(BUILD_TESTING)
         add_test(NAME macos_tls_overlap COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_tls_overlap.py $<TARGET_FILE:relinker>)
         set_tests_properties(macos_tls_overlap PROPERTIES TIMEOUT 60)
+        add_test(NAME macos_tls_exports COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_tls_exports.py $<TARGET_FILE:relinker>)
+        set_tests_properties(macos_tls_exports PROPERTIES TIMEOUT 30)
         add_test(NAME macos_gs_traps COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_gs_traps.py $<TARGET_FILE:relinker>)
         set_tests_properties(macos_gs_traps PROPERTIES TIMEOUT 60)
@@ -816,17 +819,26 @@ if(BUILD_TESTING)
         set(windows_stdio_host_arguments)
         if(WIN32)
             if(MINGW)
-                add_library(windows_stdio_host_ucrt SHARED elfpatcher/tests/WindowsStdioHost.cpp)
-                target_compile_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt)
-                target_link_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt -static-libgcc -static-libstdc++)
-                set_target_properties(windows_stdio_host_ucrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
-                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_ucrt>)
-
                 get_filename_component(testCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
                 set(mingwDlltoolExecutable "${testCompilerDirectory}/dlltool.exe")
                 if(NOT EXISTS "${mingwDlltoolExecutable}")
                     message(FATAL_ERROR "Cannot locate MinGW DLL tool: ${mingwDlltoolExecutable}")
                 endif()
+                set(ucrtImportLibrary "${CMAKE_CURRENT_BINARY_DIR}/windows_stdio_ucrt_import.a")
+                add_custom_command(OUTPUT "${ucrtImportLibrary}"
+                    COMMAND "${mingwDlltoolExecutable}" -d "${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsUcrt.def"
+                        -l "${ucrtImportLibrary}" -D ucrtbase.dll --temp-prefix windows_stdio_ucrt_import
+                    DEPENDS elfpatcher/tests/WindowsUcrt.def
+                    VERBATIM)
+                add_custom_target(windows_stdio_ucrt_import DEPENDS "${ucrtImportLibrary}")
+                add_library(windows_stdio_host_ucrt SHARED elfpatcher/tests/WindowsUcrtStdioHost.cpp)
+                add_dependencies(windows_stdio_host_ucrt windows_stdio_ucrt_import)
+                target_link_libraries(windows_stdio_host_ucrt PRIVATE "${ucrtImportLibrary}")
+                target_compile_options(windows_stdio_host_ucrt PRIVATE -fno-builtin)
+                target_link_options(windows_stdio_host_ucrt PRIVATE -nostdlib -Wl,--no-undefined -Wl,--entry,0)
+                set_target_properties(windows_stdio_host_ucrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_ucrt>)
+
                 set(msvcrtImportLibrary "${CMAKE_CURRENT_BINARY_DIR}/windows_stdio_msvcrt_import.a")
                 add_custom_command(OUTPUT "${msvcrtImportLibrary}"
                     COMMAND "${mingwDlltoolExecutable}" -d "${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsMsvcrt.def"
@@ -1032,6 +1044,9 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    add_test(NAME macos_guest_weak_exports COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_guest_weak_exports.py $<TARGET_FILE:relinker>)
+    set_tests_properties(macos_guest_weak_exports PROPERTIES TIMEOUT 30 LABELS relinker)
     add_test(NAME macos_executable_exports COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_macos_executable_exports.py $<TARGET_FILE:relinker>)
     set_tests_properties(macos_executable_exports PROPERTIES TIMEOUT 30 LABELS relinker)
