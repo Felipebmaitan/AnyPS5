@@ -1,0 +1,28 @@
+add_library(libSceJxr SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceJxr PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceJxr)
+
+if(BUILD_TESTING)
+    add_test_executable(guest_jxr_tests ${LIBS_INCLUDE_DIR}/tests/GuestJxr.cpp)
+    target_include_directories(guest_jxr_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_jxr_tests PRIVATE libSceJxr libc)
+    configure_windows_unwind(guest_jxr_tests)
+    add_test(NAME guest_jxr COMMAND guest_jxr_tests)
+    if(WIN32)
+        set_tests_properties(guest_jxr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceJxr>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_jxr_stream_tests ${LIBS_INCLUDE_DIR}/tests/JxrStream.cpp)
+    target_include_directories(guest_jxr_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_jxr_stream_tests PRIVATE libSceJxr libc libkernel)
+    configure_windows_unwind(guest_jxr_stream_tests)
+    add_test(NAME guest_jxr_stream COMMAND guest_jxr_stream_tests)
+    set_tests_properties(guest_jxr_stream PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_jxr_stream PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceJxr>")
+    endif()
+endif()

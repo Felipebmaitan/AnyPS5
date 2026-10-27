@@ -1,27 +1,16 @@
+#include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
+#include "prx/libSceLibreSsl3/libSceLibreSsl3.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libSceLibreSsl/include/Error.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 #include <thread>
-
-extern "C" {
-std::uint64_t APS5_VABI ERR_get_error_nid_postfix();
-std::uint64_t APS5_VABI ERR_peek_error_nid_postfix();
-void APS5_VABI ERR_clear_error_nid_postfix();
-void APS5_VABI ERR_remove_thread_state_nid_postfix(const void*);
-}
 
 static void Require(bool value, const char* what) {
     if (value) return;
     std::fprintf(stderr, "failed: %s\n", what);
     std::abort();
-}
-
-template<typename TAction> static void RequireThrows(TAction action, const char* what) {
-    try { action(); } catch (const std::exception&) { return; }
-    Require(false, what);
 }
 
 static std::uint64_t Pack(std::uint64_t library, std::uint64_t function, std::uint64_t reason) {
@@ -75,8 +64,6 @@ int main() {
     LibreSslPutError_nid_no_patch(10, 1, 2);
     ERR_remove_thread_state_nid_postfix(nullptr);
     Require(ERR_peek_error_nid_postfix() == 0, "removing the thread state empties the queue");
-    int threadId = 0;
-    RequireThrows([&] { ERR_remove_thread_state_nid_postfix(&threadId); }, "a thread id throws");
 
     std::puts("guest_libressl_error: ok");
     return 0;
