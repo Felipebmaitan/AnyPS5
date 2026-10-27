@@ -147,6 +147,43 @@ static void NoAliases() {
     Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close alias probe pipe");
 }
 
+#ifdef _WIN32
+static void AppendOwnership(bool stream) {
+    auto* file = OpenTemporary();
+    const int original = NativeDescriptor(file);
+    const int descriptor = dup_nid_postfix(original);
+    Require(descriptor >= 0, "duplicate append ownership file");
+    const auto before = WindowsDescriptorHandle_nid_no_patch(descriptor);
+    std::atomic<bool> started{false};
+    std::atomic<bool> finished{false};
+    FileStream* converted = nullptr;
+    std::thread changer;
+    bool premature = false;
+    {
+        const GuestDescriptorAccess admission(original, GuestDescriptorAccess::Mode::Read);
+        const GuestDescriptorAccess aliasAdmission(descriptor, GuestDescriptorAccess::Mode::Read);
+        changer = std::thread([&] {
+            started.store(true);
+            if (stream) {
+                converted = fdopen_nid_postfix(descriptor, "a+");
+                Require(converted != nullptr, "append fdopen");
+            } else Require(fcntl_nid_postfix(original, 4, 8) == 0, "change append status");
+            finished.store(true);
+        });
+        Require(Observe([&] { return started.load(); }), "start append replacement");
+        premature = Observe([&] { return finished.load(); });
+        Require(WindowsDescriptorHandle_nid_no_patch(descriptor) == before, "append replaced an admitted handle");
+        Require(fcntl_nid_postfix(original, 3) >= 0, "append waiter held the status table lock");
+    }
+    Require(Observe([&] { return finished.load(); }), "append replacement did not resume");
+    changer.join();
+    Require(!premature, "append replacement bypassed read admission");
+    if (converted) Require(fclose_nid_postfix(converted) == 0, "close converted stream");
+    else Require(close_nid_postfix(descriptor) == 0, "close append alias");
+    Require(std::fclose(file) == 0, "close append file");
+}
+#endif
+
 static bool Registered(Pthread reader) {
     return Observe([&] {
         std::lock_guard lock(reader->cancelLock);
@@ -508,6 +545,8 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[1], "invalid_registry") == 0) InvalidRegistry();
 #endif
 #ifdef _WIN32
+    else if (std::strcmp(argv[1], "append_status") == 0) AppendOwnership(false);
+    else if (std::strcmp(argv[1], "append_stream") == 0) AppendOwnership(true);
     else if (std::strcmp(argv[1], "close_progress") == 0) CloseProgress();
     else if (std::strcmp(argv[1], "position_cancel") == 0) AccessCancellation(true);
     else if (std::strcmp(argv[1], "pipe_vectors") == 0) PipeVectors();

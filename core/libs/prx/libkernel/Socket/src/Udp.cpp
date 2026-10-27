@@ -783,7 +783,7 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
         nonblocking = nonblocking || socket.options.nonblocking;
         timeout = socket.options.receiveTimeout;
     }
-    if (cancellable && (length != 0 || socket.type != 1)) {
+    if (cancellable) {
         const bool waitAll = socket.type == 1 && (flags & GuestWaitAll) != 0 && !nonblocking;
         if (waitAll && (flags & GuestPeek) != 0) {
             WSASetLastError(WSAEOPNOTSUPP);

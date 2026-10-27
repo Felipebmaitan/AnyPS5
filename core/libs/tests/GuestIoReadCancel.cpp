@@ -32,6 +32,7 @@ struct State {
     bool partial = false;
     bool waitAll = false;
     bool dontWait = false;
+    bool zero = false;
     int error = 0;
     std::atomic<bool> ready{false};
     std::atomic<bool> release{false};
@@ -72,11 +73,11 @@ static void* APS5_VABI Reader(void* opaque) {
     __pthread_cleanup_push_imp_nid_postfix(Cleanup, &state, &cleanup);
     state.ready.store(true);
     if (state.pending) Require(Observe([&] { return state.release.load(); }), "release pending reader");
-    const std::size_t length = state.partial || state.waitAll ? state.buffer.size() : 1;
+    const std::size_t length = state.zero ? 0 : state.partial || state.waitAll ? state.buffer.size() : 1;
     KernelIovec vector{state.buffer.data(), length};
     GuestMsghdr message{};
     message.iov = &vector;
-    message.iovLength = 1;
+    message.iovLength = state.operation == "recvmsg_empty" ? 0 : 1;
     if (state.operation == "read") state.transferred = read_nid_postfix(state.input, state.buffer.data(), length);
     else if (state.operation == "alias") state.transferred = _read_nid_postfix(state.input, state.buffer.data(), length);
     else if (state.operation == "readv") state.transferred = readv_nid_postfix(state.input, &vector, 1);
@@ -85,14 +86,14 @@ static void* APS5_VABI Reader(void* opaque) {
     else if (state.operation == "preadv") state.transferred = preadv_nid_postfix(state.input, &vector, 1, 0);
     else if (state.operation == "recv") state.transferred = recv_nid_postfix(state.input, state.buffer.data(), length, state.waitAll ? 0x40 : state.dontWait ? 0x80 : 0);
     else if (state.operation == "recvfrom") state.transferred = recvfrom_nid_postfix(state.input, state.buffer.data(), length, state.waitAll ? 0x40 : state.dontWait ? 0x80 : 0, nullptr, nullptr);
-    else if (state.operation == "recvmsg") state.transferred = recvmsg_nid_postfix(state.input, &message, state.waitAll ? 0x40 : state.dontWait ? 0x80 : 0);
+    else if (state.operation.starts_with("recvmsg")) state.transferred = recvmsg_nid_postfix(state.input, &message, state.waitAll ? 0x40 : state.dontWait ? 0x80 : 0);
     else if (state.operation == "sce_read") state.transferred = sceKernelRead(state.input, state.buffer.data(), length);
     else if (state.operation == "sce_readv") state.transferred = sceKernelReadv(state.input, &vector, 1);
     else Require(false, "unknown read API");
     state.error = *__error_nid_postfix();
     state.returned.store(true);
     if (state.disabled || state.sce) {
-        Require(state.transferred == 1 && state.buffer[0] == 'x', "disabled read lost data");
+        Require(state.zero ? state.transferred == 0 : state.transferred == 1 && state.buffer[0] == 'x', "disabled read lost data");
         Require(scePthreadSetcancelstate(GUEST_CANCEL_ENABLE, nullptr) == 0, "enable cancellation");
         scePthreadTestcancel();
     }
@@ -120,13 +121,14 @@ static void Run(int argc, char** argv) {
     Require(argc == 4, "expected transport, API, and scenario");
     State state;
     state.operation = argv[2];
+    state.zero = state.operation == "recvmsg_empty" || state.operation == "recvmsg_zero";
     state.sce = state.operation == "sce_read" || state.operation == "sce_readv";
     const std::string scenario = argv[3];
     state.disabled = scenario == "disabled";
     state.pending = scenario == "pending";
     state.partial = scenario == "partial";
     state.waitAll = scenario == "waitall";
-    const bool completion = scenario == "complete" || scenario == "reuse_complete" || state.partial;
+    const bool completion = scenario == "complete" || scenario == "eof" || scenario == "reuse_complete" || state.partial;
     const bool reuse = scenario == "reuse" || scenario == "reuse_complete";
     const bool race = scenario == "race";
     const bool wouldBlock = scenario == "timeout" || scenario == "nonblocking" || scenario == "dontwait";
@@ -192,7 +194,8 @@ static void Run(int argc, char** argv) {
         requester.join();
         if (writer.joinable()) writer.join();
         state.release.store(true);
-    } else if (!wouldBlock) Require(write_nid_postfix(state.output, "x", 1) == 1, "complete read");
+    } else if (scenario == "eof") Require(shutdown_nid_postfix(state.output, 1) == 0, "complete zero receive at EOF");
+    else if (!wouldBlock) Require(write_nid_postfix(state.output, "x", 1) == 1, "complete read");
     Require(Observe([&] { return reader->_finished.load(); }), "reader did not exit");
     void* result = nullptr;
     Require(scePthreadJoin(reader, &result) == 0, "join reader");
@@ -202,7 +205,12 @@ static void Run(int argc, char** argv) {
     Require(result == (completion || partialCompletion || racingCompletion || wouldBlock ? reinterpret_cast<void*>(std::uintptr_t{7}) : GUEST_CANCELED), "wrong thread result");
     Require(state.returned.load() == (completion || partialCompletion || racingCompletion || wouldBlock || state.disabled || state.sce), "unexpected read return");
     if (partialCompletion) Require(state.transferred == 1 && state.buffer[0] == 'x', "interrupted WAITALL lost progress");
-    if (completion || racingCompletion) Require(state.transferred == 1 && state.buffer[0] == 'x', "completion lost data");
+    if (completion || racingCompletion) Require(state.zero ? state.transferred == 0 : state.transferred == 1 && state.buffer[0] == 'x', "completion lost data");
+    if (state.zero && (completion || state.disabled)) {
+        char byte = 0;
+        Require(read_nid_postfix(state.input, &byte, 1) == (scenario == "eof" ? 0 : 1), "zero receive consumed stream data");
+        if (scenario != "eof") Require(byte == 'x', "zero receive changed stream data");
+    }
     Require(state.cleanups.load() == 1 && state.destructors.load() == 1, "wrong cleanup or TSD count");
     Require(scePthreadKeyDelete(state.key) == 0, "delete TSD key");
     if (wouldBlock) Require(state.transferred == -1 && state.error == 35, "wrong would-block result");
