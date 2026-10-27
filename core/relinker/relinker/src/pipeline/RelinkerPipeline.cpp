@@ -30,6 +30,7 @@ constexpr std::uint16_t kEtSceDynamic = 0xfe18;
 const NidReference* FindPathconfImport(const std::vector<NidReference>& nidRefs) {
     const NidReference* candidate = nullptr;
     for (const auto& ref : nidRefs) {
+        if ((ref.RelocationTypeValue != R_X86_64_64 && ref.RelocationTypeValue != R_X86_64_GLOB_DAT && ref.RelocationTypeValue != R_X86_64_JUMP_SLOT) || ref.Addend != 0 || (ref.SymbolType != STT_NOTYPE && ref.SymbolType != STT_FUNC)) continue;
         if (!ref.Library.empty() && !ref.Library.starts_with("libkernel")) {
             continue;
         }

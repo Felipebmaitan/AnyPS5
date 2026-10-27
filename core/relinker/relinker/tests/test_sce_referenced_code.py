@@ -340,6 +340,36 @@ def main():
                     patch = output_bytes(data, system, address, 13)
                     assert patch[:2] == b"\xff\x25" and address + 6 + struct.unpack_from("<i", patch, 2)[0] == 0x2200, (name, patch.hex())
             for module in (False, True):
+                for mixed in (False, True):
+                    for reverse in ((False, True) if mixed else (False,)):
+                        image = routed_tail()
+                        struct.pack_into("<QQq", image, 0xA80, 0x2200, (1 << 32) | 1, 4)
+                        name = f"{system}-{module}-route-pointer-{mixed}-{reverse}"
+                        if mixed:
+                            struct.pack_into("<QQq", image, 0xA98, 0x2210, (1 << 32) | 6, 0)
+                            for at in range(0x600, 0x6A0, 16):
+                                if struct.unpack_from("<Q", image, at)[0] == 0x61000031:
+                                    struct.pack_into("<Q", image, at + 8, 48)
+                            if reverse:
+                                image[0xA80:0xAB0] = image[0xA98:0xAB0] + image[0xA80:0xA98]
+                            converted = convert(relinker, work, name, image, system, module=module)
+                            patch = output_bytes(converted.read_bytes(), system, 0x1050, 13)
+                            assert patch[:2] == b"\xff\x25" and 0x1056 + struct.unpack_from("<i", patch, 2)[0] == 0x2210, name
+                        else:
+                            convert(relinker, work, name, image, system, "missing libkernel pathconf import", module=module)
+                            converted = convert(relinker, work, name + "-trapped", image, system, module=module,
+                                                flags=("--trap-sdk-syscall-stubs",))
+                            assert output_bytes(converted.read_bytes(), system, 0x105A, 2) == b"\x0f\x0b", name
+                image = routed_tail()
+                struct.pack_into("<QQq", image, 0xA80, 0x2200, (1 << 32) | 1, 0)
+                converted = convert(relinker, work, f"{system}-{module}-route-absolute-pointer", image, system, module=module)
+                patch = output_bytes(converted.read_bytes(), system, 0x1050, 13)
+                assert patch[:2] == b"\xff\x25" and 0x1056 + struct.unpack_from("<i", patch, 2)[0] == 0x2200
+                if system == "linux" and not module:
+                    for relocation in (2, 10):
+                        image = routed_tail()
+                        struct.pack_into("<QQq", image, 0xA80, 0x2200, (1 << 32) | relocation, 0)
+                        convert(relinker, work, f"route-nonpointer-{relocation}", image, system, "missing libkernel pathconf import")
                 convert(relinker, work, f"{system}-{module}-route-padded-interior", padded_interior_route(), system,
                         "Syscall route would overwrite an interior reference", module=module)
                 for kind in ("branch", "symbol", "pointer", "lea32"):

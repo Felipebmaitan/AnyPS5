@@ -32,11 +32,12 @@ std::optional<Domain::VirtualAddress> FindGuestPathconfImportAddress(const Guest
         for (std::size_t position = 0; position < table->size(); position += 24) {
             const auto info = Io::ReadU64(*table, position + 8);
             const auto relType = static_cast<std::uint32_t>(info);
-            if (relType == 0) continue;
+            if ((relType != 1 && relType != 6 && relType != 7) || Io::ReadU64(*table, position + 16) != 0) continue;
             const auto symbolIndex = static_cast<std::size_t>(info >> 32);
             if (symbolIndex >= image.Symbols.size()) continue;
             const auto& symbol = image.Symbols[symbolIndex];
             if (symbol.Section != 0) continue;
+            if ((symbol.Info & 15) != 0 && (symbol.Info & 15) != 2) continue;
             if (!symbol.Library.empty() && !symbol.Library.starts_with("libkernel")) continue;
             std::string_view name = symbol.Name;
             const auto hashPos = name.find('#');
