@@ -1,7 +1,6 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libc/include/JumpBuffer.hpp"
-#include "prx/libc/include/GuestStacks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -35,13 +34,13 @@ struct IoRestart::State {
     };
     State* previous;
     std::uintptr_t stack;
-    GuestStacks::Bounds bounds;
+    std::uint32_t context;
     bool allowed;
     bool ready = false;
     std::vector<Descriptor> expected;
     State(State* previous, std::uintptr_t stack, bool allowed)
-        : previous(previous), stack(stack), bounds(GuestStacks::GuestStackBounds_nid_no_patch(stack)), allowed(allowed) {}
-    bool Abandoned(std::uintptr_t target) const { return bounds.Contains(target) && stack < target; }
+        : previous(previous), stack(stack), context(JumpBuffer::GuestContextCurrent_nid_no_patch()), allowed(allowed) {}
+    bool Abandoned(std::uintptr_t target, std::uint32_t targetContext) const { return context == targetContext && stack < target; }
 };
 
 namespace {
@@ -346,7 +345,7 @@ bool TrackIoDescriptor(int descriptor) {
     return true;
 }
 
-void RetireIoStack(std::uintptr_t stack) {
+void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
     std::uint64_t signals = 0;
     void (*callback)() = nullptr;
 #ifndef _WIN32
@@ -355,6 +354,8 @@ void RetireIoStack(std::uintptr_t stack) {
     {
         const SetupBlock blocked;
         const bool exiting = stack == std::numeric_limits<std::uintptr_t>::max();
+        const auto previousContext = JumpBuffer::GuestContextCurrent_nid_no_patch();
+        if (!exiting) JumpBuffer::GuestContextSet_nid_no_patch(context);
         auto* deliveryCursor = &delivering;
 #ifndef _WIN32
         const auto here = reinterpret_cast<std::uintptr_t>(&blocked);
@@ -363,14 +364,14 @@ void RetireIoStack(std::uintptr_t stack) {
         while (*deliveryCursor) {
             auto& delivery = **deliveryCursor;
 #ifndef _WIN32
-            if (!exiting && !savedCurrent && delivery.replay->bounds.Contains(here) && here < delivery.replay->stack) {
+            if (!exiting && !savedCurrent && delivery.replay->context == previousContext && here < delivery.replay->stack) {
                 delivery.suspendedMask = blocked.Previous();
                 delivery.suspended = true;
                 savedCurrent = true;
                 mask = delivery.deliveryMask;
             }
 #endif
-            if (!exiting && !delivery.replay->Abandoned(stack)) {
+            if (!exiting && !delivery.replay->Abandoned(stack, context)) {
                 deliveryCursor = &delivery.previousDelivery;
                 continue;
             }
@@ -384,7 +385,7 @@ void RetireIoStack(std::uintptr_t stack) {
 #ifndef _WIN32
         if (!exiting) {
             for (auto delivery = delivering; delivery; delivery = delivery->previousDelivery) {
-                if (delivery->suspended && delivery->replay->bounds.Contains(stack) && stack < delivery->replay->stack) {
+                if (delivery->suspended && delivery->replay->context == context && stack < delivery->replay->stack) {
                     mask = delivery->suspendedMask;
                     break;
                 }
@@ -393,7 +394,7 @@ void RetireIoStack(std::uintptr_t stack) {
 #endif
         auto** restartCursor = &restarts;
         while (*restartCursor) {
-            if (!exiting && !(*restartCursor)->Abandoned(stack)) {
+            if (!exiting && !(*restartCursor)->Abandoned(stack, context)) {
                 restartCursor = &(*restartCursor)->previous;
                 continue;
             }

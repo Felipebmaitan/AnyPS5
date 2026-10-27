@@ -61,7 +61,7 @@ bool DeferIoCallback(void (*callback)(), void (*retire)());
 void WakeIoDelivery(Pthread thread);
 bool TrackIoDescriptor(int descriptor);
 void IoNoRestart();
-void RetireIoStack(std::uintptr_t stack);
+void RetireIoStack(std::uintptr_t stack, std::uint32_t context = 0);
 
 class IoPoint {
 public:

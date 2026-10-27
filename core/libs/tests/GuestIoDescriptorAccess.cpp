@@ -191,6 +191,29 @@ static bool Registered(Pthread reader) {
     });
 }
 
+static void InvalidDuplicate() {
+    int pipe[2]{};
+    Require(pipe_nid_postfix(pipe) == 0, "create invalid duplicate pipe");
+    BlockedRead read{pipe[0]};
+    Pthread reader = nullptr;
+    Require(scePthreadCreate(&reader, nullptr, Reader, &read, nullptr) == 0, "start invalid duplicate reader");
+    Require(Registered(reader), "invalid duplicate reader did not block");
+    const int closed = dup_nid_postfix(pipe[1]);
+    Require(closed >= 0 && close_nid_postfix(closed) == 0, "create closed duplicate source");
+    std::atomic<bool> finished{false};
+    std::thread duplicator([&] {
+        Require(dup2_nid_postfix(closed, pipe[0]) == -1 && *__error_nid_postfix() == 9, "invalid duplicate result");
+        finished.store(true);
+    });
+    const bool prompt = Observe([&] { return finished.load(); });
+    Require(write_nid_postfix(pipe[1], "x", 1) == 1, "complete invalid duplicate reader");
+    duplicator.join();
+    Require(Observe([&] { return reader->_finished.load(); }), "invalid duplicate reader did not finish");
+    Require(scePthreadJoin(reader, nullptr) == 0, "join invalid duplicate reader");
+    Require(prompt && read.result == 1 && read.byte == 'x', "invalid source waited for target admission");
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close invalid duplicate pipe");
+}
+
 static void AccessCancellation(bool positionedWait = false) {
     int pipe[2]{};
     Require(pipe_nid_postfix(pipe) == 0, "create access probe pipe");
@@ -539,6 +562,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[1], "no_aliases") == 0) NoAliases();
     else if (std::strcmp(argv[1], "access_cancel") == 0) AccessCancellation();
     else if (std::strcmp(argv[1], "protected_close") == 0) ProtectedClose();
+    else if (std::strcmp(argv[1], "invalid_duplicate") == 0) InvalidDuplicate();
     else if (std::strcmp(argv[1], "stdio_close") == 0) StreamOrder(false);
     else if (std::strcmp(argv[1], "stdio_reopen") == 0) StreamOrder(true);
 #ifdef __linux__

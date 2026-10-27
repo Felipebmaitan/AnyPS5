@@ -12,10 +12,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <vector>
+#include <fstream>
 #include <thread>
 #ifndef _WIN32
 #include <csignal>
 #include <pthread.h>
+#include <unistd.h>
 #endif
 
 static void Require(bool condition, const char* message) {
@@ -37,6 +41,7 @@ static bool Observe(TPredicate predicate) {
 struct Fibre {
     UserUcontext context{};
     alignas(16) std::uint64_t jump[12]{};
+    alignas(16) std::uint64_t outer[12]{};
     std::unique_ptr<std::byte[]> stack;
     bool started = false;
     bool handled = false;
@@ -50,6 +55,9 @@ struct State {
     Fibre* active = nullptr;
     bool jumps = false;
     bool signalJumps = false;
+    bool manual = false;
+    bool leave = false;
+    bool signalLeave = false;
     bool exitHandler = false;
     std::atomic<int> phase{0};
     std::atomic<int> cleanups{0};
@@ -75,20 +83,29 @@ static void CheckMask(const sigset_t& before) {
 
 static void Switch(Fibre& from, Fibre& to) {
     if (!state->jumps) {
-        Require(swapcontext_nid_postfix(&from.context, &to.context) == 0, "swap I/O context");
+        const auto target = to.context;
+        Require(swapcontext_nid_postfix(&from.context, &target) == 0, "swap I/O context");
         return;
     }
     from.started = true;
     if (state->signalJumps) {
         if (sigsetjmp_nid_postfix(from.jump, 1) == 0) {
-            if (to.started) siglongjmp_nid_postfix(to.jump, 1);
+            if (to.started) {
+                alignas(16) std::uint64_t target[12];
+                std::memcpy(target, to.jump, sizeof(target));
+                siglongjmp_nid_postfix(target, 1);
+            }
             setcontext_nid_postfix(&to.context);
             Require(false, "signal context restore returned");
         }
         return;
     }
     if (setjmp_nid_postfix(from.jump) == 0) {
-        if (to.started) longjmp_nid_postfix(to.jump, 1);
+        if (to.started) {
+            alignas(16) std::uint64_t target[12];
+            std::memcpy(target, to.jump, sizeof(target));
+            longjmp_nid_postfix(target, 1);
+        }
         setcontext_nid_postfix(&to.context);
         Require(false, "context restore returned");
     }
@@ -107,13 +124,22 @@ static void APS5_VABI Handler(int, void*) {
     Require(close_nid_postfix(fibre.descriptors[0]) == 0, "close resumed fibre descriptor");
     fibre.descriptors[0] = -1;
     fibre.handled = true;
+    if (state->signalLeave) siglongjmp_nid_postfix(fibre.outer, 1);
+    if (state->leave) longjmp_nid_postfix(fibre.outer, 1);
 }
 
 static void APS5_VABI FibreBody() {
     auto& fibre = *state->active;
     char byte = 0;
-    const auto result = read_nid_postfix(fibre.descriptors[0], &byte, 1);
-    Require(result == -1 && *__error_nid_postfix() == 4 && fibre.handled, "suspended handler did not resume safely");
+    bool escaped = false;
+    if (state->leave) {
+        if (state->signalLeave) escaped = sigsetjmp_nid_postfix(fibre.outer, 1) != 0;
+        else escaped = setjmp_nid_postfix(fibre.outer) != 0;
+    }
+    if (!escaped) {
+        const auto result = read_nid_postfix(fibre.descriptors[0], &byte, 1);
+        Require(!state->leave && result == -1 && *__error_nid_postfix() == 4 && fibre.handled, "suspended handler did not resume safely");
+    }
     fibre.finished = true;
     Switch(fibre, state->dispatcher);
     Require(false, "completed fibre resumed");
@@ -130,7 +156,13 @@ static void* APS5_VABI Scheduler(void*) {
         Require(getcontext_nid_postfix(&fibre.context) == 0, "capture fibre template");
         fibre.context.stackPointer = fibre.stack.get();
         fibre.context.stackSize = StackBytes;
-        makecontext_nid_postfix(&fibre.context, FibreBody, 0);
+        if (state->manual) {
+            auto& machine = fibre.context.mcontext;
+            machine.rsp = ((reinterpret_cast<std::uintptr_t>(fibre.stack.get()) + StackBytes) & ~std::uintptr_t{15}) - 8;
+            *reinterpret_cast<std::uint64_t*>(machine.rsp) = 0;
+            machine.rip = reinterpret_cast<std::uintptr_t>(FibreBody);
+            machine.rbp = 0;
+        } else makecontext_nid_postfix(&fibre.context, FibreBody, 0);
         state->active = &fibre;
         state->phase.store(++index);
         Switch(state->dispatcher, fibre);
@@ -158,10 +190,42 @@ static void APS5_VABI Destroy(void*) {
     state->destructors.fetch_add(1);
 }
 
+#ifdef __linux__
+static std::size_t ResidentBytes() {
+    std::ifstream memory("/proc/self/statm");
+    std::size_t mapped = 0;
+    std::size_t resident = 0;
+    Require(static_cast<bool>(memory >> mapped >> resident), "read context resident memory");
+    return resident * static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+}
+
+static void ContextChurn() {
+    constexpr std::size_t StackBytes = 2048;
+    constexpr std::size_t Count = 32768;
+    std::vector<std::byte> stacks(StackBytes * Count);
+    auto* volatileBytes = reinterpret_cast<volatile std::byte*>(stacks.data());
+    for (std::size_t offset = 0; offset < stacks.size(); offset += 1024) volatileBytes[offset] = std::byte{1};
+    UserUcontext original{};
+    Require(getcontext_nid_postfix(&original) == 0, "capture churn template");
+    const auto before = ResidentBytes();
+    for (std::size_t index = 0; index < Count; ++index) {
+        auto context = original;
+        context.stackPointer = stacks.data() + StackBytes * index;
+        context.stackSize = StackBytes;
+        makecontext_nid_postfix(&context, FibreBody, 0);
+        Require(context.mcontext.len == sizeof(UserMcontext), "create churn context");
+    }
+    Require(ResidentBytes() <= before + 1024 * 1024, "context creation retains stack registry metadata");
+}
+#endif
+
 int main(int argc, char** argv) {
     Require(argc == 2, "expected adopted, adopted_exit, swap, jump or sigjump");
     State reading;
     state = &reading;
+#ifdef __linux__
+    if (std::strcmp(argv[1], "churn") == 0) { ContextChurn(); return 0; }
+#endif
     reading.exitHandler = std::strcmp(argv[1], "adopted_exit") == 0;
     if (reading.exitHandler || std::strcmp(argv[1], "adopted") == 0) {
         if (reading.exitHandler) Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(Handler)) == 0, "install adopted exit handler");
@@ -193,8 +257,12 @@ int main(int argc, char** argv) {
         if (reading.exitHandler) Require(sceKernelRemoveExceptionHandler(30) == 0, "remove adopted exit handler");
         return 0;
     }
-    reading.signalJumps = std::strcmp(argv[1], "sigjump") == 0;
-    reading.jumps = reading.signalJumps || std::strcmp(argv[1], "jump") == 0;
+    const std::string scenario = argv[1];
+    reading.manual = scenario.starts_with("manual_");
+    reading.leave = scenario.ends_with("leave");
+    reading.signalLeave = scenario.ends_with("sigleave");
+    reading.signalJumps = scenario.ends_with("sigjump");
+    reading.jumps = scenario.ends_with("jump");
     for (auto& fibre : reading.fibres) Require(pipe_nid_postfix(fibre.descriptors) == 0, "create fibre pipe");
     Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(Handler)) == 0, "install fibre handler");
     Pthread worker = nullptr;

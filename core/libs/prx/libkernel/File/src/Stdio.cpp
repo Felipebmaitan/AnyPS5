@@ -940,6 +940,15 @@ int APS5_VABI dup_nid_postfix(int d) {
 
 int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (from < 0 || to < 0) return PosixFailure(GUEST_EBADF);
+    {
+        const GuestDescriptorAccess validation(from, GuestDescriptorAccess::Mode::Read);
+        const bool socket = GuestSockets::IsOpen(from);
+        if (socket && from != to && to <= 2)
+            throw std::runtime_error(std::string(__func__) + ": moving a guest socket onto standard descriptor " + std::to_string(to) + " is not supported");
+        if (!socket && from != to && IsKqueueDescriptor(from))
+            throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
+        if (!socket && !DescriptorIsOpen_nid_no_patch(from)) return PosixFailure(GUEST_EBADF);
+    }
     GuestDescriptorAccess source(from, GuestDescriptorAccess::Mode::Read, std::defer_lock);
     GuestDescriptorAccess target(to, GuestDescriptorAccess::Mode::Change, std::defer_lock);
     if (from == to) source.Lock();
