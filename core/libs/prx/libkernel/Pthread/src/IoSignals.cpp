@@ -1,6 +1,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libc/include/JumpBuffer.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -97,8 +98,11 @@ struct SignalState {
 
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 constinit thread_local SignalState* current = nullptr;
-thread_local std::shared_ptr<SignalState> owner;
-thread_local std::shared_ptr<SignalState> delivering;
+struct SignalOwnership {
+    std::shared_ptr<SignalState> owner;
+    std::shared_ptr<SignalState> delivering;
+};
+SignalOwnership& Ownership() { return HostThreadLocal<SignalOwnership, SignalOwnership>(); }
 constinit thread_local IoRestart::State* restarts = nullptr;
 constinit thread_local unsigned depth = 0;
 
@@ -240,6 +244,7 @@ void BeginIoSignals(Pthread thread, IoRestart& restart, std::optional<TimedWait:
         return;
     }
     const SetupBlock blocked;
+    auto& ownership = Ownership();
     auto& manager = Manager();
     auto state = std::make_shared<SignalState>();
     state->manager = &manager;
@@ -251,8 +256,8 @@ void BeginIoSignals(Pthread thread, IoRestart& restart, std::optional<TimedWait:
         std::lock_guard lock(manager.mutex);
         manager.entries.push_back(state);
     }
-    owner = std::move(state);
-    current = owner.get();
+    ownership.owner = std::move(state);
+    current = ownership.owner.get();
     depth = 1;
 #ifdef _WIN32
     TimedWait::DeliverDeferred();
@@ -266,7 +271,7 @@ void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
     bool pending;
     {
         const SetupBlock blocked;
-        auto finishing = std::move(owner);
+        auto finishing = std::move(Ownership().owner);
         state = finishing.get();
 #ifndef _WIN32
         state->deliveryMask = blocked.Previous();
@@ -281,8 +286,8 @@ void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
         }
         current = nullptr;
         pending = state->Pending();
-        state->previousDelivery = std::move(delivering);
-        delivering = std::move(finishing);
+        state->previousDelivery = std::move(Ownership().delivering);
+        Ownership().delivering = std::move(finishing);
         deferral.reset();
     }
     for (int signal = 1; signal < 64; ++signal)
@@ -297,7 +302,7 @@ void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
         state->replay->ready = pending && state->restart.load() && state->replay->allowed && !state->descriptors.empty() && unchanged;
         if (state->replay->ready) state->replay->expected = std::move(state->descriptors);
         else state->replay->expected.clear();
-        auto* cursor = &delivering;
+        auto* cursor = &Ownership().delivering;
         while (*cursor && cursor->get() != state) cursor = &(*cursor)->previousDelivery;
         if (*cursor) *cursor = std::move(state->previousDelivery);
     }
@@ -355,9 +360,19 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
     {
         const SetupBlock blocked;
         const bool exiting = stack == std::numeric_limits<std::uintptr_t>::max();
+        if (!current && !restarts) {
+            if (!exiting) JumpBuffer::GuestContextSet_nid_no_patch(context);
+            return;
+        }
         const auto previousContext = JumpBuffer::GuestContextCurrent_nid_no_patch();
         if (!exiting) JumpBuffer::GuestContextSet_nid_no_patch(context);
-        auto* deliveryCursor = &delivering;
+#ifdef _WIN32
+        auto* ownership = FindHostThreadLocal<SignalOwnership, SignalOwnership>();
+#else
+        auto* ownership = &Ownership();
+#endif
+        std::shared_ptr<SignalState> noDelivery;
+        auto* deliveryCursor = ownership ? &ownership->delivering : &noDelivery;
 #ifndef _WIN32
         const auto here = reinterpret_cast<std::uintptr_t>(&blocked);
         bool savedCurrent = false;
@@ -385,7 +400,7 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
         }
 #ifndef _WIN32
         if (!exiting) {
-            for (auto delivery = delivering; delivery; delivery = delivery->previousDelivery) {
+            for (auto delivery = ownership->delivering; delivery; delivery = delivery->previousDelivery) {
                 if (delivery->suspended && delivery->replay->context == context && stack < delivery->replay->stack) {
                     mask = delivery->suspendedMask;
                     break;

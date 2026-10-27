@@ -35,6 +35,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/NativeIo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/IoSignals.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/GuestTlsMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
@@ -242,6 +243,23 @@ if(BUILD_TESTING)
         add_test(NAME guest_io_descriptor_borrowed_posix_close COMMAND guest_io_descriptor_access_tests borrowed_posix_close)
         set_tests_properties(guest_io_descriptor_borrowed_posix_close PROPERTIES TIMEOUT 15)
         set_tests_properties(guest_io_descriptor_record_locks guest_io_descriptor_borrowed_net_close PROPERTIES TIMEOUT 15)
+    endif()
+    add_test_executable(guest_io_native_threads_tests ${LIBS_INCLUDE_DIR}/tests/GuestIoNativeThreads.cpp)
+    target_include_directories(guest_io_native_threads_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_io_native_threads_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_io_native_threads_tests)
+    add_test(NAME guest_io_native_threads COMMAND guest_io_native_threads_tests)
+    set_tests_properties(guest_io_native_threads PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        add_test(NAME guest_io_restart_only_retirement COMMAND guest_io_native_threads_tests retire_restart)
+        add_test(NAME guest_io_empty_retirement COMMAND guest_io_native_threads_tests retire_empty)
+        add_test(NAME guest_io_empty_guest_return COMMAND guest_io_native_threads_tests return_empty)
+        add_test(NAME guest_io_empty_guest_exit COMMAND guest_io_native_threads_tests exit_empty)
+        set_tests_properties(guest_io_restart_only_retirement guest_io_empty_retirement guest_io_empty_guest_return guest_io_empty_guest_exit PROPERTIES TIMEOUT 20
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    if(WIN32)
+        set_tests_properties(guest_io_native_threads PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_io_read_cancel_tests ${LIBS_INCLUDE_DIR}/tests/GuestIoReadCancel.cpp)
     target_include_directories(guest_io_read_cancel_tests PRIVATE ${LIBS_INCLUDE_DIR})
