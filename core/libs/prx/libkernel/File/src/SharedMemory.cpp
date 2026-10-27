@@ -5,6 +5,7 @@
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libc/include/CreationMask.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 
 #include <cerrno>
 #include <algorithm>
@@ -129,7 +130,13 @@ public:
     HostShmLock() {
 #ifdef __linux__
         descriptor = ::open("/dev/shm", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (descriptor < 0 || ::flock(descriptor, LOCK_EX) != 0) error = errno;
+        try {
+            if (descriptor < 0 || ThreadCancel::Native([&] { return ::flock(descriptor, LOCK_EX); }) != 0) error = errno;
+        } catch (...) {
+            if (descriptor >= 0) ::close(descriptor);
+            descriptor = -1;
+            throw;
+        }
 #endif
     }
 
@@ -227,6 +234,7 @@ int WindowsNamedError(DWORD error) {
     switch (error) {
     case ERROR_FILE_NOT_FOUND:
     case ERROR_PATH_NOT_FOUND: return ENOENT;
+    case ERROR_OPERATION_ABORTED: return EINTR;
     case ERROR_ACCESS_DENIED:
     case ERROR_SHARING_VIOLATION: return EACCES;
     case ERROR_FILE_EXISTS:
@@ -363,9 +371,27 @@ private:
         }
         handle = ::CreateMutexW(nullptr, FALSE, lockName.c_str());
         if (handle == nullptr) { error = ::GetLastError(); return; }
-        const DWORD result = ::WaitForSingleObject(handle, INFINITE);
-        if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) locked = true;
-        else error = result == WAIT_FAILED ? ::GetLastError() : ERROR_GEN_FAILURE;
+        try { Wait(); }
+        catch (...) { ::CloseHandle(handle); handle = nullptr; throw; }
+    }
+    void Wait() {
+        if (!ThreadCancel::IoActive()) {
+            const DWORD result = ::WaitForSingleObject(handle, INFINITE);
+            if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) locked = true;
+            else error = result == WAIT_FAILED ? ::GetLastError() : ERROR_GEN_FAILURE;
+            return;
+        }
+        const std::unique_ptr<void, decltype(&::CloseHandle)> interrupted(::CreateEventW(nullptr, TRUE, FALSE, nullptr), &::CloseHandle);
+        if (!interrupted) { error = ::GetLastError(); return; }
+        ThreadCancel::IoWait wait([](void* event) noexcept { ::SetEvent(event); }, interrupted.get());
+        if (ThreadCancel::IoInterrupted()) { error = ERROR_OPERATION_ABORTED; return; }
+        const HANDLE handles[]{interrupted.get(), handle};
+        const DWORD result = ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        if (result == WAIT_OBJECT_0) { error = ERROR_OPERATION_ABORTED; return; }
+        if (result == WAIT_OBJECT_0 + 1 || result == WAIT_ABANDONED_0 + 1) {
+            locked = true;
+            if (ThreadCancel::IoInterrupted()) { ::ReleaseMutex(handle); locked = false; error = ERROR_OPERATION_ABORTED; }
+        } else error = result == WAIT_FAILED ? ::GetLastError() : ERROR_GEN_FAILURE;
     }
     HANDLE handle = nullptr;
     DWORD error = ERROR_SUCCESS;
@@ -831,9 +857,9 @@ std::int64_t WriteSharedMemory_nid_no_patch(int descriptor, const void* buffer, 
     if (position >= status.st_size) return 0;
     const auto count = std::min<std::uint64_t>(size, static_cast<std::uint64_t>(status.st_size - position));
 #ifdef _WIN32
-    const auto result = ::_write(fd, buffer, static_cast<unsigned int>(std::min<std::uint64_t>(count, std::numeric_limits<unsigned int>::max())));
+    const auto result = File::IoWriteNative(fd, buffer, static_cast<std::size_t>(std::min<std::uint64_t>(count, std::numeric_limits<unsigned int>::max())));
 #else
-    const auto result = ::write(fd, buffer, static_cast<std::size_t>(count));
+    const auto result = ThreadCancel::Native([&] { return ::write(fd, buffer, static_cast<std::size_t>(count)); });
 #endif
     return static_cast<std::int64_t>(result);
 }
@@ -864,13 +890,13 @@ std::int64_t PwriteSharedMemory_nid_no_patch(int descriptor, const void* buffer,
     overlapped.Offset = static_cast<DWORD>(offset);
     overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(offset) >> 32u);
     DWORD written = 0;
-    const BOOL succeeded = ::WriteFile(handle, buffer, static_cast<DWORD>(std::min<std::uint64_t>(count, std::numeric_limits<DWORD>::max())), &written, &overlapped);
+    const BOOL succeeded = ThreadCancel::Native([&] { return ::WriteFile(handle, buffer, static_cast<DWORD>(std::min<std::uint64_t>(count, std::numeric_limits<DWORD>::max())), &written, &overlapped) ? 0 : -1; }) == 0;
     const DWORD writeError = succeeded ? ERROR_SUCCESS : ::GetLastError();
     if (!::SetFilePointerEx(handle, previous, nullptr, FILE_BEGIN)) throw std::runtime_error("pwrite: restoring the host file position failed");
-    if (!succeeded) { errno = writeError == ERROR_ACCESS_DENIED ? EBADF : EIO; return -1; }
+    if (!succeeded) { if (written != 0) return written; errno = writeError == ERROR_OPERATION_ABORTED ? EINTR : writeError == ERROR_ACCESS_DENIED ? EBADF : EIO; return -1; }
     const auto result = written;
 #else
-    const auto result = ::pwrite(fd, buffer, static_cast<std::size_t>(count), static_cast<off_t>(offset));
+    const auto result = ThreadCancel::Native([&] { return ::pwrite(fd, buffer, static_cast<std::size_t>(count), static_cast<off_t>(offset)); });
 #endif
     return static_cast<std::int64_t>(result);
 }
@@ -949,8 +975,10 @@ static std::int64_t TransferSharedMemoryVectors(int descriptor, const struct iov
         available -= length;
     }
     if (bounded.empty()) return 0;
-    return positioned ? ::pwritev(fd, bounded.data(), static_cast<int>(bounded.size()), static_cast<off_t>(offset))
-                      : ::writev(fd, bounded.data(), static_cast<int>(bounded.size()));
+    return ThreadCancel::Native([&] {
+        return positioned ? ::pwritev(fd, bounded.data(), static_cast<int>(bounded.size()), static_cast<off_t>(offset))
+                          : ::writev(fd, bounded.data(), static_cast<int>(bounded.size()));
+    });
 }
 
 std::int64_t WritevSharedMemory_nid_no_patch(int descriptor, const struct iovec* vectors, int count) {
