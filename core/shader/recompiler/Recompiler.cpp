@@ -1912,8 +1912,10 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
     auto& other = capture.readTrace.otherReads;
-    std::sort(other.begin(), other.end());
-    other.erase(std::unique(other.begin(), other.end()), other.end());
+    if (other.size() > 1) {
+        std::sort(other.begin(), other.end());
+        other.erase(std::unique(other.begin(), other.end()), other.end());
+    }
 }
 
 }
