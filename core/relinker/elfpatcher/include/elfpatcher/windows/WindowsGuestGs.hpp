@@ -7,7 +7,7 @@ namespace Elfpatcher::Windows {
 
 class WindowsGuestGs {
 public:
-    static void Append(PeSection& section, std::uint32_t rva, const std::uint8_t* bytes, const Codegen::DecodedInstructionInfo& info);
+    static bool TryAppend(PeSection& section, std::uint32_t rva, const std::uint8_t* bytes, const Codegen::DecodedInstructionInfo& info);
 };
 
 }

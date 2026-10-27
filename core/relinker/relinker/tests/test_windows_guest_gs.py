@@ -21,13 +21,16 @@ def program(instruction, setup=b""):
             + bytes.fromhex("48 8b 54 24 80 48 89 57 28 48 8b 54 24 f8 48 89 57 30 9c 5a 48 89 57 10 48 89 5f 18 48 89 77 20 f3 0f 7f 47 38 f3 44 0f 7f 47 48 5e 5b fc c3"))
 
 
-def fixture(body):
+def fixture(body, extra_entry=None):
     image = make_image()
     image[0x200:0x300] = b"\x90" * 0x100
     image[0x210:0x210 + len(body)] = body
     struct.pack_into("<Q", image, 24, 0x210)
     struct.pack_into("<I", image, 176, 0)
-    struct.pack_into("<qQ", image, 0x400 + 4 * 16, 0, 0)
+    if extra_entry is None:
+        struct.pack_into("<qQ", image, 0x400 + 4 * 16, 0, 0)
+    else:
+        struct.pack_into("<q", image, 0x710, extra_entry)
     return image
 
 
@@ -144,10 +147,20 @@ def main():
         assert converted.returncode == 0, converted
         assert pe_bytes_at(output.read_bytes(), 0x10215, 5) == image[0x215:0x21a]
         output.unlink()
-        for encoding in ("65 48 8b 00", "65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 6e 00", "65 c5 f9 6e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
-            source.write_bytes(fixture(bytes.fromhex(encoding) + b"\xc3"))
+        for encoding in ("65 48 8b 00", "65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 6e 00", "65 c5 f9 6e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "65 66 0f f7 c1", "65 0f 01 c8", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
+            instruction = bytes.fromhex(encoding)
+            source.write_bytes(fixture(instruction + b"\xc3"))
             converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
-            assert converted.returncode == 2 and "Unsupported Windows guest GS" in converted.stderr and not output.exists(), (encoding, converted)
+            assert converted.returncode == 0, (encoding, converted)
+            patched = pe_bytes_at(output.read_bytes(), 0x10210, len(instruction) + 1)
+            assert patched == b"\x0f\x0b" + b"\x90" * (len(instruction) - 2) + b"\xc3", (encoding, patched.hex())
+            image = fixture(bytes((0xeb, len(instruction))) + instruction + program(bytes.fromhex("65 48 8b 04 25 00 00 00 00")), extra_entry=0x212)
+            source.write_bytes(image)
+            converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
+            assert converted.returncode == 0, (encoding, converted)
+            assert pe_bytes_at(output.read_bytes(), 0x10212, len(instruction)) == patched[:-1], encoding
+            run = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210"], capture_output=True, text=True, timeout=10)
+            assert run.returncode == 0 and int(run.stdout.split()[0], 16) == INITIAL, (encoding, run)
         if args.digest:
             import json
             args.digest.write_text(json.dumps(digest))

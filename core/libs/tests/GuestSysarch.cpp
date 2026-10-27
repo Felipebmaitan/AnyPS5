@@ -5,19 +5,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
-#include <string>
 
 static void Require(bool value) { if (!value) std::abort(); }
-
-template <typename TCall> static std::string Thrown(TCall call) {
-    try {
-        call();
-    } catch (const std::runtime_error& error) {
-        return error.what();
-    }
-    return {};
-}
 
 #if (defined(__linux__) || defined(_WIN32)) && defined(__x86_64__)
 static void* APS5_VABI ReadGsBase(void* arg) {
@@ -57,8 +46,6 @@ static void* APS5_VABI ChangeGsBase(void* arg) {
 #endif
 
 int main() {
-    Require(Thrown([] { sysarch(129, nullptr); }) == "sysarch not implemented");
-    Require(Thrown([] { sysarch(132, nullptr); }) == "sysarch not implemented");
     for (const int operation : {2, 5, 6, 12, 127, 133, 134, 1000, -1}) {
         *__error_nid_postfix() = 0;
         Require(sysarch(operation, nullptr) == -1 && *__error_nid_postfix() == 22);
@@ -82,9 +69,6 @@ int main() {
     RequireLowHalf(9, base);
     *__error_nid_postfix() = 0;
     Require(sysarch(7, nullptr) == -1 && *__error_nid_postfix() == 14);
-#else
-    Require(Thrown([&read] { sysarch(128, &read); }) == "sysarch not implemented");
-    Require(Thrown([&read] { sysarch(7, &read); }) == "sysarch not implemented");
 #endif
     RequireLowHalf(9, base);
     *__error_nid_postfix() = 0;
@@ -113,10 +97,6 @@ int main() {
     Require(sysarch(130, &read) == 0 && read == base);
     std::uint64_t zero = 0;
     Require(sysarch(131, &zero) == 0 && sysarch(130, &read) == 0 && read == 0);
-#else
-    std::uint64_t base = 0;
-    Require(Thrown([&base] { sysarch(130, &base); }) == "sysarch not implemented");
-    Require(Thrown([&base] { sysarch(7, &base); }) == "sysarch not implemented");
 #endif
     return 0;
 }

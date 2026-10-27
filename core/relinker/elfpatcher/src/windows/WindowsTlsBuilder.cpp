@@ -47,6 +47,7 @@ struct GsTrap {
     std::uint32_t Rva;
     std::size_t Length;
     std::optional<Domain::FileByteOffset> Entry;
+    std::optional<std::uint32_t> Replay;
 };
 
 bool isAluReadOpcode(std::uint8_t opcode) {
@@ -98,17 +99,22 @@ void patchAccess(std::vector<PeSection>& sections, const TlsAccess& access, cons
     throw Domain::RelinkerException("TLS instruction is outside the PE image", access.Rva);
 }
 
-void patchGsJump(std::vector<PeSection>& sections, const std::uint32_t rva, const std::size_t length, const std::uint32_t target) {
+void patchGsInstruction(std::vector<PeSection>& sections, const std::uint32_t rva, const std::size_t length, const std::optional<std::uint32_t> target) {
     for (auto& section : sections) {
         if (rva < section.Rva || rva - section.Rva >= section.Data.size())
             continue;
         const auto offset = rva - section.Rva;
         if (length > section.Data.size() - offset)
             throw Domain::RelinkerException("Guest GS instruction crosses a PE section boundary", rva);
-        WindowsStubEmitter jump(rva);
-        jump.Rip({0xe9}, target);
-        const auto bytes = jump.TakeBytes();
-        std::copy(bytes.begin(), bytes.end(), section.Data.begin() + offset);
+        if (target) {
+            WindowsStubEmitter jump(rva);
+            jump.Rip({0xe9}, *target);
+            const auto bytes = jump.TakeBytes();
+            std::copy(bytes.begin(), bytes.end(), section.Data.begin() + offset);
+        } else {
+            std::fill_n(section.Data.begin() + offset, length, 0x90);
+            std::copy(std::begin(kStubOpUd2), std::end(kStubOpUd2), section.Data.begin() + offset);
+        }
         return;
     }
     throw Domain::RelinkerException("Guest GS instruction is outside the PE image", rva);
@@ -163,14 +169,15 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
             const bool gsStack = info.IsTwoByteOpcode && (info.Opcode == 0xa8 || info.Opcode == 0xa9);
             const bool gsBaseRegister = info.IsTwoByteOpcode && info.Opcode == 0xae && info.HasModRm && (info.ModRmByte >> 6) == 3 &&
                 (info.ModRmRegField == 1 || info.ModRmRegField == 3) && std::find(bytes, bytes + info.OpcodeOffset, 0xf3) != bytes + info.OpcodeOffset;
-            if (gsSelector || gsStack || gsBaseRegister)
-                throw Domain::RelinkerException("Unsupported Windows guest GS state instruction", header.Offset + offset);
-            if (info.SegmentPrefix == 0x65 && !insidePrevious) {
-                if (info.HasMemoryOperand) {
+            const bool gsState = gsSelector || gsStack || gsBaseRegister;
+            if ((info.SegmentPrefix == 0x65 || gsState) && !insidePrevious) {
+                if (info.HasMemoryOperand || gsState) {
                     image.RequireNoRelocation(*instruction, info.Length);
                     const auto entry = entryRoots.upper_bound(*instruction);
-                    WindowsGuestGs::Append(gsSection, rva, bytes, info);
-                    gsTraps.push_back({rva, info.Length, entry != entryRoots.end() && *entry - *instruction < kJumpSize ? std::optional<Domain::FileByteOffset>(header.Offset + *entry - header.MappedAddress) : std::nullopt});
+                    const auto replay = !gsState && WindowsGuestGs::TryAppend(gsSection, rva, bytes, info) ?
+                        std::optional<std::uint32_t>(CheckedRva(static_cast<std::uint64_t>(gsSection.Rva) + gsSection.Data.size() - 64 + 24)) : std::nullopt;
+                    const auto patchLength = replay ? kJumpSize : info.Length;
+                    gsTraps.push_back({rva, info.Length, entry != entryRoots.end() && *entry - *instruction < patchLength ? std::optional<Domain::FileByteOffset>(header.Offset + *entry - header.MappedAddress) : std::nullopt, replay});
                 }
                 continue;
             }
@@ -243,15 +250,13 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
     report(9000);
     std::sort(branchTargets.begin(), branchTargets.end());
     branchTargets.erase(std::unique(branchTargets.begin(), branchTargets.end()), branchTargets.end());
-    std::size_t gsIndex = 0;
-    for (const auto& [rva, length, entry] : gsTraps) {
+    for (const auto& [rva, length, entry, replay] : gsTraps) {
         const auto target = std::upper_bound(branchTargets.begin(), branchTargets.end(), rva);
-        if (target != branchTargets.end() && *target < rva + 5)
+        if (target != branchTargets.end() && *target < rva + (replay ? kJumpSize : length))
             throw Domain::RelinkerException("Branch enters a guest GS instruction", *target);
         if (entry)
             throw Domain::RelinkerException("GS trap would overwrite an executable entry point", *entry);
-        patchGsJump(sections, rva, length, CheckedRva(static_cast<std::uint64_t>(gsSection.Rva) + 16 + gsIndex * 64 + 24));
-        ++gsIndex;
+        patchGsInstruction(sections, rva, length, replay);
     }
     if (!gsSection.Data.empty()) {
         nextRva = AlignRva(static_cast<std::uint64_t>(nextRva) + gsSection.Data.size());
