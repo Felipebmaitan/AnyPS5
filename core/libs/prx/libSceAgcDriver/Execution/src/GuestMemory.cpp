@@ -2659,11 +2659,12 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 #ifdef ANYPS5_ENABLE_ASAN
 [[gnu::no_sanitize("address")]] void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
+    using UnalignedWord [[gnu::aligned(1), gnu::may_alias]] = std::uint64_t;
     auto* to = static_cast<unsigned char*>(destination);
     const auto* from = static_cast<const unsigned char*>(source);
     std::size_t index = 0;
     for (; index + sizeof(std::uint64_t) <= bytes; index += sizeof(std::uint64_t)) {
-        const std::uint64_t word = *reinterpret_cast<const volatile std::uint64_t*>(from + index);
+        const std::uint64_t word = *reinterpret_cast<const volatile UnalignedWord*>(from + index);
         std::memcpy(to + index, &word, sizeof(word));
     }
     for (; index < bytes; ++index) to[index] = static_cast<const volatile unsigned char*>(from)[index];
