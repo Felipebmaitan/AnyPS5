@@ -18,7 +18,7 @@ def gs_image(root, instruction):
     image = make_image("relative" if root == "trap-tail" else root)
     image[0x210:0x21a] = instruction
     if root == "trap-tail":
-        struct.pack_into("<q", image, 0x728, 0x218)
+        struct.pack_into("<q", image, 0x728, 0x215)
     return image
 
 
@@ -55,7 +55,7 @@ def main():
         result, output = convert("trap-tail", GS_VECTOR_AND_RETURN)
         assert result.returncode == 2 and not output.exists(), result
         assert "GS trap would overwrite an executable entry point" in result.stderr, result.stderr
-        assert "(offset 0x218)" in result.stderr, result.stderr
+        assert "(offset 0x215)" in result.stderr, result.stderr
 
     print("Windows GS trap entry-point tests passed")
 
