@@ -1089,9 +1089,10 @@ int APS5_VABI _open_nid_postfix(const char* path, int flags, ...) {
 
 int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t offset) {
     return ThreadCancel::Io([&]() -> std::int64_t {
+        if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
+        if (ExceedsTransferLimit(nbytes)) return PosixFailure(GUEST_EINVAL);
+        if (IsKqueueDescriptor(d)) return PosixFailure(GUEST_ESPIPE);
         return File::WithIoDescriptor(d, [&](int d) -> std::int64_t {
-            if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
-            if (ExceedsTransferLimit(nbytes)) return PosixFailure(GUEST_EINVAL);
             if (const int error = PositionedArgumentError(d, false, buf == nullptr && nbytes != 0, offset)) return PosixFailure(error);
             if (FailPosixPositionedGuestSocket(d)) return -1;
             const GuestArena::HostWrite destination(buf, nbytes);
@@ -1652,8 +1653,12 @@ int64_t APS5_VABI sceKernelPwritev(int d, const KernelIovec* guestIov, int iovcn
 
 int64_t APS5_VABI preadv_nid_postfix(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
     return ThreadCancel::Io([&]() -> std::int64_t {
+        if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
+        std::vector<KernelIovec> vectors;
+        if (const int error = CopyIovecs(iov, iovcnt, vectors)) return PosixFailure(error & 0xffff);
+        if (IsKqueueDescriptor(d)) return PosixFailure(GUEST_ESPIPE);
         return File::WithIoDescriptor(d, [&](int d) -> std::int64_t {
-            const auto result = sceKernelPreadv(d, iov, iovcnt, offset);
+            const auto result = sceKernelPreadv(d, vectors.data(), iovcnt, offset);
             return result < 0 ? PosixFailure(static_cast<int>(result) & 0xffff) : result;
         });
     });
@@ -1833,8 +1838,11 @@ int APS5_VABI fdatasync_nid_postfix(int fd) {
 
 int64_t APS5_VABI readv_nid_postfix(int d, const KernelIovec* iov, int iovcnt) {
     return ThreadCancel::Io([&]() -> std::int64_t {
+        if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
+        std::vector<KernelIovec> vectors;
+        if (const int error = CopyIovecs(iov, iovcnt, vectors)) return PosixFailure(error & 0xffff);
         return File::WithIoDescriptor(d, [&](int d) -> std::int64_t {
-            const auto result = sceKernelReadv(d, iov, iovcnt);
+            const auto result = sceKernelReadv(d, vectors.data(), iovcnt);
             return result < 0 ? PosixFailure(static_cast<int>(result) & 0xffff) : result;
         });
     });

@@ -58,10 +58,18 @@ struct NativeIo::State {
         if (const int error = pthread_sigmask(SIG_UNBLOCK, &signal, &previous); error != 0)
             throw std::system_error(error, std::generic_category(), "cancellable I/O: unblocking interrupt signal");
 #endif
-        wait.emplace(Interrupt, this);
+        try {
+            wait.emplace(Interrupt, this);
+        } catch (...) {
+            release();
+            throw;
+        }
     }
 
-    ~State() {
+    ~State() { release(); }
+
+private:
+    void release() {
         const int saved = errno;
         wait.reset();
 #ifdef _WIN32

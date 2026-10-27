@@ -781,48 +781,66 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
         nonblocking = nonblocking || socket.options.nonblocking;
         timeout = socket.options.receiveTimeout;
     }
-    if (cancellable) {
-        OVERLAPPED operation{};
-        operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!operation.hEvent) {
-            WSASetLastError(WSAENOBUFS);
+    if (cancellable && (length != 0 || socket.type != 1)) {
+        const bool waitAll = socket.type == 1 && (flags & GuestWaitAll) != 0 && !nonblocking;
+        if (waitAll && (flags & GuestPeek) != 0) {
+            WSASetLastError(WSAEOPNOTSUPP);
             return -1;
         }
-        struct Pending {
-            Socket& socket;
-            OVERLAPPED& operation;
-            static void Interrupt(void* argument) noexcept {
-                auto& pending = *static_cast<Pending*>(argument);
-                CancelIoEx(reinterpret_cast<HANDLE>(pending.socket.value), &pending.operation);
+        int transferred = 0;
+        for (;;) {
+            OVERLAPPED operation{};
+            operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!operation.hEvent) {
+                WSASetLastError(WSAENOBUFS);
+                return transferred != 0 ? transferred : -1;
             }
-        } pending{socket, operation};
-        DWORD done = 0;
-        DWORD nativeFlags = static_cast<DWORD>(NativeReceiveFlags(nonblocking ? flags & ~GuestWaitAll : flags, socket.type));
-        int result = -1;
-        int error = WSAEINTR;
-        {
-            ThreadCancel::IoWait wait(Pending::Interrupt, &pending);
-            if (!ThreadCancel::Requested()) {
-                WSABUF destination{static_cast<ULONG>(length), static_cast<char*>(buffer)};
-                const int started = address
-                    ? WSARecvFrom(socket.value, &destination, 1, &done, &nativeFlags, address, addressLength, &operation, nullptr)
-                    : WSARecv(socket.value, &destination, 1, &done, &nativeFlags, &operation, nullptr);
-                error = started == 0 ? 0 : WSAGetLastError();
-                if (error == WSA_IO_PENDING) {
-                    const auto milliseconds = nonblocking ? 0 : timeout == 0 ? INFINITE : static_cast<DWORD>(std::min<std::int64_t>(
-                        ((timeout >> 32) * 1000) + ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(timeout)) * 1000 + 0xffffffffu) >> 32), INFINITE - 1));
-                    const DWORD waited = WaitForSingleObject(operation.hEvent, milliseconds);
-                    if (waited != WAIT_OBJECT_0) Pending::Interrupt(&pending);
-                    const BOOL completed = WSAGetOverlappedResult(socket.value, &operation, &done, TRUE, &nativeFlags);
-                    error = completed ? 0 : WSAGetLastError();
-                    if (waited == WAIT_TIMEOUT && error == WSA_OPERATION_ABORTED) error = WSAEWOULDBLOCK;
+            struct Event {
+                HANDLE handle;
+                ~Event() {
+                    const int error = WSAGetLastError();
+                    CloseHandle(handle);
+                    WSASetLastError(error);
                 }
-                if (error == 0) result = static_cast<int>(done);
+            } event{operation.hEvent};
+            struct Pending {
+                Socket& socket;
+                OVERLAPPED& operation;
+                static void Interrupt(void* argument) noexcept {
+                    auto& pending = *static_cast<Pending*>(argument);
+                    CancelIoEx(reinterpret_cast<HANDLE>(pending.socket.value), &pending.operation);
+                }
+            } pending{socket, operation};
+            DWORD done = 0;
+            DWORD nativeFlags = static_cast<DWORD>(NativeReceiveFlags(flags & ~GuestWaitAll, socket.type));
+            int result = -1;
+            int error = WSAEINTR;
+            {
+                ThreadCancel::IoWait wait(Pending::Interrupt, &pending);
+                if (!ThreadCancel::Requested()) {
+                    WSABUF destination{static_cast<ULONG>(length - transferred),
+                        transferred == 0 ? static_cast<char*>(buffer) : static_cast<char*>(buffer) + transferred};
+                    const int started = address
+                        ? WSARecvFrom(socket.value, &destination, 1, &done, &nativeFlags, address, addressLength, &operation, nullptr)
+                        : WSARecv(socket.value, &destination, 1, &done, &nativeFlags, &operation, nullptr);
+                    error = started == 0 ? 0 : WSAGetLastError();
+                    if (error == WSA_IO_PENDING) {
+                        const auto milliseconds = nonblocking ? 0 : timeout == 0 ? INFINITE : static_cast<DWORD>(std::min<std::int64_t>(
+                            ((timeout >> 32) * 1000) + ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(timeout)) * 1000 + 0xffffffffu) >> 32), INFINITE - 1));
+                        const DWORD waited = WaitForSingleObject(operation.hEvent, milliseconds);
+                        if (waited != WAIT_OBJECT_0) Pending::Interrupt(&pending);
+                        const BOOL completed = WSAGetOverlappedResult(socket.value, &operation, &done, TRUE, &nativeFlags);
+                        error = completed ? 0 : WSAGetLastError();
+                        if (waited == WAIT_TIMEOUT && error == WSA_OPERATION_ABORTED) error = WSAEWOULDBLOCK;
+                    }
+                    if (error == 0) result = static_cast<int>(done);
+                }
             }
+            WSASetLastError(error);
+            if (result < 0) return transferred != 0 ? transferred : result;
+            transferred += result;
+            if (!waitAll || result == 0 || transferred == length || ThreadCancel::Requested()) return transferred;
         }
-        CloseHandle(operation.hEvent);
-        WSASetLastError(error);
-        return result;
     }
     return address
         ? ::recvfrom(socket.value, static_cast<char*>(buffer), length, NativeReceiveFlags(flags, socket.type), address, addressLength)
