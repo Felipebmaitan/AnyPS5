@@ -23,6 +23,7 @@ std::uintptr_t resumeSite;
 std::string_view mode;
 unsigned faults;
 bool store;
+bool checkUpper;
 std::array<std::uint8_t, 16> faultBytes{};
 
 bool Observe(std::uintptr_t rip, std::uint64_t rbx, std::uint64_t rsi, std::uint64_t flags, std::uint32_t mxcsr, const void* vectors) {
@@ -46,6 +47,13 @@ bool Repair() {
 #endif
 }
 
+bool ObserveUpper(const void* upper) {
+    if (!upper) return false;
+    for (unsigned reg = 0; reg < 16; ++reg)
+        if (std::memcmp(static_cast<const std::uint8_t*>(upper) + reg * 16, data + 0x810 + reg * 32, 16) != 0) return false;
+    return true;
+}
+
 #ifdef _WIN32
 LONG WINAPI Handle(EXCEPTION_POINTERS* info) {
     if (GuestGsHandleException_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -53,6 +61,12 @@ LONG WINAPI Handle(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         info->ExceptionRecord->ExceptionAddress != reinterpret_cast<void*>(faultSite) ||
         !Observe(context.Rip, context.Rbx, context.Rsi, context.EFlags, context.MxCsr, &context.Xmm0)) return EXCEPTION_CONTINUE_SEARCH;
+    if (checkUpper) {
+        DWORD size = 0;
+        DWORD64 mask = 0;
+        const auto* upper = LocateXStateFeature(&context, 2, &size);
+        if (!GetXStateFeaturesMask(&context, &mask) || (mask & 4) == 0 || size < 256 || !ObserveUpper(upper)) return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (mode != "align" && mode != "align-base" && (info->ExceptionRecord->NumberParameters < 2 ||
         info->ExceptionRecord->ExceptionInformation[0] != (store ? 1u : 0u) ||
         info->ExceptionRecord->ExceptionInformation[1] != reinterpret_cast<std::uintptr_t>(data + 4096))) return EXCEPTION_CONTINUE_SEARCH;
@@ -71,6 +85,16 @@ void Handle(int, siginfo_t* info, void* opaque) {
     auto* fp = context.uc_mcontext.fpregs;
     if (!fp || !Observe(context.uc_mcontext.gregs[REG_RIP], context.uc_mcontext.gregs[REG_RBX], context.uc_mcontext.gregs[REG_RSI],
         context.uc_mcontext.gregs[REG_EFL], fp->mxcsr, fp->_xmm)) std::_Exit(20);
+    if (checkUpper) {
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(fp);
+        std::uint32_t magic = 0;
+        std::uint32_t size = 0;
+        std::uint64_t mask = 0;
+        std::memcpy(&magic, raw + 464, 4);
+        std::memcpy(&size, raw + 468, 4);
+        std::memcpy(&mask, raw + 472, 8);
+        if (magic != 0x46505853 || size < sizeof(_xstate) || (mask & 4) == 0 || !ObserveUpper(&reinterpret_cast<const _xstate*>(fp)->ymmh)) std::_Exit(24);
+    }
     if (mode != "align" && mode != "align-base" && info->si_addr != data + 4096) std::_Exit(23);
     if (mode == "align" || mode == "align-base") {
         if (faults++) std::_Exit(21);
@@ -98,6 +122,7 @@ int main(int argc, char** argv) {
     if (argc < 4) return 2;
     mode = argv[3];
     store = argc > 6 && std::string_view(argv[6]) == "store";
+    checkUpper = argc > 7 && std::string_view(argv[7]) == "xstate";
     std::ifstream input(argv[1], std::ios::binary);
     const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(input), {}};
     if (bytes.size() < 0x100) return 3;

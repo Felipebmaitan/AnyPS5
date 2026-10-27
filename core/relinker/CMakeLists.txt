@@ -595,6 +595,12 @@ if(BUILD_TESTING)
                     $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_vector_runner> ${group} ${guestGsMode})
                 set_tests_properties(windows_guest_gs_sse_${group} PROPERTIES TIMEOUT 30)
             endforeach()
+            foreach(group IN ITEMS packed128 packed256 scalar address faults fallback)
+                add_test(NAME windows_guest_gs_vex_${group} COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs_vex.py
+                    $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_vector_runner> ${group} ${guestGsMode})
+                set_tests_properties(windows_guest_gs_vex_${group} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+            endforeach()
         endif()
         if(MINGW AND TARGET libc)
             add_library(guest_gs_state_only_runtime SHARED ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/GuestGsStateOnlyRuntime.cpp)
@@ -623,10 +629,17 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_runtime_runner> --runtime)
             set_tests_properties(windows_guest_gs_runtime PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            foreach(group IN ITEMS packed128 packed256 scalar address faults fallback)
+                add_test(NAME windows_guest_gs_vex_runtime_${group} COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs_vex.py
+                    $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_vector_runtime_runner> ${group})
+                set_tests_properties(windows_guest_gs_vex_runtime_${group} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endforeach()
             get_filename_component(guestGsCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
             add_test(NAME windows_guest_gs_startup COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs_integration.py
-                $<TARGET_FILE:relinker> --runtime $<TARGET_FILE:libc> --state-runtime $<TARGET_FILE:guest_gs_state_only_runtime> --replay-runtime $<TARGET_FILE:guest_gs_replay_only_runtime> --dll-directory ${guestGsCompilerDirectory})
+                $<TARGET_FILE:relinker> --runtime $<TARGET_FILE:libc> --state-runtime $<TARGET_FILE:guest_gs_state_only_runtime> --replay-runtime $<TARGET_FILE:guest_gs_replay_only_runtime> --dll-directory ${guestGsCompilerDirectory} --vector-runner $<TARGET_FILE:guest_gs_vector_runtime_runner>)
             set_tests_properties(windows_guest_gs_startup PROPERTIES TIMEOUT 30)
         endif()
         add_test(NAME windows_guest_gs_relocations COMMAND ${Python3_EXECUTABLE}

@@ -82,7 +82,7 @@ def operation(name, store, reg, form="direct", rex_w=False):
     return head + bytes((0x02 | field,))
 
 
-def program(name, store, reg, offset, form, avx, borrowed=False, rex_w=False):
+def program(name, store, reg, offset, form, avx, borrowed=False, rex_w=False, operation_builder=operation, follower_builder=memory_move, payload_size=16):
     code = bytearray(bytes.fromhex("53 56 48 bb") + struct.pack("<Q", RBX) + bytes.fromhex("48 be") + struct.pack("<Q", RSI))
     code += bytes.fromhex("48 83 ec 10 0f ae 5c 24 08 0f ae 97 40 04 00 00")
     for index in range(16):
@@ -95,9 +95,9 @@ def program(name, store, reg, offset, form, avx, borrowed=False, rex_w=False):
     code += bytes.fromhex("48 c7 44 24 80 78 56 34 12 48 c7 44 24 f8 21 43 65 07 31 c0 f9 fd")
     site = len(code)
     if borrowed:
-        op = bytes.fromhex("65 ff 02") + memory_move(0xf3, 0x7f if store else 0x6f, reg, 4096)
+        op = bytes.fromhex("65 ff 02") + follower_builder(0xf3, 0x7f if store else 0x6f, reg, 4096)
     else:
-        op = operation(name, store, reg, form, rex_w)
+        op = operation_builder(name, store, reg, form, rex_w)
     code += op
     resume = len(code)
     if form != "borrow-sse":
@@ -111,7 +111,7 @@ def program(name, store, reg, offset, form, avx, borrowed=False, rex_w=False):
     code += b"\xc3"
     if form == "rip":
         struct.pack_into("<i", code, site + len(op) - 4, len(code) - site - len(op))
-        code += pattern(0, 16)
+        code += pattern(0, payload_size)
     return code, site + (3 if borrowed else 0), resume
 
 
@@ -302,7 +302,7 @@ def main():
             digest.append((case, validate(run.stdout.split(), case, avx)))
         if args.group == "fallback":
             borrowed_fallbacks(args.relinker, work)
-            for encoding in ("65 f0 0f 10 02", "65 66 f3 0f 10 02", "65 f2 0f 6f 02", "65 0f 6f 02", "65 0f 58 02", "65 66 0f 38 10 02", "65 66 0f 3a 20 02 00", "65 0f 2b 02", "65 f2 0f 12 02", "65 f3 0f 12 02", "65 0f f7 c0", "65 c5 fa 6f 02", "65 62 f1 7c 48 10 02"):
+            for encoding in ("65 f0 0f 10 02", "65 66 f3 0f 10 02", "65 f2 0f 6f 02", "65 0f 6f 02", "65 0f 58 02", "65 66 0f 38 10 02", "65 66 0f 3a 20 02 00", "65 0f 2b 02", "65 f2 0f 12 02", "65 f3 0f 12 02", "65 0f f7 c0", "65 c5 fa 58 02", "65 62 f1 7c 48 10 02"):
                 op = bytes.fromhex(encoding)
                 source.write_bytes(fixture(op + b"\xc3"))
                 convert = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)

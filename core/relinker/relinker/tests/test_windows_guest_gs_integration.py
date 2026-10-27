@@ -46,7 +46,7 @@ def guest_relocation(kind):
     return image
 
 
-def startup_image(gs, short=False, sse=False):
+def startup_image(gs, short=False, sse=False, vex=False):
     image = make_image()
     code = bytes.fromhex("48 8b 05 01 00 00 00 c3")
     if gs:
@@ -55,7 +55,9 @@ def startup_image(gs, short=False, sse=False):
         code = bytes.fromhex("48 8d 15 09 00 00 00 48 8d 52 01 65 48 8b 02 90 c3")
     if sse:
         code = bytes.fromhex("48 8d 15 0d 00 00 00 48 8d 52 01 65 0f 10 22 90 66 0f 7e e0 c3")
-    payload = struct.pack("<Q", 42) * (2 if sse else 1)
+    if vex:
+        code = bytes.fromhex("48 8d 15 0e 00 00 00 48 8d 52 01 65 c5 fc 10 22 90 66 0f 7e e0 c3")
+    payload = struct.pack("<Q", 42) * (4 if vex else 2 if sse else 1)
     image[0x210:0x210 + len(code) + len(payload)] = code + payload
     struct.pack_into("<Q", image, 24, 0x210)
     struct.pack_into("<I", image, 176, 0)
@@ -63,15 +65,18 @@ def startup_image(gs, short=False, sse=False):
     return image
 
 
-def guest_initializer(short=False, sse=False):
+def guest_initializer(short=False, sse=False, vex=False):
     image = module_with_symbol(True)
     code = bytes.fromhex("65 48 8b 05 01 00 00 00 c3") + struct.pack("<Q", 42)
     image[0x400:0x400 + len(code)] = code
-    if short or sse:
+    if short or sse or vex:
         image[0x400:0x407] = bytes.fromhex("8b 05 ea 13 00 00 c3")
         code = bytes.fromhex("48 8d 15 a9 13 00 00 b8 2a 00 00 00 65 89 02 90 90 c3")
         if sse:
             code = bytes.fromhex("48 8d 15 a9 13 00 00 b8 2a 00 00 00 66 44 0f 6e e0 65 f3 44 0f 11 22 c3")
+        if vex:
+            image[0x400:0x407] = bytes.fromhex("8b 05 ca 13 00 00 c3")
+            code = bytes.fromhex("48 8d 15 89 13 00 00 b8 2a 00 00 00 c5 79 6e e0 65 c5 7c 11 22 c3")
         image[0x440:0x440 + len(code)] = code
     tags = []
     for offset in range(0x600, 0x700, 16):
@@ -79,7 +84,7 @@ def guest_initializer(short=False, sse=False):
         if tag[0] == 0:
             break
         tags.append(tag)
-    tags += [(12, 0x1040 if short or sse else 0x1000), (0, 0)]
+    tags += [(12, 0x1040 if short or sse or vex else 0x1000), (0, 0)]
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", image, 0x600 + index * 16, *tag)
     struct.pack_into("<QQ", image, 176 + 32, len(tags) * 16, len(tags) * 16)
@@ -111,6 +116,7 @@ def main():
     parser.add_argument("--state-runtime", type=Path)
     parser.add_argument("--replay-runtime", type=Path)
     parser.add_argument("--dll-directory", type=Path)
+    parser.add_argument("--vector-runner", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="anyps5-gs-integration-") as directory:
         work = Path(directory)
@@ -139,7 +145,7 @@ def main():
         if args.runtime:
             assert sys.platform == "win32" and args.dll_directory
             ctypes.windll.kernel32.SetErrorMode(3)
-            for label, image, module, required in (
+            startup_cases = [
                 ("plain", startup_image(False), None, False),
                 ("skipped-gs", skipped_gs_image(), None, False),
                 ("borrowed-entry", borrowed_entry_image(), None, False),
@@ -149,7 +155,13 @@ def main():
                 ("short-guest-initializer", executable("consumer.prx"), guest_initializer(short=True), True),
                 ("short-sse", startup_image(True, sse=True), None, True),
                 ("sse-guest-initializer", executable("consumer.prx"), guest_initializer(sse=True), True),
-            ):
+            ]
+            if args.vector_runner:
+                features = subprocess.run([str(args.vector_runner.resolve()), "--features"], capture_output=True, text=True, timeout=5)
+                assert features.returncode == 0, features
+                if features.stdout.strip() == "avx":
+                    startup_cases += [("vex", startup_image(True, vex=True), None, True), ("vex-guest-initializer", executable("consumer.prx"), guest_initializer(vex=True), True)]
+            for label, image, module, required in startup_cases:
                 result, output = convert(image, f"startup-{label}", module)
                 assert result.returncode == 0, result
                 if label == "skipped-gs":

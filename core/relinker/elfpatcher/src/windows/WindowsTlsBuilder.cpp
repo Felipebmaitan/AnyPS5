@@ -70,7 +70,11 @@ std::optional<MovedInstruction> moveGsFollower(const std::uint8_t* bytes, const 
     if (info.Length == 0 || info.Length > 15 || info.SegmentPrefix != 0) return std::nullopt;
     if (!info.IsTwoByteOpcode && (opcode == 0xc6 || opcode == 0xc7) && info.ModRmRegField != 0) return std::nullopt;
     const auto encoded = bytes[info.OpcodeOffset];
-    if (encoded == 0xc4 || encoded == 0xc5 || encoded == 0x62 || encoded == 0x8f) return std::nullopt;
+    if (encoded == 0xc4 || encoded == 0xc5) {
+        if (!info.HasMemoryOperand) return std::nullopt;
+        return MovedInstruction{rva, {bytes, bytes + info.Length}, std::nullopt, std::nullopt, 0, info.Length};
+    }
+    if (encoded == 0x62 || encoded == 0x8f) return std::nullopt;
     for (std::size_t index = 0; index < info.OpcodeOffset; ++index) {
         const auto prefix = bytes[index];
         if (prefix != 0x66 && prefix != 0x67 && !((prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3) && info.HasMemoryOperand) && !(prefix >= 0x40 && prefix <= 0x4f && index + 1 == info.OpcodeOffset)) return std::nullopt;

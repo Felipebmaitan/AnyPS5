@@ -195,7 +195,7 @@ def main():
         assert converted.returncode == 0, converted
         assert pe_bytes_at(output.read_bytes(), 0x10215, 5) == image[0x215:0x21a]
         output.unlink()
-        for encoding in ("65 48 8b 00", "65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 6e 00", "65 c5 f9 6e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "65 66 0f f7 c1", "65 0f 01 c8", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
+        for encoding in ("65 48 8b 00", "65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 5e 00", "65 c5 f9 5e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "65 66 0f f7 c1", "65 0f 01 c8", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
             instruction = bytes.fromhex(encoding)
             source.write_bytes(fixture(instruction + b"\xc3"))
             converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)

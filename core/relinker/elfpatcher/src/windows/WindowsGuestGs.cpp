@@ -1,6 +1,7 @@
 #include <elfpatcher/windows/WindowsGuestGs.hpp>
 #include <domain/Types.hpp>
 #include <io/BufferUtils.hpp>
+#include <codegen/x86/X64InstructionDecoder.hpp>
 #include <algorithm>
 #include <bit>
 #include <iterator>
@@ -9,7 +10,49 @@ namespace Elfpatcher::Windows {
 
 bool WindowsGuestGs::TryAppend(PeSection& section, const std::uint32_t rva, const std::uint8_t* bytes, const Codegen::DecodedInstructionInfo& info) {
     const auto encodedOpcode = bytes[info.OpcodeOffset];
-    if (encodedOpcode == 0xc4 || encodedOpcode == 0xc5 || encodedOpcode == 0x62 ||
+    if (encodedOpcode == 0xc4 || encodedOpcode == 0xc5) {
+        const auto prefixSize = encodedOpcode == 0xc4 ? 3u : 2u;
+        const auto opcodeOffset = info.OpcodeOffset + prefixSize;
+        if (opcodeOffset + 1 >= info.Length || !info.HasModRm || info.ModRmOffset != opcodeOffset + 1 || (info.ModRmByte >> 6) == 3) return false;
+        const auto fields = bytes[opcodeOffset - 1];
+        const auto map = encodedOpcode == 0xc4 ? bytes[info.OpcodeOffset + 1] & 31 : 1;
+        const auto opcode = bytes[opcodeOffset];
+        const auto pp = fields & 3;
+        const bool wide = (fields & 4) != 0;
+        const bool packed = ((opcode == 0x10 || opcode == 0x11 || opcode == 0x28 || opcode == 0x29) && pp <= 1) ||
+            ((opcode == 0x6f || opcode == 0x7f) && (pp == 1 || pp == 2));
+        const bool scalar = !wide && (((opcode == 0x10 || opcode == 0x11) && pp >= 2) ||
+            ((opcode == 0x6e || opcode == 0x7e || opcode == 0xd6) && pp == 1) || (opcode == 0x7e && pp == 2));
+        if (map != 1 || (fields & 0x78) != 0x78 || (!packed && !scalar)) return false;
+        std::vector<std::uint8_t> legacy;
+        for (std::size_t index = 0; index < info.OpcodeOffset; ++index) {
+            if (bytes[index] != 0x65 && bytes[index] != 0x67) return false;
+            legacy.push_back(bytes[index]);
+        }
+        if (pp != 0) legacy.push_back(pp == 1 ? 0x66 : pp == 2 ? 0xf3 : 0xf2);
+        const auto address = bytes[info.OpcodeOffset + 1];
+        const auto rex = static_cast<std::uint8_t>(0x40 | ((~address & 0x80) >> 5) |
+            (encodedOpcode == 0xc4 ? ((~address & 0x60) >> 5) | ((fields & 0x80) >> 4) : 0));
+        if (rex != 0x40) legacy.push_back(rex);
+        legacy.push_back(0x0f);
+        legacy.insert(legacy.end(), bytes + opcodeOffset, bytes + info.Length);
+        if (legacy.size() > 15) return false;
+        const auto decoded = Codegen::X64InstructionDecoder().DecodeInstruction(legacy.data(), legacy.size());
+        if (decoded.Length != legacy.size() || !TryAppend(section, rva, legacy.data(), decoded)) return false;
+        const auto record = section.Data.size() - 64;
+        std::fill(section.Data.begin() + record + 31, section.Data.end(), 0);
+        auto output = record + 31;
+        for (std::size_t index = info.OpcodeOffset; index < opcodeOffset; ++index)
+            section.Data[output++] = bytes[index] | (encodedOpcode == 0xc4 && index == info.OpcodeOffset + 1 ? 0x60 : 0);
+        section.Data[output++] = opcode;
+        section.Data[output++] = static_cast<std::uint8_t>((info.ModRmByte & 0x38) | section.Data[record + 12]);
+        section.Data[record + 13] = static_cast<std::uint8_t>(output - record - 31);
+        section.Data[output++] = 0x0f;
+        section.Data[output] = 0x0b;
+        Io::WriteU32(section.Data, record + 4, CheckedRva(static_cast<std::uint64_t>(rva) + info.Length));
+        return true;
+    }
+    if (encodedOpcode == 0x62 ||
         (encodedOpcode == 0x8f && info.OpcodeOffset + 1 < info.Length && (bytes[info.OpcodeOffset + 1] & 0x1f) >= 8)) return false;
     const auto opcode = info.Opcode;
     const auto group = info.ModRmRegField;
