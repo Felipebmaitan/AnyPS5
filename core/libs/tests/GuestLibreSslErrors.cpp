@@ -9,6 +9,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <string>
+
+namespace {
+struct ErrorString {
+    std::uint32_t code;
+    const char* text;
+};
+
+#include "ErrorStrings.inc"
+}
 
 static void Require(bool value, const char* message) {
     if (value) return;
@@ -23,15 +33,41 @@ static void ExpectString(std::uint64_t code, const char* expected) {
     Require(std::strcmp(buffer.data(), expected) == 0, buffer.data());
 }
 
+static void ExpectNumeric(std::uint64_t code) {
+    std::array<char, 32> hexadecimal{};
+    std::snprintf(hexadecimal.data(), hexadecimal.size(), "%08llX", static_cast<unsigned long long>(code));
+    const auto expected = "error:" + std::string(hexadecimal.data()) +
+        ":lib(" + std::to_string((code >> 24) & 255) +
+        "):func(" + std::to_string((code >> 12) & 4095) +
+        "):reason(" + std::to_string(code & 4095) + ")";
+    ExpectString(code, expected.c_str());
+}
+
+static void TestNumericCodes() {
+    for (const auto& entry : CryptoStrings) ExpectNumeric(entry.code);
+    for (std::uint64_t library = 0; library < 256; ++library) ExpectNumeric(library << 24);
+    for (std::uint64_t reason = 1; reason <= 127; ++reason) ExpectNumeric(0x02000000 | reason);
+    for (const auto code : {0x100000000ULL, 0x12345678e1abc789ULL, 0xffffffffffffffffULL, 0x8000000000000000ULL}) ExpectNumeric(code);
+    std::uint64_t code = 0x51e073ab94d62fc8;
+    for (int index = 0; index < 2000; ++index) {
+        code ^= code << 13;
+        code ^= code >> 7;
+        code ^= code << 17;
+        ExpectNumeric(code);
+    }
+}
+
 static void TestStrings() {
-    ERR_load_crypto_strings_nid_postfix();
+    TestNumericCodes();
     ExpectString(0, "error:00000000:lib(0):func(0):reason(0)");
-    ExpectString(0x20fff043, "error:20FFF043:BIO routines:CRYPTO_internal:passed a null parameter");
-    ExpectString(0x20fff07e, "error:20FFF07E:BIO routines:CRYPTO_internal:write to read only BIO");
-    ExpectString(0x03fff06c, "error:03FFF06C:bignum routines:CRYPTO_internal:no inverse");
+    ExpectString(0x20fff043, "error:20FFF043:lib(32):func(4095):reason(67)");
+    ExpectString(0x20fff07e, "error:20FFF07E:lib(32):func(4095):reason(126)");
+    ExpectString(0x03fff06c, "error:03FFF06C:lib(3):func(4095):reason(108)");
+    ExpectString(0x0dfff0a8, "error:0DFFF0A8:lib(13):func(4095):reason(168)");
+    ExpectString(0x08fff065, "error:08FFF065:lib(8):func(4095):reason(101)");
     ExpectString(0xe1abc789, "error:E1ABC789:lib(225):func(2748):reason(1929)");
     ExpectString(0x12345678e1abc789, "error:12345678E1ABC789:lib(225):func(2748):reason(1929)");
-    ExpectString(0x02002023, "error:02002023:system library:connect:Resource temporarily unavailabl");
+    ExpectString(0x02002023, "error:02002023:lib(2):func(2):reason(35)");
     auto* shared = ERR_error_string_nid_postfix(0xe1abc789, nullptr);
     Require(shared != nullptr, "static buffer exists");
     Require(ERR_error_string_nid_postfix(0, nullptr) == shared, "static buffer reused");
@@ -106,6 +142,9 @@ static void TestThreads() {
             LibreSslPutError_nid_no_patch(129, 0, static_cast<int>(index + 1), nullptr, 0);
             ++ready;
             while (ready.load() != static_cast<int>(threads.size())) std::this_thread::yield();
+            ERR_free_strings_nid_postfix();
+            ERR_load_crypto_strings_nid_postfix();
+            ExpectString(0x0dfff0a8, "error:0DFFF0A8:lib(13):func(4095):reason(168)");
             Require(ERR_peek_last_error_nid_postfix() == 0x81000001 + index, "thread-local newest");
             if (index % 2) ERR_clear_error_nid_postfix();
             else ERR_remove_thread_state_nid_postfix(nullptr);
@@ -124,16 +163,18 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "free") == 0) TestStrings();
         LibreSslPutError_nid_no_patch(32, 0xfff, 67, nullptr, 0);
         ERR_free_strings_nid_postfix();
-        ExpectString(0x20fff043, "error:20FFF043:lib(32):func(4095):reason(67)");
+        TestStrings();
         Require(ERR_peek_error_nid_postfix() == 0x20fff043, "free strings preserves queued error");
         ERR_load_crypto_strings_nid_postfix();
-        ExpectString(0x20fff043, "error:20FFF043:lib(32):func(4095):reason(67)");
+        TestStrings();
         ERR_free_strings_nid_postfix();
         ERR_load_crypto_strings_nid_postfix();
-        ExpectString(0x20fff043, "error:20FFF043:lib(32):func(4095):reason(67)");
+        TestStrings();
         Require(ERR_get_error_nid_postfix() == 0x20fff043, "free strings preserves queue");
         return 0;
     }
+    TestStrings();
+    ERR_load_crypto_strings_nid_postfix();
     TestStrings();
     TestQueue();
     TestThreads();

@@ -2,7 +2,7 @@
 
 ### Functional
 
-- [ERR_load_crypto_strings and ERR_peek_last_error](../../../core/libs/prx/libSceLibreSsl3/Export.cpp) share libSceLibreSsl's string registry and calling-thread queue. This relationship and PS5 equivalence are unverified; the public contracts follow LibreSSL 3.4.1 at OpenBSD commit `078b3d1df8ca2011c1605cd40418c58fa0f5b143`. `ERR_print_errors_cb` remains throwing: the public callback contract is known, but PS5 thread identifiers and diagnostic metadata have not been established.
+- [ERR_load_crypto_strings and ERR_peek_last_error](../../../core/libs/prx/libSceLibreSsl3/Export.cpp) have no console execution verification. [Firmware 13.42 modules run on a PC](https://github.com/boykopovar/AnyPS5/pull/9535#issuecomment-6407060914) retained numeric-only output after loaders and matched queue order/overflow; whether the two firmware modules share a queue was not tested. This implementation reads libSceLibreSsl's calling-thread queue. `ERR_print_errors_cb` remains throwing because guest thread identifiers and diagnostic metadata are unverified.
 
 ### Unknown function info
 

@@ -68,7 +68,6 @@ int APS5_VABI EC_KEY_up_ref_nid_postfix(void) {
 }
 
 void APS5_VABI ERR_load_crypto_strings_nid_postfix() {
-    LibreSslLoadErrorStrings_nid_no_patch();
 }
 
 std::uint64_t APS5_VABI ERR_peek_last_error_nid_postfix() {

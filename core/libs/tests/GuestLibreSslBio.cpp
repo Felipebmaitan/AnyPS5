@@ -1,6 +1,5 @@
 #include "prx/libSceLibreSsl/libSceLibreSsl.hpp"
 #include "prx/libc/include/Api.hpp"
-#include "prx/libSceLibreSsl/include/Bio.hpp"
 #include "prx/libSceLibreSsl/ErrorQueue.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include <algorithm>
@@ -27,6 +26,7 @@
 using LibreSsl::Bio;
 using LibreSsl::BioBuffer;
 using LibreSsl::BioMethod;
+
 
 #ifdef ANYPS5_BIO_DYNAMIC
 namespace {
@@ -143,6 +143,17 @@ void InitializeHeap() {
     ApplicationHeapRegister_nid_no_patch(api.data());
 }
 
+template<class TFunction>
+void RequireUnsupported(TFunction function) {
+    bool threw = false;
+    try {
+        function();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "unsupported BIO path did not throw");
+}
+
 void RequireError(std::uint64_t expected) {
     Require(ERR_peek_error_nid_postfix() == expected, "BIO error code or ordering");
     Require(ERR_get_error_nid_postfix() == expected, "consume BIO error");
@@ -173,7 +184,9 @@ void TestWritable() {
     Require(bio && bio->method == method && bio->initialized == 1 && bio->references == 1, "new BIO state");
     Require(!bio->callback && !bio->callbackArgument && !bio->flags && !bio->retryReason && !bio->next && !bio->previous && !bio->extraData, "new BIO zero fields");
     Require(bio->number == -1 && bio->bytesRead == 0 && bio->bytesWritten == 0, "new BIO counters");
-    Require(BIO_write_nid_postfix(bio, nullptr, 7) == 0 && BIO_write_nid_postfix(bio, "x", 0) == 0, "empty write guard");
+    Require(BIO_write_nid_postfix(bio, nullptr, 7) == -1, "null write reaches memory method");
+    RequireError(0x20fff073);
+    Require(BIO_write_nid_postfix(bio, "x", 0) == 0, "zero-length owned write");
     RequireError(0);
     RequireData(bio, "");
     auto* buffer = Buffer(bio);
@@ -183,7 +196,11 @@ void TestWritable() {
     Require(BIO_write_nid_postfix(bio, "abc", 3) == 3 && (bio->flags & 0xf) == 0, "write clears retry flags");
     RequireData(bio, "abc");
     Require(buffer->capacity == 8 && buffer->data[3] == 0, "first buffer expansion");
+    std::memset(buffer->data + buffer->length, 0xa5, buffer->capacity - buffer->length);
+    wipePointer = buffer->data;
+    wipeSize = buffer->capacity;
     Require(BIO_write_nid_postfix(bio, "0123456789", 10) == 10, "second write");
+    Require(wipePointer == nullptr, "growth frees the wiped allocation");
     Require(buffer->capacity == 20 && buffer->data[13] == 0, "second buffer expansion");
     RequireData(bio, "abc0123456789");
     Require(method->read(bio, output, 4) == 4 && std::memcmp(output, "abc0", 4) == 0, "partial memory read");
@@ -193,7 +210,8 @@ void TestWritable() {
     Require(method->read(bio, nullptr, 3) == 3, "null raw read reports available count");
     RequireData(bio, "123456789xy");
     Require(method->read(bio, output, -3) == -3, "negative raw read");
-    Require(BIO_write_nid_postfix(bio, nullptr, 5) == 0 && BIO_write_nid_postfix(bio, "z", -3) == 0, "ignored public writes");
+    Require(BIO_write_nid_postfix(bio, nullptr, 5) == -1, "reject null public source");
+    RequireError(0x20fff073);
     RequireData(bio, "123456789xy");
     Require(BIO_ctrl_nid_postfix(bio, 11, 0, nullptr) == 1 && BIO_ctrl_nid_postfix(bio, 12, 0, nullptr) == 1, "flush and duplicate controls");
     Require(BIO_ctrl_nid_postfix(bio, 13, 0, nullptr) == 0, "no pending output");
@@ -316,6 +334,90 @@ void TestInterleavedTransfers() {
     Require(BIO_free_nid_postfix(bio) == 1, "free interleaved BIO");
 }
 
+struct WriteEvent {
+    int operation;
+    const char* source;
+    int size;
+    std::int64_t result;
+    int flags;
+    std::uint64_t bytesWritten;
+};
+
+struct WriteTrace {
+    std::vector<WriteEvent> events;
+    int veto = 0;
+    int postAdjustment = 0;
+};
+
+std::int64_t APS5_VABI TraceWrite(Bio* bio, int operation, const char* source, int size, std::int64_t, std::int64_t result) {
+    auto& trace = *reinterpret_cast<WriteTrace*>(bio->callbackArgument);
+    trace.events.push_back({operation, source, size, result, bio->flags, bio->bytesWritten});
+    if (operation == 3 && trace.veto) return trace.veto;
+    return (operation & 0x80) ? result + trace.postAdjustment : result;
+}
+
+void TestWriteBoundaries() {
+    const char source[] = "abc";
+    for (const bool readOnly : {false, true}) {
+        Bio* bio = readOnly ? BIO_new_mem_buf_nid_postfix(source, 3) : BIO_new_nid_postfix(BIO_s_mem_nid_postfix());
+        WriteTrace trace;
+        bio->callback = TraceWrite;
+        bio->callbackArgument = reinterpret_cast<char*>(&trace);
+        for (const int size : {0, 1}) {
+            bio->flags |= 0x4009;
+            const int flags = bio->flags;
+            trace.events.clear();
+            Require(BIO_write_nid_postfix(bio, nullptr, size) == -1, "null source dispatch result");
+            RequireError(0x20fff073);
+            Require(trace.events.size() == 2, "null source has pre/post callbacks");
+            Require(trace.events[0].operation == 3 && trace.events[1].operation == 0x83, "null source callback operations");
+            Require(trace.events[0].source == nullptr && trace.events[1].source == nullptr &&
+                trace.events[0].size == size && trace.events[1].size == size, "null source callback arguments");
+            Require(trace.events[0].result == 1 && trace.events[1].result == -1, "null source callback results");
+            Require(trace.events[0].flags == flags && trace.events[1].flags == flags && bio->flags == flags, "null source preserves retry flags");
+            Require(trace.events[0].bytesWritten == 0 && trace.events[1].bytesWritten == 0 && bio->bytesWritten == 0, "failed write does not count bytes");
+        }
+        bio->flags |= 0x4009;
+        const int flags = bio->flags;
+        trace.events.clear();
+        Require(BIO_write_nid_postfix(bio, source, 0) == (readOnly ? -1 : 0), "zero-length method result");
+        RequireError(readOnly ? 0x20fff07e : 0);
+        Require(trace.events.size() == 2 && trace.events[0].operation == 3 && trace.events[1].operation == 0x83, "zero-length write callback operations");
+        Require(trace.events[0].source == source && trace.events[1].source == source &&
+            trace.events[0].size == 0 && trace.events[1].size == 0, "zero-length callback arguments");
+        Require(trace.events[0].result == 1 && trace.events[1].result == (readOnly ? -1 : 0), "zero-length callback results");
+        Require(trace.events[0].flags == flags && trace.events[1].flags == (readOnly ? flags : flags & ~0xf), "retry flags change during the method");
+        Require(bio->flags == (readOnly ? flags : flags & ~0xf) && bio->bytesWritten == 0, "zero-length retry flags and byte count");
+        RequireData(bio, readOnly ? "abc" : "");
+        trace.events.clear();
+        trace.veto = -7;
+        Require(BIO_write_nid_postfix(bio, nullptr, 0) == -7 && trace.events.size() == 1, "null write callback veto prevents method");
+        RequireError(0);
+        trace.veto = 0;
+        trace.postAdjustment = 5;
+        trace.events.clear();
+        Require(BIO_write_nid_postfix(bio, nullptr, 0) == 4 && bio->bytesWritten == 0, "post callback can override failure without counting bytes");
+        RequireError(0x20fff073);
+        bio->callback = nullptr;
+        Require(BIO_free_nid_postfix(bio) == 1, "free boundary BIO");
+    }
+    Bio* bio = BIO_new_nid_postfix(BIO_s_mem_nid_postfix());
+    WriteTrace trace;
+    bio->callback = TraceWrite;
+    bio->callbackArgument = reinterpret_cast<char*>(&trace);
+    const auto* method = bio->method;
+    bio->method = nullptr;
+    Require(BIO_write_nid_postfix(bio, nullptr, 0) == -2 && trace.events.empty(), "method validation precedes callback");
+    RequireError(0x20fff079);
+    bio->method = method;
+    bio->initialized = 0;
+    Require(BIO_write_nid_postfix(bio, nullptr, 0) == -2 && trace.events.size() == 1 && trace.events[0].operation == 3, "initialization validation follows pre-callback");
+    RequireError(0x20fff078);
+    bio->initialized = 1;
+    bio->callback = nullptr;
+    Require(BIO_free_nid_postfix(bio) == 1, "free dispatch-order BIO");
+}
+
 struct CallbackState {
     std::vector<int> events;
     std::int64_t argument = 0;
@@ -372,6 +474,9 @@ void TestDispatchAndReferences() {
     bio = BIO_new_nid_postfix(&custom);
     Require(bio && bio->method == &custom, "title-defined method");
     Require(BIO_write_nid_postfix(bio, "abc", 3) == 2 && bio->bytesWritten == 2, "title-defined writer");
+    Require(BIO_write_nid_postfix(bio, nullptr, 3) == 2 && bio->bytesWritten == 4, "custom method receives null source");
+    Require(BIO_write_nid_postfix(bio, "", 0) == -1 && bio->bytesWritten == 4, "custom method receives zero length");
+    RequireError(0);
     Require(BIO_ctrl_nid_postfix(bio, 17, 0x1234567800000000LL, nullptr) == 0x1234567800000011LL, "64-bit method result");
     constexpr int referenceCount = 8;
     std::atomic_ref(bio->references).store(referenceCount + 1);
@@ -396,6 +501,10 @@ void TestUnsupported() {
     Require(BIO_write_nid_postfix(bio, "a", 1) == -2, "reject uninitialized write");
     RequireError(0x20fff078);
     bio->initialized = 1;
+    bio->extraData = bio;
+    RequireUnsupported([&] { BIO_free_nid_postfix(bio); });
+    Require(bio->references == 1, "unsupported ex-data preserves reference");
+    bio->extraData = nullptr;
     const BioMethod* method = bio->method;
     bio->method = nullptr;
     Require(BIO_ctrl_nid_postfix(bio, 1, 0, nullptr) == -2, "reject control without a method");
@@ -451,6 +560,7 @@ int main(int argc, char** argv) {
     TestReadOnlyAndLines();
     TestBufferOwnership();
     TestInterleavedTransfers();
+    TestWriteBoundaries();
     TestDispatchAndReferences();
     TestUnsupported();
     Require(allocations == 0, "BIO tests leaked guest heap storage");

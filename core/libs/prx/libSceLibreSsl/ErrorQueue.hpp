@@ -9,7 +9,6 @@
 
 extern "C" {
 std::uint64_t LibreSslPeekLastError_nid_no_patch();
-void LibreSslLoadErrorStrings_nid_no_patch();
 
 }
 
