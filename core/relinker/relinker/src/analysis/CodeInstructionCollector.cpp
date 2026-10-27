@@ -42,16 +42,22 @@ public:
 }
 
 std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, const std::vector<Domain::VirtualAddress>& extraEntries) const {
-    return collect(bytes, headers, progress, entryRoots, message, tailReachableRanges, false, extraEntries);
+    return collect(bytes, headers, progress, entryRoots, message, tailReachableRanges, false, false, extraEntries);
 }
 
 std::vector<Domain::CodeRange> CodeInstructionCollector::CollectTailReachableRanges(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
     std::vector<Domain::CodeRange> ranges;
-    collect(bytes, headers, progress, nullptr, {}, &ranges, true, {});
+    collect(bytes, headers, progress, nullptr, {}, &ranges, true, false, {});
     return ranges;
 }
 
-std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, bool allowIdenticalDynamicTags, const std::vector<Domain::VirtualAddress>& extraEntries) const {
+std::set<Domain::VirtualAddress> CodeInstructionCollector::CollectRewriteAnchors(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
+    std::set<Domain::VirtualAddress> anchors;
+    collect(bytes, headers, progress, &anchors, {}, nullptr, true, true, {});
+    return anchors;
+}
+
+std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::function<void(std::uint64_t, std::uint64_t)>& progress, std::set<Domain::VirtualAddress>* entryRoots, const std::function<void(std::string_view)>& message, std::vector<Domain::CodeRange>* tailReachableRanges, bool allowIdenticalDynamicTags, bool forceAuthoritative, const std::vector<Domain::VirtualAddress>& extraEntries) const {
     std::uint64_t lastProgress = 0;
     const auto report = [&](std::uint64_t completed) {
         if (completed <= lastProgress) return;
@@ -165,7 +171,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
     const auto addStrongRoot = [&](std::uint64_t address, bool authoritative = true) {
         if (!isCode(address)) return;
         if (inTable(address)) throw Domain::RelinkerException("Code analysis: code entry point lies inside a data table", address);
-        if (!tailHeaders.empty() && (authoritative || inTail(address))) flowRoots.insert(address);
+        if ((forceAuthoritative || !tailHeaders.empty()) && (authoritative || inTail(address))) flowRoots.insert(address);
         strongRoots.insert(address);
         roots.insert(address);
     };

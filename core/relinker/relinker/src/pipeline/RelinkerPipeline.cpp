@@ -3,6 +3,7 @@
 #include <relinker/analysis/UnusedNidFilter/PltCompactor.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
 #include <relinker/analysis/SceCodeExtent.hpp>
+#include <relinker/analysis/SyscallScanner.hpp>
 #include <relinker/analysis/RelativeJumpTables.hpp>
 #include <algorithm>
 #include <bit>
@@ -484,6 +485,8 @@ RelinkResult RelinkerPipeline::Relink() {
             if (trapOffsets.insert(patch.Offset).second) syscallPatches.push_back(std::move(patch));
     }
     std::set<FileByteOffset> routedOffsets;
+    std::set<VirtualAddress> routedImportSlots;
+    if (FindPathconfImport(nidRefs)) ValidateSyscallRoutes(raw, programHeaders, routedStubs, progress);
     for (const auto& routed : routedStubs) {
         if (!routedOffsets.insert(routed.StubOffset).second) continue;
         const auto header = std::find_if(programHeaders.begin(), programHeaders.end(), [&](const auto& candidate) {
@@ -493,6 +496,7 @@ RelinkResult RelinkerPipeline::Relink() {
             throw RelinkerException("Unsupported syscall route patch", routed.StubOffset);
         const auto stubVAddr = header->MappedAddress + (routed.StubOffset - header->Offset);
         if (const auto* pathconfRef = FindPathconfImport(nidRefs)) {
+            routedImportSlots.insert(pathconfRef->RelocationAddress);
             const auto disp = std::bit_cast<std::int64_t>(pathconfRef->RelocationAddress - (stubVAddr + 6));
             if (disp < std::numeric_limits<std::int32_t>::min() || disp > std::numeric_limits<std::int32_t>::max())
                 throw RelinkerException("Syscall stub relocation distance exceeds 32-bit displacement", stubVAddr);
@@ -510,6 +514,12 @@ RelinkResult RelinkerPipeline::Relink() {
         }
     }
     for (const auto& patch : syscallPatches) {
+        if (!textSection.empty()) {
+            const auto header = std::find_if(programHeaders.begin(), programHeaders.end(), [&](const auto& candidate) {
+                return candidate.Type == PT_LOAD && candidate.MappedAddress == textVAddr && patch.Offset >= candidate.Offset && patch.Offset - candidate.Offset < textSection.size() && patch.Bytes.size() <= textSection.size() - (patch.Offset - candidate.Offset);
+            });
+            if (header != programHeaders.end()) std::copy(patch.Bytes.begin(), patch.Bytes.end(), textSection.begin() + (patch.Offset - header->Offset));
+        }
         for (std::size_t index = 0; index < executableSegments.size(); ++index) {
             auto& [segment, segmentVAddr, segmentFileOffset] = executableSegments[index];
             if (patch.Offset < segmentFileOffset || patch.Offset - segmentFileOffset >= segment.size()) continue;
@@ -518,7 +528,6 @@ RelinkResult RelinkerPipeline::Relink() {
                 throw RelinkerException("Syscall patch crosses scan boundary", segmentVAddr + offset);
             std::copy(patch.Bytes.begin(), patch.Bytes.end(), segment.begin() + offset);
             std::copy(patch.Bytes.begin(), patch.Bytes.end(), scanSegments[index].begin() + offset);
-            if (index == 0 && !textSection.empty()) std::copy(patch.Bytes.begin(), patch.Bytes.end(), textSection.begin() + offset);
             break;
         }
     }
@@ -582,10 +591,17 @@ RelinkResult RelinkerPipeline::Relink() {
     const auto originalNidRefs = nidRefs;
     { std::ostringstream message; message << "NID input: " << originalNidCount << " references\n"; progress.Message(message.str()); }
 
+    const auto preserveRoutedImports = [&](std::vector<NidReference> filtered, const std::vector<NidReference>& candidates) {
+        for (const auto& candidate : candidates) {
+            if (!routedImportSlots.contains(candidate.RelocationAddress)) continue;
+            if (std::none_of(filtered.begin(), filtered.end(), [&](const auto& reference) { return reference.RelocationTableOffset == candidate.RelocationTableOffset; })) filtered.push_back(candidate);
+        }
+        return filtered;
+    };
     if (unusedFilterLevel == 2) {
         if (executableSegments.size() > 1)
             throw RelinkerException("Strict NID filtering does not support multiple executable segments");
-        nidRefs = unusedNidFilter->Filter(nidRefs, raw, textSection, textVAddr);
+        nidRefs = preserveRoutedImports(unusedNidFilter->Filter(nidRefs, raw, textSection, textVAddr), nidRefs);
         if (nidRefs.size() > originalNidCount) throw RelinkerException("Strict NID filter increased the reference count");
         { std::ostringstream message; message << "Strict filtering total: " << originalNidCount << " -> " << nidRefs.size() << "; filtered=" << originalNidCount - nidRefs.size() << "\n"; progress.Message(message.str()); }
     } else if (unusedFilterLevel == 1) {
@@ -604,7 +620,7 @@ RelinkResult RelinkerPipeline::Relink() {
             { std::ostringstream message; message << "CFG/GOT filtering skipped: multiple executable segments are not modeled; "
                       << nonPltCount << " -> " << nonPltCount << "; filtered=0\n"; progress.Message(message.str()); }
         } else {
-            nonPltRefs = unusedNidFilter->Filter(nonPltRefs, raw, textSection, textVAddr, exportedFunctions);
+            nonPltRefs = preserveRoutedImports(unusedNidFilter->Filter(nonPltRefs, raw, textSection, textVAddr, exportedFunctions), nonPltRefs);
             if (nonPltRefs.size() > nonPltCount) throw RelinkerException("Unused NID filter increased the reference count");
             { std::ostringstream message; message << "CFG/GOT filtering: " << nonPltCount << " -> " << nonPltRefs.size() << "; filtered=" << nonPltCount - nonPltRefs.size() << "\n"; progress.Message(message.str()); }
         }

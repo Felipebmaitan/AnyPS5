@@ -1,6 +1,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <relinker/analysis/RelativeJumpTables.hpp>
 #include <relinker/analysis/SceCodeExtent.hpp>
+#include <relinker/analysis/SyscallScanner.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
 #include <elfpatcher/general/GuestModuleWriter.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
@@ -473,6 +474,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         const auto tailPatches = hasCodeTail ? syscallScanner.ScanReferencedTailForSyscalls(image.Bytes, image.Headers, scanBytes, Io::Utf8Path(image.SourcePath), &routedStubs) : std::vector<RelinkPatch>{};
         for (const auto& patch : tailPatches) syscallPatches.emplace(patch.Offset, patch.Bytes);
+        if (FindGuestPathconfImportAddress(image)) ValidateSyscallRoutes(image.Bytes, image.Headers, routedStubs, progress, Io::Utf8Path(image.SourcePath));
         std::set<FileByteOffset> routedOffsets;
         for (const auto& routed : routedStubs) {
             if (!routedOffsets.insert(routed.StubOffset).second) continue;

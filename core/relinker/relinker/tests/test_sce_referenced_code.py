@@ -1,17 +1,20 @@
 from pathlib import Path
 import os
+import json
 import struct
 import subprocess
 import sys
 import tempfile
 
 from test_sce_module_code_extent import sce_module
-from test_guest_symbol_names import importing_executable, dynamic_tags
+from test_guest_symbol_names import importing_executable, dynamic_tags, imported_symbols
 from test_guest_module_args import args_module
 from test_sce_code_extent import fixture as plt_fixture
 from test_jmprel_table_bounds import fixture as no_tail_fixture
 from test_tls_function_coverage import pe_bytes_at
 from test_macos_output import MachO
+from test_guest_intel_trampolines import pe_sections
+from test_guest_syscall_route import fixture as numbered_route_fixture, STUB_191
 
 TAIL = 0x1030
 TLS = bytes.fromhex("64 48 8b 04 25 00 00 00 00 8b 40 f8 c3")
@@ -113,6 +116,7 @@ def convert(relinker, work, name, image, system, error=None, module=False, flags
     result = subprocess.run(command, capture_output=True, text=True, timeout=10)
     if error:
         assert result.returncode == 2 and error in result.stderr and not output.exists(), (name, result.returncode, result.stdout, result.stderr)
+        assert not (case / "app0/sce_module/tail.prx.guest.prx").exists(), name
         return
     assert result.returncode == 0, (name, result.stdout, result.stderr)
     converted = case / "app0/sce_module/tail.prx.guest.prx" if module else output
@@ -247,6 +251,45 @@ def routed_tail(imported=True):
     return image
 
 
+def interior_route(kind):
+    image = routed_tail()
+    image[0x45D] = 0xC3
+    if kind == "branch":
+        body = b"\xe8" + struct.pack("<i", 0x1050 - 0x1035) + bytes.fromhex("b8 09 00 00 00")
+        body += b"\xe8" + struct.pack("<i", 0x1057 - 0x103F) + TLS
+        image[0x430:0x430 + len(body)] = body
+    elif kind == "symbol":
+        struct.pack_into("<IBBHQQ", image, 0xA50, 15, 0x12, 0, 1, 0x1057, 0)
+        for at in range(0x600, 0x6A0, 16):
+            if struct.unpack_from("<Q", image, at)[0] == 0x6100003F:
+                struct.pack_into("<Q", image, at + 8, 72)
+    elif kind == "pointer":
+        struct.pack_into("<QQq", image, 0xA98, 0x2210, 8, 0x1057)
+        for at in range(0x600, 0x6A0, 16):
+            if struct.unpack_from("<Q", image, at)[0] == 0x61000031:
+                struct.pack_into("<Q", image, at + 8, 48)
+    elif kind == "lea32":
+        image[0x400:0x408] = b"\x8d\x05" + struct.pack("<i", 0x1057 - 0x1006) + b"\xc3\x90"
+    else:
+        raise ValueError(kind)
+    return image
+
+
+def padded_interior_route():
+    image = bytearray(numbered_route_fixture(STUB_191))
+    image[0x1000:0x1200] = b"\xcc" * 0x200
+    image[0x1000:0x1007] = b"\x48\x8d\x05" + struct.pack("<i", 0x900 - 0x1007)
+    image[0x1007:0x100C] = b"\xe8" + struct.pack("<i", 0x1060 - 0x100C)
+    image[0x100C:0x1010] = bytes(4)
+    image[0x1060] = 0xC3
+    body = b"\xe8" + struct.pack("<i", 0x1100 - 0x1015) + bytes.fromhex("b8 09 00 00 00")
+    body += b"\xe8" + struct.pack("<i", 0x1107 - 0x101F) + b"\xc3"
+    image[0x1010:0x1010 + len(body)] = body
+    image[0x1100:0x110D] = STUB_191
+    image[0x110D] = 0xC3
+    return image
+
+
 def masked_prefix_tail():
     image, _ = plt_fixture(tls=True, gap_embedded_data=True)
     image[0x380:0x380 + len(TLS)] = TLS
@@ -272,7 +315,43 @@ def main():
             struct.pack_into("<QQ", image, 120 + 32, 240, 240)
             convert(relinker, work, "no-tail-identical-tags", image, "linux")
         for system in systems:
+            for prefix in (False, True):
+                for level in (0, 1, 2):
+                    image = routed_tail()
+                    image[0x420:0x430] = b"\xcc" * 16
+                    address = 0x1000 if prefix else 0x1050
+                    if prefix:
+                        image[0x400:0x40D] = image[0x450:0x45D]
+                        image[0x450:0x45D] = b"\xcc" * 13
+                        image[0x430:0x435] = b"\xe8" + struct.pack("<i", 0x1000 - 0x1035)
+                    name = f"{system}-route-filter-{prefix}-{level}"
+                    converted = convert(relinker, work, name, image, system, flags=("--registry", f"unused-filter={level}"))
+                    registry = json.loads(converted.with_suffix(".registry.json").read_text())
+                    assert any(r["nid"] == "pathconf" and r["relocationType"] == "R_X86_64_GLOB_DAT" and r["targetOffset"] == "0x2200" for r in registry), (name, registry)
+                    data = converted.read_bytes()
+                    if system == "linux":
+                        assert "pathconf" in imported_symbols(data), name
+                    elif system == "windows":
+                        startup = next(section for section in pe_sections(data) if section[0] == b".startup")
+                        assert b"pathconf\0" in data[startup[3]:startup[3] + startup[2]], name
+                    else:
+                        offset, size = MachO(data).dyld_info[2:4]
+                        assert b"_pathconf\0" in data[offset:offset + size], name
+                    patch = output_bytes(data, system, address, 13)
+                    assert patch[:2] == b"\xff\x25" and address + 6 + struct.unpack_from("<i", patch, 2)[0] == 0x2200, (name, patch.hex())
             for module in (False, True):
+                convert(relinker, work, f"{system}-{module}-route-padded-interior", padded_interior_route(), system,
+                        "Syscall route would overwrite an interior reference", module=module)
+                for kind in ("branch", "symbol", "pointer", "lea32"):
+                    convert(relinker, work, f"{system}-{module}-route-interior-{kind}", interior_route(kind), system,
+                            "Syscall route would overwrite an interior reference", module=module)
+                image = routed_tail()
+                image[0x450:0x45F] = bytes.fromhex("48 b8 48 c7 c0 bf 00 00 00 49 89 ca 0f 05 c3")
+                image[0x45F] = 0xC3
+                for trap in (False, True):
+                    convert(relinker, work, f"{system}-{module}-route-immediate-{trap}", image, system,
+                            "Forbidden syscall instruction at code offset 0x105c", module=module,
+                            flags=("--trap-sdk-syscall-stubs",) if trap else ())
                 name = f"{system}-{module}-masked-prefix-tail"
                 image = masked_prefix_tail()
                 table = bytes(image[0x220:0x230])

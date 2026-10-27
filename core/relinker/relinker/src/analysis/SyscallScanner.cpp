@@ -32,31 +32,6 @@ static constexpr std::array<std::uint8_t, 23> SDK_GENERIC_SYSCALL_STUB{
     0x4D, 0x89, 0xC2, 0x4D, 0x89, 0xC8, 0x4C, 0x8B, 0x4C, 0x24, 0x08,
 };
 
-static std::optional<std::uint32_t> SdkSyscallStubNumber(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset) {
-    constexpr std::array<std::uint8_t, 3> numberLoad{0x48, 0xC7, 0xC0};
-    constexpr std::array<std::uint8_t, 3> argumentShuffle{0x49, 0x89, 0xCA};
-    if (syscallOffset > code.size() || syscallOffset < 10u || code.size() - syscallOffset < 3u)
-        return std::nullopt;
-    const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - 10u);
-    if (!std::equal(numberLoad.begin(), numberLoad.end(), begin)
-        || !std::equal(argumentShuffle.begin(), argumentShuffle.end(), begin + 7)
-        || code[syscallOffset] != 0x0F || code[syscallOffset + 1] != 0x05 || code[syscallOffset + 2] != 0xC3)
-        return std::nullopt;
-    std::uint32_t number = 0;
-    std::memcpy(&number, code.data() + syscallOffset - 7u, sizeof(number));
-    return number;
-}
-
-static bool IsSdkSyscallStub(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset) {
-    if (syscallOffset <= code.size() && syscallOffset >= SDK_GENERIC_SYSCALL_STUB.size() && code.size() - syscallOffset >= 3u) {
-        const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - SDK_GENERIC_SYSCALL_STUB.size());
-        if (std::equal(SDK_GENERIC_SYSCALL_STUB.begin(), SDK_GENERIC_SYSCALL_STUB.end(), begin)
-            && code[syscallOffset] == 0x0F && code[syscallOffset + 1] == 0x05 && code[syscallOffset + 2] == 0xC3)
-            return true;
-    }
-    return SdkSyscallStubNumber(code, syscallOffset).has_value();
-}
-
 enum class ForbiddenInstruction {
     None,
     Invocation,
@@ -97,12 +72,48 @@ struct RecentInstructions {
         return matches[(count - 1 - step) % Capacity];
     }
 
+    [[nodiscard]] bool ContainsSequence(FileByteOffset begin, FileByteOffset end) const {
+        if (count == 0 || Before(0).Offset != end || Before(0).Length != 2) return false;
+        for (std::size_t step = 1; step < std::min(count, Capacity); ++step) {
+            const auto& match = Before(step);
+            if (match.Offset < begin || match.Offset >= end || match.Length != end - match.Offset) return false;
+            if (match.Offset == begin) return true;
+            end = match.Offset;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool Contains(FileByteOffset offset) const {
         for (std::size_t step = 0; step < std::min(count, Capacity); ++step)
             if (Before(step).Offset == offset) return true;
         return false;
     }
 };
+
+static std::optional<std::uint32_t> SdkSyscallStubNumber(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset, const std::size_t limit, const RecentInstructions& recent, const FileByteOffset codeOffset) {
+    constexpr std::array<std::uint8_t, 3> numberLoad{0x48, 0xC7, 0xC0};
+    constexpr std::array<std::uint8_t, 3> argumentShuffle{0x49, 0x89, 0xCA};
+    if (syscallOffset > limit || syscallOffset < 10u || limit - syscallOffset < 3u || !recent.ContainsSequence(codeOffset + syscallOffset - 10u, codeOffset + syscallOffset))
+        return std::nullopt;
+    const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - 10u);
+    if (!std::equal(numberLoad.begin(), numberLoad.end(), begin)
+        || !std::equal(argumentShuffle.begin(), argumentShuffle.end(), begin + 7)
+        || code[syscallOffset] != 0x0F || code[syscallOffset + 1] != 0x05 || code[syscallOffset + 2] != 0xC3)
+        return std::nullopt;
+    std::uint32_t number = 0;
+    std::memcpy(&number, code.data() + syscallOffset - 7u, sizeof(number));
+    return number;
+}
+
+static bool IsSdkSyscallStub(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset, const std::size_t limit, const RecentInstructions& recent, const FileByteOffset codeOffset) {
+    if (syscallOffset <= limit && syscallOffset >= SDK_GENERIC_SYSCALL_STUB.size() && limit - syscallOffset >= 3u && recent.ContainsSequence(codeOffset + syscallOffset - SDK_GENERIC_SYSCALL_STUB.size(), codeOffset + syscallOffset)) {
+        const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - SDK_GENERIC_SYSCALL_STUB.size());
+        if (std::equal(SDK_GENERIC_SYSCALL_STUB.begin(), SDK_GENERIC_SYSCALL_STUB.end(), begin)
+            && code[syscallOffset] == 0x0F && code[syscallOffset + 1] == 0x05 && code[syscallOffset + 2] == 0xC3)
+            return true;
+    }
+    return SdkSyscallStubNumber(code, syscallOffset, limit, recent, codeOffset).has_value();
+}
 
 template<std::size_t TSize>
 static bool MatchesSdkInlineStub(const std::vector<std::uint8_t>& code, std::size_t syscallOffset, std::size_t limit, const std::array<std::uint8_t, TSize>& pattern, std::size_t beforeSyscall, const RecentInstructions& recent, FileByteOffset codeOffset) {
@@ -265,6 +276,24 @@ static std::optional<std::uint64_t> ConstantSyscallNumberInBytes(const std::vect
     return std::nullopt;
 }
 
+void ValidateSyscallRoutes(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, const std::vector<RoutedSyscallStub>& routes, Domain::IProgress& progress, std::string_view input) {
+    if (routes.empty()) return;
+    const auto anchors = CodeInstructionCollector().CollectRewriteAnchors(bytes, headers, [&](auto completed, auto total) { progress.Report({Domain::ProgressStage::Decode, std::string(input), completed, total}); });
+    for (const auto& route : routes) {
+        const auto header = std::find_if(headers.begin(), headers.end(), [&](const auto& candidate) {
+            return candidate.Type == 1 && (candidate.Flags & 1) != 0 && route.StubOffset >= candidate.Offset && route.StubOffset - candidate.Offset < candidate.FileSize && route.StubLength <= candidate.FileSize - (route.StubOffset - candidate.Offset);
+        });
+        if (header == headers.end()) throw RelinkerException("Syscall route exceeds executable segment", route.StubOffset);
+        const auto address = header->MappedAddress + (route.StubOffset - header->Offset);
+        const auto anchor = anchors.upper_bound(address);
+        if (anchor != anchors.end() && *anchor - address < route.StubLength) {
+            RelinkerException error("Syscall route would overwrite an interior reference", *anchor);
+            error.InputPath = std::string(input);
+            throw error;
+        }
+    }
+}
+
 class SyscallScanner : public ISyscallScanner {
 public:
     SyscallScanner(Domain::IProgress& progress, const bool trapSdkStubs) : progress(progress), trapSdkStubs(trapSdkStubs) {}
@@ -310,7 +339,7 @@ std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::v
             return;
 
         if (routedStubs != nullptr && kind == ForbiddenInstruction::Invocation) {
-            if (const auto number = SdkSyscallStubNumber(codeSection, opcode); number && *number == 191) {
+            if (const auto number = SdkSyscallStubNumber(codeSection, opcode, limit, recent, codeSectionOffset); number && *number == 191) {
                 routedStubs->push_back({opcode - 10u, 13u, 191});
                 std::ostringstream message;
                 message << "Routing SDK syscall stub 191 at code offset 0x" << std::hex << (match.Offset - 10u) << '\n';
@@ -320,7 +349,7 @@ std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::v
         }
 
         if (trapSdkStubs && kind == ForbiddenInstruction::Invocation &&
-            (IsSdkSyscallStub(codeSection, opcode) || IsSdkMmanSyscallStub(codeSection, opcode, limit, recent, codeSectionOffset))) {
+            (IsSdkSyscallStub(codeSection, opcode, limit, recent, codeSectionOffset) || IsSdkMmanSyscallStub(codeSection, opcode, limit, recent, codeSectionOffset))) {
             trapped.push_back(opcode);
             std::ostringstream message;
             message << "Trapping SDK syscall instruction at code offset 0x" << std::hex << match.Offset << '\n';
