@@ -46,6 +46,7 @@ struct State {
     bool replace = true;
     bool leave = false;
     bool localJump = false;
+    bool changeErrno = false;
     bool socket = false;
     std::intptr_t nativeInput = -1;
     alignas(16) std::array<std::uint64_t, 12> jump{};
@@ -71,6 +72,7 @@ static void APS5_VABI SignalHandler(int) {
         alignas(16) std::uint64_t local[12]{};
         if (setjmp_nid_postfix(local) == 0) longjmp_nid_postfix(local, 1);
     }
+    if (state->changeErrno) Require(close_nid_postfix(-1) == -1 && *__error_nid_postfix() == 9, "handler changes errno");
     if (state->replace) {
         state->closed = close_nid_postfix(state->input);
         state->replaced = dup2_nid_postfix(state->replacement, state->input);
@@ -134,7 +136,8 @@ static void RunCase(int argc, char** argv) {
     reading.disabled = std::strcmp(argv[2], "disabled") == 0;
     reading.socket = source.ends_with("_socket");
     const bool starting = argc == 4 && std::strcmp(argv[3], "starting") == 0;
-    const bool resume = starting || (argc == 4 && std::strcmp(argv[3], "resume") == 0);
+    reading.changeErrno = argc == 4 && std::strcmp(argv[3], "resume_errno") == 0;
+    const bool resume = starting || reading.changeErrno || (argc == 4 && std::strcmp(argv[3], "resume") == 0);
     const bool interrupt = argc == 4 && std::strcmp(argv[3], "interrupt") == 0;
     const bool timeout = argc == 4 && std::strcmp(argv[3], "timeout") == 0;
     reading.leave = argc == 4 && std::strcmp(argv[3], "jump") == 0;
