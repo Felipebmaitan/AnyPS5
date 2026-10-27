@@ -6,6 +6,9 @@ import subprocess
 import tempfile
 
 from test_windows_tls_protected_entries import make_image, pe_bytes_at
+from test_windows_guest_gs_integration import executable_relocation, guest_relocation
+from test_guest_intel_trampolines import main_fixture
+from test_guest_module_directories import module_with_symbol
 
 
 FAMILIES = {
@@ -199,6 +202,77 @@ def validate(values, case, avx):
     return values[:2] + [normalized.hex()] + values[3:]
 
 
+def borrowed_fallbacks(relinker, work):
+    number = 0
+
+    def convert(image, module=None):
+        nonlocal number
+        case = work / f"borrowed-{number}"
+        number += 1
+        case.mkdir()
+        if module is not None:
+            (case / "prx").mkdir()
+            (case / "prx" / "consumer.prx").write_bytes(module)
+        source = case / "input.elf"
+        output = case / "output.exe"
+        source.write_bytes(image)
+        run = subprocess.run([str(relinker.resolve()), "--windows", *(["--skip-sce-module"] if module is None else []), str(source), str(output)], capture_output=True, text=True, timeout=10)
+        assert run.returncode == 0, run
+        if module is not None:
+            assert b"GuestGs" not in output.read_bytes()
+            output = next(case.rglob("consumer.prx.guest.prx"))
+        return output.read_bytes()
+
+    def check(pe, rva, body):
+        assert pe_bytes_at(pe, rva, len(body)) == b"\x0f\x0b\x90" + body[3:]
+        assert b"APS5GGS1" not in pe and b"APS5GGM1" not in pe and b"GuestGs" not in pe
+
+    for store in (False, True):
+        body = bytes.fromhex("65 ff 02") + memory_move(0xf3, 0x7f if store else 0x6f, 12, 4096) + b"\xc3"
+        image = make_image()
+        image[0x210:0x210 + len(body)] = body
+        supported = convert(image)
+        assert pe_bytes_at(supported, 0x10210, 1) == b"\xe9" and b"APS5GGM1" in supported
+        for delta in (3, 4, 6):
+            image = make_image("relative")
+            image[0x210:0x210 + len(body)] = body
+            struct.pack_into("<q", image, 0x728, 0x210 + delta)
+            check(convert(image), 0x10210, body)
+            image = make_image()
+            image[0x210:0x210 + len(body)] = body
+            image[0x200:0x204] = bytes((0x75, 0x10 + delta - 2, 0xeb, 0x10 - 4))
+            check(convert(image), 0x10210, body)
+            module = module_with_symbol(True)
+            module[0x400:0x400 + len(body)] = body
+            struct.pack_into("<Q", module, 0x668, 24)
+            struct.pack_into("<QQq", module, 0x900, 0x2320, 8, 0x1000 + delta)
+            check(convert(main_fixture(), module), 0x10000, body)
+        overlapping = bytearray(body)
+        overlapping[8:12] = bytes.fromhex("65 8b 02 90")
+        image = make_image("relative")
+        image[0x210:0x210 + len(overlapping)] = overlapping
+        struct.pack_into("<q", image, 0x728, 0x218)
+        check(convert(image), 0x10210, overlapping)
+        module = module_with_symbol(True)
+        module[0x400:0x400 + len(overlapping)] = overlapping
+        struct.pack_into("<Q", module, 0x668, 24)
+        struct.pack_into("<QQq", module, 0x900, 0x2320, 8, 0x1008)
+        check(convert(main_fixture(), module), 0x10000, overlapping)
+        for module in (False, True):
+            image = guest_relocation(8) if module else executable_relocation(8, 0x219)
+            site = 0x400 if module else 0x210
+            image[site:site + len(body)] = body
+            if module:
+                struct.pack_into("<Q", image, 0x900, 0x1009)
+            pe = convert(main_fixture(), image) if module else convert(image)
+            image[site:site + 3] = b"\x90" * 3
+            baseline = convert(main_fixture(), image) if module else convert(image)
+            rva = 0x10000 if module else 0x10210
+            assert pe_bytes_at(pe, rva, 3) == b"\x0f\x0b\x90"
+            assert pe_bytes_at(pe, rva + 3, len(body) - 3) == pe_bytes_at(baseline, rva + 3, len(body) - 3)
+            assert b"APS5GGS1" not in pe and b"APS5GGM1" not in pe and b"GuestGs" not in pe
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("relinker", type=Path)
@@ -227,6 +301,7 @@ def main():
             assert run.returncode == 0, (case, run.returncode, run.stdout, run.stderr)
             digest.append((case, validate(run.stdout.split(), case, avx)))
         if args.group == "fallback":
+            borrowed_fallbacks(args.relinker, work)
             for encoding in ("65 f0 0f 10 02", "65 66 f3 0f 10 02", "65 f2 0f 6f 02", "65 0f 6f 02", "65 0f 58 02", "65 66 0f 38 10 02", "65 66 0f 3a 20 02 00", "65 0f 2b 02", "65 f2 0f 12 02", "65 f3 0f 12 02", "65 0f f7 c0", "65 c5 fa 6f 02", "65 62 f1 7c 48 10 02"):
                 op = bytes.fromhex(encoding)
                 source.write_bytes(fixture(op + b"\xc3"))
