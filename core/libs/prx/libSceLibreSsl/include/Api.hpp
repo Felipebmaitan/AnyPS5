@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SceTypes.hpp"
+#include "prx/libSceLibreSsl/include/Bio.hpp"
 
 struct Asn1String {
     std::int32_t length;
@@ -123,18 +124,18 @@ int APS5_VABI ASN1_STRING_print_nid_postfix(void);
 int APS5_VABI ASN1_STRING_to_UTF8_nid_postfix(unsigned char** output, Asn1String* value);
 int APS5_VABI ASN1_STRING_type_nid_postfix(Asn1String* value);
 int APS5_VABI ASN1_TIME_print_nid_postfix(void);
-int APS5_VABI BIO_ctrl_nid_postfix(void);
+std::int64_t APS5_VABI BIO_ctrl_nid_postfix(LibreSsl::Bio* bio, int command, std::int64_t argument, void* pointer);
 int APS5_VABI BIO_f_ssl_nid_postfix(void);
-int APS5_VABI BIO_free_nid_postfix(void);
-int APS5_VABI BIO_new_nid_postfix(void);
+int APS5_VABI BIO_free_nid_postfix(LibreSsl::Bio* bio);
+LibreSsl::Bio* APS5_VABI BIO_new_nid_postfix(const LibreSsl::BioMethod* method);
 int APS5_VABI BIO_new_fp_nid_postfix(void);
-int APS5_VABI BIO_new_mem_buf_nid_postfix(void);
+LibreSsl::Bio* APS5_VABI BIO_new_mem_buf_nid_postfix(const void* source, int size);
 int APS5_VABI BIO_new_socket_nid_postfix(void);
 int APS5_VABI BIO_printf_nid_postfix(void);
-int APS5_VABI BIO_puts_nid_postfix(void);
+int APS5_VABI BIO_puts_nid_postfix(LibreSsl::Bio* bio, const char* source);
 int APS5_VABI BIO_s_file_nid_postfix(void);
-int APS5_VABI BIO_s_mem_nid_postfix(void);
-int APS5_VABI BIO_write_nid_postfix(void);
+const LibreSsl::BioMethod* APS5_VABI BIO_s_mem_nid_postfix();
+int APS5_VABI BIO_write_nid_postfix(LibreSsl::Bio* bio, const void* source, int size);
 int APS5_VABI BN_CTX_end_nid_postfix(void);
 int APS5_VABI BN_CTX_free_nid_postfix(void);
 int APS5_VABI BN_CTX_new_nid_postfix(void);
