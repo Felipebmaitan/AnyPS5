@@ -2,6 +2,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include "nid/Sha1.hpp"
 
 #include <array>
@@ -143,7 +144,10 @@ int main(int argc, char** argv) {
     Pthread writer = nullptr;
     Require(scePthreadCreate(&writer, nullptr, Writer, &state, nullptr) == 0, "create shared writer");
     Require(Observe([&] { return state.ready.load(); }), "shared writer did not start");
-    if (!disabled) Observe([&] { std::lock_guard lock(writer->cancelLock); return writer->cancelIo != nullptr; }, 250);
+    Require(Observe([&] {
+        GuestDescriptorAccess probe(descriptor, GuestDescriptorAccess::Mode::Update, std::defer_lock);
+        return !probe.TryLock();
+    }), "shared writer did not acquire descriptor admission");
     if (cancel) Require(pthread_cancel_nid_postfix(writer) == 0, "request shared write cancellation");
     std::atomic<bool> closed{false};
     std::thread closer;

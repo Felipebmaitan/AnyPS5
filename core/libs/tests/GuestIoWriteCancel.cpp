@@ -307,7 +307,7 @@ static void Run(const char* transport, const char* api, const char* scenario) {
         Drain(state, static_cast<std::size_t>(state.result), 'w');
     }
     else if (!partial) Require((result == GUEST_CANCELED && !state.returned.load()) ||
-        (state.socket && result == reinterpret_cast<void*>(std::uintptr_t{7}) && state.returned.load() && state.result > 0 && state.result <= 2), "blocked write neither canceled nor preserved completed bytes");
+        (!pending && state.socket && result == reinterpret_cast<void*>(std::uintptr_t{7}) && state.returned.load() && state.result > 0 && state.result <= 2), "blocked write neither canceled nor preserved completed bytes");
     if (state.socket && !completion && !partial && !peerClose && !race && state.result > 0) {
         Drain(state, filled, 'f');
         Drain(state, static_cast<std::size_t>(state.result), 'w');
