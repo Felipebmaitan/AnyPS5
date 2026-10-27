@@ -57,6 +57,10 @@ def cases():
     yield "moffs16-rex-r-store", "65 66 44 a3 00 00 00 00 00 00 00 00", b"", 0x8877665544332211, 0x1122334455662211, 0x45
     yield "sib-negative", "65 48 8b 44 88 e0", bytes.fromhex("31 c0 f9"), INITIAL, INITIAL, 0x45
     yield "address32-wrap", "65 67 48 8b 04 08", bytes.fromhex("48 b8 f8 ff ff ff ff ff ff ff"), INITIAL, INITIAL, 0x45
+    yield "eip32-load", "65 67 48 8b 05 00 00 00 00", b"", INITIAL, INITIAL, 0x45
+    yield "eip32-unaligned", "65 67 48 8b 05 01 00 00 00", b"", 0x8811223344556677, INITIAL, 0x45
+    yield "eip32-negative", "65 67 48 8b 05 f8 ff ff ff", b"", INITIAL, INITIAL, 0x45
+    yield "eip32-store", "65 67 48 89 05 00 00 00 00", b"", 0x8877665544332211, 0x8877665544332211, 0x45
     yield "rsp", "65 48 8b 04 0c", bytes.fromhex("48 89 e1 48 f7 d9 31 d2 f9"), INITIAL, INITIAL, 0x45
     yield "extended-sib", "65 4b 8b 44 c8 c0", bytes.fromhex("41 b8 00 00 00 00 41 b9 08 00 00 00"), INITIAL, INITIAL, 0x45
     yield "store-rbx", "65 48 89 1c 25 00 00 00 00", b"", 0x8877665544332211, RBX, 0x45
@@ -100,7 +104,11 @@ def main():
             source.write_bytes(fixture(body))
             converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
             assert converted.returncode == 0, (name, converted.stderr)
-            run = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210"] + (["zero"] if name == "rip" else []), capture_output=True, text=True, timeout=10)
+            mode = ["zero"] if name == "rip" else []
+            if name.startswith("eip32-"):
+                resume = (0x210 if args.native else 0x10210) + body.index(bytes.fromhex(encoding)) + len(bytes.fromhex(encoding))
+                mode = ["eip", hex(resume)]
+            run = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210"] + mode, capture_output=True, text=True, timeout=10)
             assert run.returncode == 0, (name, run.returncode, run.stdout, run.stderr)
             values = [int(value, 16) for value in run.stdout.split()]
             assert values[0] == result and values[5] == memory, (name, run.stdout)
