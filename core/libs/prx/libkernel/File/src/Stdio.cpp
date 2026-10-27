@@ -256,10 +256,11 @@ static std::shared_ptr<PositionedLock> PositionedMutex(int descriptor) {
     }
     return entry;
 }
-std::unique_lock<std::mutex> File::LockPositionedTransfer(int descriptor) {
-    return std::unique_lock<std::mutex>(PositionedMutex(descriptor)->mutex);
+File::PositionedTransferLock File::LockPositionedTransfer(int descriptor) {
+    const auto entry = PositionedMutex(descriptor);
+    return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex));
 }
-std::optional<std::unique_lock<std::mutex>> File::IoPositionedTransfer(int descriptor) {
+std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descriptor) {
     if (!ThreadCancel::IoEnabled()) return LockPositionedTransfer(descriptor);
     const auto entry = PositionedMutex(descriptor);
     TimedWait::Condition changed;
@@ -273,7 +274,7 @@ std::optional<std::unique_lock<std::mutex>> File::IoPositionedTransfer(int descr
             return std::nullopt;
         }
         std::unique_lock lock(entry->mutex, std::try_to_lock);
-        if (lock.owns_lock()) return lock;
+        if (lock.owns_lock()) return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex), std::move(lock));
         std::unique_lock sleep(mutex);
         changed.WaitUntil(sleep, TimedWait::DeadlineNanos(1000));
     }
@@ -862,12 +863,8 @@ int APS5_VABI close_nid_postfix(int d) {
 #ifdef _WIN32
     const auto positioned = File::LockPositionedTransfer(d);
 #endif
-    File::ForgetRandomDevice(d);
-    File::ForgetDescriptor(d);
-    ForgetJitSharedMemory(d);
-    File::ForgetDirectoryDescriptor(d);
+    File::ForgetClosedDescriptor(d);
 #ifdef _WIN32
-    File::ForgetFileLock(d);
     const int shared = File::CloseSharedMemoryDescriptor_nid_no_patch(d);
     if (shared != -2) return shared;
     return WithoutParameterHandler([d] { return ::_close(d); });

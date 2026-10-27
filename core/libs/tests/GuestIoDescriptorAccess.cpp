@@ -198,7 +198,7 @@ static void AccessCancellation(bool positionedWait = false) {
     std::FILE* file = nullptr;
     int input = pipe[0];
 #ifdef _WIN32
-    std::optional<std::unique_lock<std::mutex>> positioned;
+    std::optional<File::PositionedTransferLock> positioned;
     if (positionedWait) {
         file = OpenTemporary();
         input = NativeDescriptor(file);

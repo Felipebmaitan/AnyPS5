@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,6 +36,35 @@ extern "C" void ForgetDirectoryStream_nid_no_patch(int descriptor);
 extern "C" int _IO_switch_to_get_mode(std::FILE* stream);
 #endif
 extern "C" int DuplicateHostDescriptor_nid_no_patch(int descriptor);
+extern "C" void LibcRegisterClosedDescriptors_nid_no_patch(void* (*begin)(int descriptor), void (*end)(void* closing));
+extern "C" void* BeginClosingDescriptor_nid_no_patch(int descriptor);
+extern "C" void EndClosingDescriptor_nid_no_patch(void* closing);
+
+class ClosingDescriptor {
+public:
+    ClosingDescriptor([[maybe_unused]] std::FILE* stream, int descriptor)
+#ifdef _WIN32
+        : _stream(stream), _access(descriptor, GuestDescriptorAccess::Mode::Change), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
+#else
+        : _access(descriptor, GuestDescriptorAccess::Mode::Change), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
+#endif
+    ~ClosingDescriptor() { EndClosingDescriptor_nid_no_patch(_closing); }
+    ClosingDescriptor(const ClosingDescriptor&) = delete;
+    ClosingDescriptor& operator=(const ClosingDescriptor&) = delete;
+
+private:
+#ifdef _WIN32
+    struct LockedStream {
+        explicit LockedStream(std::FILE* value) : stream(value) { ::_lock_file(stream); }
+        ~LockedStream() { ::_unlock_file(stream); }
+        LockedStream(const LockedStream&) = delete;
+        LockedStream& operator=(const LockedStream&) = delete;
+        std::FILE* stream;
+    } _stream;
+#endif
+    GuestDescriptorAccess _access;
+    void* _closing;
+};
 
 struct GuestFilePrefix {
     unsigned char* position = nullptr;
@@ -183,11 +213,6 @@ public:
         [[maybe_unused]] std::FILE* (*open)(const std::filesystem::path&, const std::string&) = nullptr) {
         auto* previous = GetHandle();
         NativeLock streamLock(previous);
-#ifdef _WIN32
-        const GuestDescriptorAccess descriptorAccess(previous ? ::_fileno(previous) : -1, GuestDescriptorAccess::Mode::Change);
-#else
-        const GuestDescriptorAccess descriptorAccess(previous ? ::fileno(previous) : -1, GuestDescriptorAccess::Mode::Change);
-#endif
         _guest = {};
         guestError = false;
         randomDevice = false;
@@ -198,10 +223,12 @@ public:
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(replaced);
         auto* const standard = HostStandardHandle_nid_no_patch(replaced);
         GuestFileLockForget_nid_no_patch(replaced);
+        std::optional<ClosingDescriptor> closing(std::in_place, previous, replaced);
         if (open && !filename.empty()) {
             if (!IsHostStandard()) {
                 _handle = nullptr;
                 streamLock.Close();
+                closing.reset();
                 _handle = open(filename, mode);
             } else {
                 std::wstring resetMode;
@@ -242,6 +269,7 @@ public:
 #else
         if (::fileno(previous) == 2) KeepHostStandardError_nid_no_patch();
         const bool hostStandard = IsHostStandard();
+        const ClosingDescriptor closing(previous, ::fileno(previous));
         const int kept = IsHostStandard() ? DuplicateHostDescriptor_nid_no_patch(::fileno(previous)) : -1;
         if (kept >= 0) ::flockfile(previous);
         if (!hostStandard) streamLock.Forget();
@@ -344,16 +372,14 @@ public:
         GetHandle();
         NativeLock streamLock(_handle);
 #ifdef _WIN32
-        const GuestDescriptorAccess descriptorAccess(::_fileno(_handle), GuestDescriptorAccess::Mode::Change);
-#else
-        const GuestDescriptorAccess descriptorAccess(::fileno(_handle), GuestDescriptorAccess::Mode::Change);
-#endif
-#ifdef _WIN32
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
+        const ClosingDescriptor closing(_handle, ::_fileno(_handle));
+#else
+        const ClosingDescriptor closing(_handle, ::fileno(_handle));
 #endif
-        _handle = nullptr;
         const int result = streamLock.Close();
+        _handle = nullptr;
         _guest.flags = 0;
         _guest.descriptor = -1;
         return result;
