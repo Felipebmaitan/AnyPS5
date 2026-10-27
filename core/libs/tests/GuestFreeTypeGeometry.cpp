@@ -1,12 +1,20 @@
 #include "prx/libSceFreeType/include/Api.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_GLYPH_H
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <string_view>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace FreeType;
 
@@ -19,7 +27,80 @@ static void Print(const TMatrix& matrix) {
     std::cout << ' ' << matrix.xx << ' ' << matrix.xy << ' ' << matrix.yx << ' ' << matrix.yy;
 }
 
-int main() {
+static int CheckWatched() {
+    using namespace GuestArena;
+    constexpr std::size_t bytes = 65536;
+#ifndef _WIN32
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+#ifdef __APPLE__
+        std::abort();
+#else
+        std::cout << "Page write watch is unavailable\n";
+        return 77;
+#endif
+    }
+#else
+    if (!GuestArenaWriteWatched_nid_postfix()) std::abort();
+#endif
+    auto* memory = static_cast<std::byte*>(GuestArenaAllocate_nid_postfix(bytes, bytes));
+    if (!memory) std::abort();
+#ifdef _WIN32
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+    if (!section) std::abort();
+    GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+#else
+    GuestArenaCommit_nid_postfix(memory, bytes, 0x04, bytes);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, bytes);
+#endif
+    const auto collect = [&] {
+#ifdef _WIN32
+        std::array<void*, 32> pages{};
+        auto count = pages.size();
+        if (!GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(memory), bytes, pages.data(), &count, true)) std::abort();
+        return count != 0;
+#else
+        bool written = false;
+        if (!GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(reinterpret_cast<std::uintptr_t>(memory), bytes,
+            [](void* context, std::uintptr_t, std::uintptr_t) { *static_cast<bool*>(context) = true; }, &written)) std::abort();
+        return written;
+#endif
+    };
+    auto* vector = reinterpret_cast<GuestVector*>(memory + 16384 - 8);
+    auto* matrix = reinterpret_cast<GuestMatrix*>(memory + 32768 - 16);
+    auto* inverse = reinterpret_cast<GuestMatrix*>(memory + 49152 - 16);
+    *vector = {1, -2};
+    *matrix = {131072, 0, 0, 131072};
+    *inverse = {131072, 0, 0, 32768};
+    if (!collect() || collect()) std::abort();
+#ifdef _WIN32
+    for (const auto offset : {16376, 16391, 32752, 32783, 49136, 49167}) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(memory + offset, &info, sizeof(info)) != sizeof(info) || info.Protect != PAGE_READONLY) std::abort();
+    }
+#endif
+    FT_Vector_Transform_nid_postfix(vector, matrix);
+    if (vector->x != 2 || vector->y != -4 || !collect() || collect()) std::abort();
+    FT_Matrix_Multiply_nid_postfix(matrix, matrix);
+    if (!Equal(*matrix, {262144, 0, 0, 262144}) || !collect() || collect()) std::abort();
+    if (FT_Matrix_Invert_nid_postfix(inverse) != FT_Err_Ok || !Equal(*inverse, {32768, 0, 0, 131072}) || !collect() || collect()) std::abort();
+    FT_Vector_Transform_nid_postfix(vector, nullptr);
+    FT_Matrix_Multiply_nid_postfix(nullptr, matrix);
+    if (collect()) std::abort();
+    *inverse = {1, 0, 0, 1};
+    if (!collect() || FT_Matrix_Invert_nid_postfix(inverse) != FT_Err_Invalid_Argument || !Equal(*inverse, {1, 0, 0, 1}) || collect()) std::abort();
+#ifndef _WIN32
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+#endif
+    GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArenaRelease_nid_postfix(memory, bytes);
+    std::cout << "Geometry CPU stores into watched guest pages passed\n";
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--watched") return CheckWatched();
+    if (argc != 1) return 1;
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
     GuestMatrix unchanged{65536, -32768, 131072, 65536};
