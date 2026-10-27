@@ -19,6 +19,8 @@ void ShareDescriptor(int from, int to);
 void ForgetDescriptor(int fd);
 bool Appends(int fd);
 void SyncWrites(int fd);
+using SynchronousWriteHook = int (*)(int);
+extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWriteHook hook);
 
 class WriteSync {
 public:

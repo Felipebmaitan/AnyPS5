@@ -11,6 +11,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -640,6 +641,11 @@ void ForgetDescriptor(int fd) {
 }
 
 std::uint64_t g_synchronousWrites = 0;
+std::atomic<SynchronousWriteHook> g_synchronousWriteHook{nullptr};
+
+extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWriteHook hook) {
+    g_synchronousWriteHook.store(hook);
+}
 
 void SyncWrites(int fd) {
     {
@@ -648,7 +654,8 @@ void SyncWrites(int fd) {
         if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return;
     }
     if (Classify(fd, "write") != Kind::File) return;
-    if (const int result = sceKernelFsync(fd); result != 0)
+    const auto hook = g_synchronousWriteHook.load();
+    if (const int result = hook ? hook(fd) : sceKernelFsync(fd); result != 0)
         throw std::runtime_error("write: syncing an O_FSYNC file failed, fd=" + std::to_string(fd) + ", error=" + std::to_string(result & 0xffff));
     std::lock_guard lock(g_mutex);
     ++g_synchronousWrites;
