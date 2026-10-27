@@ -674,6 +674,7 @@ struct ExitReporter {
 } g_exitReporter;
 
 const bool g_crashReportInstalled = [] {
+    GuestGsInstallContinuation_nid_no_patch();
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     AddVectoredExceptionHandler(1, ReportCrash);

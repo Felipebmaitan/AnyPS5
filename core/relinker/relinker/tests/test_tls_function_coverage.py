@@ -806,7 +806,7 @@ def main():
                 ("gs-load-r13", bytes.fromhex("65 4c 8b 2c 25 30 00 00 00"), True),
                 ("gs-store", bytes.fromhex("65 48 89 04 25 30 00 00 00"), True),
                 ("gs-alu", bytes.fromhex("65 48 33 04 25 28 00 00 00"), True),
-                ("gs-short-register-address", bytes.fromhex("65 48 8b 00"), True),
+                ("gs-short-register-address", bytes.fromhex("65 48 8b 00 90"), True),
                 ("gs-nop", bytes.fromhex("65 90"), False),
                 ("gs-register-move", bytes.fromhex("65 48 89 c8"), False),
                 ("gs-cpuid", bytes.fromhex("65 0f a2"), False),

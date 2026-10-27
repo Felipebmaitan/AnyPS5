@@ -91,6 +91,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
         throw;
     }
     runtime.RequiresGuestGsRuntime = std::any_of(sections.begin(), sections.end(), [](const auto& section) { return section.Name == ".ggs"; });
+    runtime.RequiresGuestGsContinuation = std::any_of(sections.begin(), sections.end(), [](const auto& section) { return section.Name == ".ggm"; });
     WindowsTrampolineBuilder().Build(guest.Trampolines, image, sections, nextRva);
     for (const auto& [target, rva] : tlsModules) {
         if (tlsIndex == 0) throw Domain::RelinkerException("Guest TLS relocation has no TLS block", target);

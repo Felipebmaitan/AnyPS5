@@ -32,6 +32,23 @@ def fixture(body):
 
 
 def cases():
+    yield "short-load", "65 48 8b 02", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL, 0x45
+    yield "short-load32", "65 8b 02", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-store", "65 48 89 02", bytes.fromhex("31 d2 f9"), 0x8877665544332211, 0x8877665544332211, 0x45
+    yield "short-xchg", "65 48 87 02", bytes.fromhex("31 d2 f9"), INITIAL, 0x8877665544332211, 0x45
+    yield "short-lock-inc", "65 f0 ff 02", bytes.fromhex("31 d2 f9"), 0x8877665544332211, INITIAL + 1, None
+    yield "short-branch-taken", "65 8b 02 72 01 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-branch-untaken", "65 8b 02 73 01 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-branch-near", "65 8b 02 0f 82 01 00 00 00 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-jump", "65 8b 02 eb 01 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-jump-near", "65 8b 02 e9 01 00 00 00 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-two-followers", "65 8b 02 90 90", bytes.fromhex("31 d2 f9"), INITIAL & 0xffffffff, INITIAL, 0x45
+    yield "short-nop-memory", "65 8b 02 90 48 8b 07", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL, 0x45
+    yield "short-follow-rip", "65 8b 02 48 8b 05 00 00 00 00", bytes.fromhex("31 d2 f9"), 0x9988776655443322, INITIAL, 0x45
+    yield "short-follow-lea", "65 8b 02 48 8d 15 00 00 00 00 48 8b 02", bytes.fromhex("31 d2 f9"), 0x99887766554433c3, INITIAL, 0x45
+    yield "short-follow-fault", "65 ff 02 48 8b 87 00 10 00 00", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL + 1, None
+    yield "short-follow-fault-locked", "65 ff 02 f0 48 ff 87 00 10 00 00 48 8b 87 00 10 00 00", bytes.fromhex("31 d2 f9"), INITIAL + 1, INITIAL + 1, None
+    yield "short-multiple-records", "65 8b 02 48 8b 07 65 48 8b 04 25 00 00 00 00", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL, 0x45
     yield "load", "65 48 8b 04 25 00 00 00 00", b"", INITIAL, INITIAL, 0x45
     yield "store", "65 48 89 04 25 00 00 00 00", b"", 0x8877665544332211, 0x8877665544332211, 0x45
     yield "load32", "65 8b 04 25 00 00 00 00", b"", 0x55667788, INITIAL, 0x45
@@ -91,7 +108,12 @@ def main():
                 position = body.index(bytes.fromhex(encoding))
                 body = bytearray(body)
                 struct.pack_into("<i", body, position + 4, len(body) - position - 8)
-                body += struct.pack("<Q", 0x9988776655443322)
+                body += struct.pack("<Q", result)
+            if name in ("short-follow-rip", "short-follow-lea"):
+                position = body.index(bytes.fromhex(encoding))
+                body = bytearray(body)
+                struct.pack_into("<i", body, position + 6, len(body) - position - 10)
+                body += struct.pack("<Q", result)
             source = work / (name + ".elf")
             output = source.with_suffix(".exe")
             source.write_bytes(fixture(body))
@@ -106,15 +128,24 @@ def main():
             assert values[8:10] == [RBX, RSI], (name, "scratch register", run.stdout)
             if flags is not None:
                 assert values[7] & 0xcd5 == flags, (name, "flags", run.stdout)
-            if sys.platform == "win32" and not args.runtime and name in ("load", "store", "lock-xadd"):
+            if sys.platform == "win32" and not args.runtime and name in ("load", "store", "lock-xadd", "short-load", "short-store", "short-xchg", "short-lock-inc", "short-follow-fault", "short-follow-fault-locked"):
                 site = 0x10210 + body.index(bytes.fromhex(encoding))
-                retry = subprocess.run([str(args.runner.resolve()), str(output), "0x10210", "fault", hex(site)], capture_output=True, text=True, timeout=10)
+                mode = "fault"
+                if name.startswith("short-follow-fault"):
+                    site += 3
+                    mode = "fault-follow"
+                retry = subprocess.run([str(args.runner.resolve()), str(output), "0x10210", mode, hex(site)], capture_output=True, text=True, timeout=10)
                 assert retry.returncode == 0 and retry.stdout == run.stdout, (name, "fault retry", retry)
             values[7] &= 0xcd5
             digest.append((name, values))
         source = work / "atomic.elf"
         output = source.with_suffix(".exe")
         source.write_bytes(fixture(bytes.fromhex("65 f0 48 ff 04 25 00 00 00 00 c3")))
+        converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
+        assert converted.returncode == 0, converted.stderr
+        atomic = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210", "atomic"], capture_output=True, text=True, timeout=10)
+        assert atomic.returncode == 0 and atomic.stdout.strip() == "atomic 512", atomic
+        source.write_bytes(fixture(bytes.fromhex("31 d2 65 f0 ff 02 90 c3")))
         converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
         assert converted.returncode == 0, converted.stderr
         atomic = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210", "atomic"], capture_output=True, text=True, timeout=10)
@@ -144,10 +175,14 @@ def main():
         assert converted.returncode == 0, converted
         assert pe_bytes_at(output.read_bytes(), 0x10215, 5) == image[0x215:0x21a]
         output.unlink()
-        for encoding in ("65 48 8b 00", "65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 6e 00", "65 c5 f9 6e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
+        for encoding in ("65 48 8b 24 25 00 00 00 00", "65 a4", "65 0f 10 00", "65 c4 c1 f9 6e 00", "65 c5 f9 6e 00", "65 62 f1 7c 48 10 00", "65 8f e8 78 c0 44 24 f0 01", "f3 48 0f ae c8", "f3 48 0f ae d8", "8e e8", "8c e8", "0f a8", "0f a9"):
             source.write_bytes(fixture(bytes.fromhex(encoding) + b"\xc3"))
             converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
             assert converted.returncode == 2 and "Unsupported Windows guest GS" in converted.stderr and not output.exists(), (encoding, converted)
+        for encoding in ("65 48 8b 00 c3", "65 8b 00 90 c3", "65 8b 00 e8 00 00 00 00", "65 8b 00 ff d0", "65 8b 00 f7 f1", "65 8b 00 0f 10 00", "65 8b 00 c5 f9 ef c0", "65 8b 00 62 f1 7c 48 58 c0", "65 8b 00 8f e8 78 c0 44 24 f0 01", "65 8b 00 64 48 8b 02"):
+            source.write_bytes(fixture(bytes.fromhex(encoding)))
+            converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
+            assert converted.returncode == 2 and "Short guest GS" in converted.stderr and not output.exists(), (encoding, converted)
         if args.digest:
             import json
             args.digest.write_text(json.dumps(digest))

@@ -10,6 +10,7 @@ import tempfile
 from test_guest_module_directories import module_with_symbol
 from test_guest_intel_trampolines import main_fixture
 from test_windows_tls_protected_entries import make_image
+from guest_import_fixtures import executable
 
 
 GS = bytes.fromhex("65 48 a1 00 00 00 00 00 00 00 00 c3")
@@ -45,11 +46,13 @@ def guest_relocation(kind):
     return image
 
 
-def startup_image(gs):
+def startup_image(gs, short=False):
     image = make_image()
     code = bytes.fromhex("48 8b 05 01 00 00 00 c3")
     if gs:
         code = b"\x65" + code
+    if short:
+        code = bytes.fromhex("48 8d 15 09 00 00 00 48 8d 52 01 65 48 8b 02 90 c3")
     image[0x210:0x210 + len(code) + 8] = code + struct.pack("<Q", 42)
     struct.pack_into("<Q", image, 24, 0x210)
     struct.pack_into("<I", image, 176, 0)
@@ -57,17 +60,21 @@ def startup_image(gs):
     return image
 
 
-def guest_initializer():
+def guest_initializer(short=False):
     image = module_with_symbol(True)
     code = bytes.fromhex("65 48 8b 05 01 00 00 00 c3") + struct.pack("<Q", 42)
     image[0x400:0x400 + len(code)] = code
+    if short:
+        image[0x400:0x407] = bytes.fromhex("8b 05 ea 13 00 00 c3")
+        code = bytes.fromhex("48 8d 15 a9 13 00 00 b8 2a 00 00 00 65 89 02 90 90 c3")
+        image[0x440:0x440 + len(code)] = code
     tags = []
     for offset in range(0x600, 0x700, 16):
         tag = struct.unpack_from("<qQ", image, offset)
         if tag[0] == 0:
             break
         tags.append(tag)
-    tags += [(12, 0x1000), (0, 0)]
+    tags += [(12, 0x1040 if short else 0x1000), (0, 0)]
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", image, 0x600 + index * 16, *tag)
     struct.pack_into("<QQ", image, 176 + 32, len(tags) * 16, len(tags) * 16)
@@ -79,6 +86,7 @@ def main():
     parser.add_argument("relinker", type=Path)
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--state-runtime", type=Path)
+    parser.add_argument("--replay-runtime", type=Path)
     parser.add_argument("--dll-directory", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="anyps5-gs-integration-") as directory:
@@ -112,6 +120,8 @@ def main():
                 ("plain", startup_image(False), None, False),
                 ("gs", startup_image(True), None, True),
                 ("guest-initializer", main_fixture(), guest_initializer(), True),
+                ("short-gs", startup_image(True, short=True), None, True),
+                ("short-guest-initializer", executable("consumer.prx"), guest_initializer(short=True), True),
             ):
                 result, output = convert(image, f"startup-{label}", module)
                 assert result.returncode == 0, result
@@ -128,6 +138,10 @@ def main():
                     shutil.copy2(args.state_runtime, libraries / "libc.prx")
                     state_only = subprocess.run([str(output)], capture_output=True, text=True, timeout=10)
                     assert state_only.returncode != 42 and "does not provide the Windows guest GS runtime" in state_only.stderr, (label, state_only)
+                if label.startswith("short-") and args.replay_runtime:
+                    shutil.copy2(args.replay_runtime, libraries / "libc.prx")
+                    replay_only = subprocess.run([str(output)], capture_output=True, text=True, timeout=10)
+                    assert replay_only.returncode != 42 and "does not provide the Windows guest GS runtime" in replay_only.stderr, (label, replay_only)
                 shutil.copy2(args.runtime, libraries / "libc.prx")
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=10)
                 assert run.returncode == 42, (label, run)

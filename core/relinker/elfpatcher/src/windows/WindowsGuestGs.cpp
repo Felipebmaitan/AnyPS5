@@ -9,7 +9,6 @@ namespace Elfpatcher::Windows {
 
 void WindowsGuestGs::Append(PeSection& section, const std::uint32_t rva, const std::uint8_t* bytes, const Codegen::DecodedInstructionInfo& info) {
     const auto reject = [&] { throw Domain::RelinkerException("Unsupported Windows guest GS instruction", rva); };
-    if (info.Length < 5) reject();
     const auto encodedOpcode = bytes[info.OpcodeOffset];
     if (encodedOpcode == 0xc4 || encodedOpcode == 0xc5 || encodedOpcode == 0x62 ||
         (encodedOpcode == 0x8f && info.OpcodeOffset + 1 < info.Length && (bytes[info.OpcodeOffset + 1] & 0x1f) >= 8)) reject();

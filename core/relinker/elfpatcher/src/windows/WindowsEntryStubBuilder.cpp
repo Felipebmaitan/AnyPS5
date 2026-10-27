@@ -69,7 +69,7 @@ std::u16string toUtf16(const std::string& text) {
 
 }
 
-WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules, const std::set<std::string>& unmatchedImportModules, const bool traceImports, const bool requiresGuestGsRuntime) const {
+WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules, const std::set<std::string>& unmatchedImportModules, const bool traceImports, const bool requiresGuestGsRuntime, const bool requiresGuestGsContinuation) const {
     if (!imports.empty() && libraries.empty())
         throw Domain::RelinkerException("ELF imports have no DT_NEEDED libraries");
     const auto path = normalizeRunPath(runPath);
@@ -174,7 +174,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         }
         if (!gsProvider) throw Domain::RelinkerException("Windows guest GS requires libc.prx among the libraries");
         imported[*gsProvider] = true;
-        gsSymbol = addString("GuestGsIsReplay_nid_no_patch");
+        gsSymbol = addString(requiresGuestGsContinuation ? "GuestGsInstallContinuation_nid_no_patch" : "GuestGsIsReplay_nid_no_patch");
     }
     std::vector<bool> executableImports(guestModules.size());
     const bool unscopedImports = std::any_of(imports.begin(), imports.end(), [](const auto& import) { return import.Library.empty(); });

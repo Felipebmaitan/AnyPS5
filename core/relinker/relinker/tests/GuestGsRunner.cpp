@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #ifndef GUEST_GS_RUNTIME
+    GuestGsInstallContinuation_nid_no_patch();
     AddVectoredExceptionHandler(1, Handle);
 #endif
     const auto nt = Read<std::uint32_t>(bytes.data() + 0x3c);
@@ -102,9 +103,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 #ifdef _WIN32
-    if (argc > 4 && std::strcmp(argv[3], "fault") == 0) {
+    if (argc > 4 && (std::strcmp(argv[3], "fault") == 0 || std::strcmp(argv[3], "fault-follow") == 0)) {
         faultSite = reinterpret_cast<std::uintptr_t>(image) + std::stoull(argv[4], nullptr, 0);
-        faultPage = base;
+        faultPage = base + (std::strcmp(argv[3], "fault-follow") == 0 ? 4096 : 0);
         DWORD previous = 0;
         if (!VirtualProtect(reinterpret_cast<void*>(faultPage), 4096, PAGE_NOACCESS, &previous)) return 8;
     }

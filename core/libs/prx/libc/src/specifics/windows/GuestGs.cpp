@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestGs.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <cstring>
+#include <stdexcept>
 
 namespace {
 
@@ -55,7 +56,7 @@ template<typename TValue> TValue Value(const std::uint8_t* bytes) {
     return value;
 }
 
-bool Find(std::uintptr_t address, std::uint8_t* entry, std::uintptr_t& image, std::uintptr_t& replay, bool replayAddress = false) {
+bool Section(std::uintptr_t address, const char* name, const char* magic, std::uintptr_t& image, std::uintptr_t& start, std::uint32_t& count) {
     MEMORY_BASIC_INFORMATION memory{};
     if (!VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory))) return false;
     image = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
@@ -68,23 +69,54 @@ bool Find(std::uintptr_t address, std::uint8_t* entry, std::uintptr_t& image, st
     for (unsigned index = 0; index < nt.FileHeader.NumberOfSections; ++index) {
         IMAGE_SECTION_HEADER section{};
         if (!Read(table + index * sizeof(section), &section, sizeof(section))) return false;
-        if (std::memcmp(section.Name, ".ggs\0\0\0\0", 8) != 0) continue;
+        if (std::memcmp(section.Name, name, 8) != 0) continue;
         const auto size = section.Misc.VirtualSize;
         if (section.VirtualAddress >= nt.OptionalHeader.SizeOfImage || size > nt.OptionalHeader.SizeOfImage - section.VirtualAddress || size < 16) return false;
-        const auto start = image + section.VirtualAddress;
+        start = image + section.VirtualAddress;
         std::uint8_t header[16];
-        if (!Read(start, header, sizeof(header)) || std::memcmp(header, "APS5GGS1", 8) != 0 || Value<std::uint32_t>(header + 12) != 64) return false;
-        const auto count = Value<std::uint32_t>(header + 8);
+        if (!Read(start, header, sizeof(header)) || std::memcmp(header, magic, 8) != 0 || Value<std::uint32_t>(header + 12) != 64) return false;
+        count = Value<std::uint32_t>(header + 8);
         if (count > (size - 16) / 64) return false;
-        for (std::uint32_t item = 0; item < count; ++item) {
-            if (!Read(start + 16 + static_cast<std::uintptr_t>(item) * 64, entry, 64)) return false;
-            replay = start + 16 + static_cast<std::uintptr_t>(item) * 64 + 31;
-            if (replayAddress ? address < replay - 7 || address > replay + entry[13] : address != replay - 2) continue;
-            return true;
-        }
-        return false;
+        return true;
     }
     return false;
+}
+
+bool Find(std::uintptr_t address, std::uint8_t* entry, std::uintptr_t& image, std::uintptr_t& replay, bool replayAddress = false) {
+    std::uintptr_t start = 0;
+    std::uint32_t count = 0;
+    if (!Section(address, ".ggs\0\0\0\0", "APS5GGS1", image, start, count)) return false;
+    for (std::uint32_t item = 0; item < count; ++item) {
+        if (!Read(start + 16 + static_cast<std::uintptr_t>(item) * 64, entry, 64)) return false;
+        replay = start + 16 + static_cast<std::uintptr_t>(item) * 64 + 31;
+        if (replayAddress ? address < replay - 7 || address > replay + entry[13] : address != replay - 2) continue;
+        return true;
+    }
+    return false;
+}
+
+std::uintptr_t MovedAddress(std::uintptr_t address, bool original) {
+    std::uintptr_t image = 0;
+    std::uintptr_t start = 0;
+    std::uint32_t count = 0;
+    if (!Section(address, ".ggm\0\0\0\0", "APS5GGM1", image, start, count)) return 0;
+    for (std::uint32_t item = 0; item < count; ++item) {
+        std::uint8_t entry[16];
+        const auto record = start + 16 + static_cast<std::uintptr_t>(item) * 64;
+        if (!Read(record, entry, sizeof(entry))) return 0;
+        const auto guest = image + Value<std::uint32_t>(entry);
+        const auto size = Value<std::uint32_t>(entry + 4);
+        const auto clone = record + 16;
+        if (size > 48) return 0;
+        if (original ? address == guest : address >= clone && address < clone + size)
+            return original ? (size == 0 ? image + Value<std::uint32_t>(entry + 8) : clone) : guest;
+    }
+    return 0;
+}
+
+LONG WINAPI Continue(EXCEPTION_POINTERS* info) {
+    if (const auto clone = MovedAddress(info->ContextRecord->Rip, true)) info->ContextRecord->Rip = clone;
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 }
@@ -92,11 +124,16 @@ bool Find(std::uintptr_t address, std::uint8_t* entry, std::uintptr_t& image, st
 extern "C" std::uint64_t GuestGsGet_nid_no_patch() { return BaseSlot::Get(); }
 extern "C" void GuestGsSet_nid_no_patch(std::uint64_t base) { BaseSlot::Set(base); }
 
+extern "C" void GuestGsInstallContinuation_nid_no_patch() {
+    static const auto handler = AddVectoredContinueHandler(0, Continue);
+    if (!handler) throw std::runtime_error("Cannot install the Windows guest GS continue handler");
+}
+
 extern "C" bool GuestGsIsReplay_nid_no_patch(std::uintptr_t address) {
     std::uint8_t entry[64];
     std::uintptr_t image = 0;
     std::uintptr_t replay = 0;
-    return Find(address, entry, image, replay, true);
+    return Find(address, entry, image, replay, true) || MovedAddress(address, false) != 0;
 }
 
 bool GuestGsHandleException_nid_no_patch(EXCEPTION_POINTERS* info) {
@@ -114,6 +151,11 @@ bool GuestGsHandleException_nid_no_patch(EXCEPTION_POINTERS* info) {
         }
         return false;
     }
+    if (const auto guest = MovedAddress(context.Rip, false)) {
+        context.Rip = guest;
+        fault.ExceptionAddress = reinterpret_cast<void*>(guest);
+        return false;
+    }
     if (fault.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION || (context.EFlags & 0x100) != 0) return false;
     std::uint8_t entry[64];
     std::uintptr_t image = 0;
@@ -125,14 +167,14 @@ bool GuestGsHandleException_nid_no_patch(EXCEPTION_POINTERS* info) {
     const auto length = entry[13];
     const auto resume = image + Value<std::uint32_t>(entry + 4);
     if ((base >= 16 && base != 0xfe && base != 0xff) || (index >= 16 && index != 0xff) || entry[10] > 3 || entry[11] > 1 ||
-        (scratch != 3 && scratch != 6) || length == 0 || length > 15 || Value<std::uint32_t>(entry + 4) <= Value<std::uint32_t>(entry) || Value<std::uint32_t>(entry + 4) - Value<std::uint32_t>(entry) > 15 ||
+        (scratch != 3 && scratch != 6) || entry[14] > 1 || length == 0 || length > 15 || Value<std::uint32_t>(entry + 4) <= Value<std::uint32_t>(entry) || Value<std::uint32_t>(entry + 4) - Value<std::uint32_t>(entry) > 15 ||
         entry[31 + length] != 0x0f || entry[32 + length] != 0x0b) return false;
     auto address = Value<std::uint64_t>(entry + 16);
     if (base == 0xfe) address += resume;
     else if (base != 0xff) address += Register(context, base) + (base == 4 ? 128 : 0);
     if (index != 0xff) address += Register(context, index) << entry[10];
     if (entry[11]) address = static_cast<std::uint32_t>(address);
-    address += GuestGsGet_nid_no_patch();
+    if (entry[14] == 0) address += GuestGsGet_nid_no_patch();
     pending = {replay, replay + length, image + Value<std::uint32_t>(entry), resume, Register(context, scratch), scratch};
     Register(context, scratch) = address;
     context.Rip = replay;
