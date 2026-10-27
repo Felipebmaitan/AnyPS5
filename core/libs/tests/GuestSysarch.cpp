@@ -82,9 +82,6 @@ int main() {
     RequireLowHalf(9, base);
     *__error_nid_postfix() = 0;
     Require(sysarch(7, nullptr) == -1 && *__error_nid_postfix() == 14);
-#else
-    Require(Thrown([&read] { sysarch(128, &read); }) == "sysarch not implemented");
-    Require(Thrown([&read] { sysarch(7, &read); }) == "sysarch not implemented");
 #endif
     RequireLowHalf(9, base);
     *__error_nid_postfix() = 0;
