@@ -794,6 +794,11 @@ if(BUILD_TESTING)
         set_tests_properties(guest_standard_streams guest_standard_streams_closed_stdout guest_standard_streams_exclusive_stdout PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME guest_standard_streams_update_stdout COMMAND guest_standard_stream_tests --update-stdout)
+    if(WIN32)
+        set_tests_properties(guest_standard_streams_update_stdout PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_gets_tests ${LIBS_INCLUDE_DIR}/tests/GuestGets.cpp)
     target_include_directories(guest_gets_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_gets_tests PRIVATE libc ${CMAKE_DL_LIBS})
