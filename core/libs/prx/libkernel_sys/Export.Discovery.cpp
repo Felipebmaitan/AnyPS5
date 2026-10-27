@@ -60,21 +60,6 @@ int APS5_VABI blockpool_unmap_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI cpuset_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI cpuset_getid_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI cpuset_setid_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI dynlib_get_obj_member_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -251,11 +236,6 @@ int APS5_VABI mount_nid_postfix(void) {
 }
 
 int APS5_VABI openintr_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI profil_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
