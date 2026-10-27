@@ -32,21 +32,29 @@ static constexpr std::array<std::uint8_t, 23> SDK_GENERIC_SYSCALL_STUB{
     0x4D, 0x89, 0xC2, 0x4D, 0x89, 0xC8, 0x4C, 0x8B, 0x4C, 0x24, 0x08,
 };
 
-static bool IsSdkSyscallStub(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset) {
+static std::optional<std::uint32_t> SdkSyscallStubNumber(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset) {
     constexpr std::array<std::uint8_t, 3> numberLoad{0x48, 0xC7, 0xC0};
     constexpr std::array<std::uint8_t, 3> argumentShuffle{0x49, 0x89, 0xCA};
+    if (syscallOffset > code.size() || syscallOffset < 10u || code.size() - syscallOffset < 3u)
+        return std::nullopt;
+    const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - 10u);
+    if (!std::equal(numberLoad.begin(), numberLoad.end(), begin)
+        || !std::equal(argumentShuffle.begin(), argumentShuffle.end(), begin + 7)
+        || code[syscallOffset] != 0x0F || code[syscallOffset + 1] != 0x05 || code[syscallOffset + 2] != 0xC3)
+        return std::nullopt;
+    std::uint32_t number = 0;
+    std::memcpy(&number, code.data() + syscallOffset - 7u, sizeof(number));
+    return number;
+}
+
+static bool IsSdkSyscallStub(const std::vector<std::uint8_t>& code, const std::size_t syscallOffset) {
     if (syscallOffset <= code.size() && syscallOffset >= SDK_GENERIC_SYSCALL_STUB.size() && code.size() - syscallOffset >= 3u) {
         const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - SDK_GENERIC_SYSCALL_STUB.size());
         if (std::equal(SDK_GENERIC_SYSCALL_STUB.begin(), SDK_GENERIC_SYSCALL_STUB.end(), begin)
             && code[syscallOffset] == 0x0F && code[syscallOffset + 1] == 0x05 && code[syscallOffset + 2] == 0xC3)
             return true;
     }
-    if (syscallOffset > code.size() || syscallOffset < 10u || code.size() - syscallOffset < 3u)
-        return false;
-    const auto begin = code.begin() + static_cast<std::ptrdiff_t>(syscallOffset - 10u);
-    return std::equal(numberLoad.begin(), numberLoad.end(), begin)
-        && std::equal(argumentShuffle.begin(), argumentShuffle.end(), begin + 7)
-        && code[syscallOffset] == 0x0F && code[syscallOffset + 1] == 0x05 && code[syscallOffset + 2] == 0xC3;
+    return SdkSyscallStubNumber(code, syscallOffset).has_value();
 }
 
 enum class ForbiddenInstruction {
@@ -261,15 +269,17 @@ class SyscallScanner : public ISyscallScanner {
 public:
     SyscallScanner(Domain::IProgress& progress, const bool trapSdkStubs) : progress(progress), trapSdkStubs(trapSdkStubs) {}
 
-    std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>& codeSection, FileByteOffset codeSectionOffset, FileByteOffset codeSectionSize, std::string_view input, const std::vector<CodeRange>& unwindRanges) override;
-    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, std::string_view input) override;
+    std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>& codeSection, FileByteOffset codeSectionOffset, FileByteOffset codeSectionSize, std::string_view input, const std::vector<CodeRange>& unwindRanges, std::vector<RoutedSyscallStub>* routedStubs = nullptr) override;
+
+    bool TrapsSdkStubs() const override { return trapSdkStubs; }
+    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, const std::vector<std::uint8_t>& scanBytes, std::string_view input, std::vector<RoutedSyscallStub>* routedStubs) override;
 
 private:
     Domain::IProgress& progress;
     bool trapSdkStubs;
 };
 
-std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>& codeSection, const FileByteOffset codeSectionOffset, const FileByteOffset codeSectionSize, std::string_view input, const std::vector<CodeRange>& unwindRanges) {
+std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>& codeSection, const FileByteOffset codeSectionOffset, const FileByteOffset codeSectionSize, std::string_view input, const std::vector<CodeRange>& unwindRanges, std::vector<RoutedSyscallStub>* routedStubs) {
     if (codeSectionSize > codeSection.size()) throw RelinkerException("Code section exceeds the input buffer", codeSectionOffset);
     if (codeSectionSize > std::numeric_limits<FileByteOffset>::max() - codeSectionOffset) throw RelinkerException("Code section offset overflow", codeSectionOffset);
     const auto limit = static_cast<std::size_t>(codeSectionSize);
@@ -298,6 +308,16 @@ std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::v
 
         if (kind == ForbiddenInstruction::None)
             return;
+
+        if (routedStubs != nullptr && kind == ForbiddenInstruction::Invocation) {
+            if (const auto number = SdkSyscallStubNumber(codeSection, opcode); number && *number == 191) {
+                routedStubs->push_back({opcode - 10u, 13u, 191});
+                std::ostringstream message;
+                message << "Routing SDK syscall stub 191 at code offset 0x" << std::hex << (match.Offset - 10u) << '\n';
+                progress.Message(message.str());
+                return;
+            }
+        }
 
         if (trapSdkStubs && kind == ForbiddenInstruction::Invocation &&
             (IsSdkSyscallStub(codeSection, opcode) || IsSdkMmanSyscallStub(codeSection, opcode, limit, recent, codeSectionOffset))) {
@@ -344,7 +364,8 @@ std::unique_ptr<ISyscallScanner> MakeSyscallScanner(Domain::IProgress& progress,
     return std::make_unique<SyscallScanner>(progress, trapSdkStubs);
 }
 
-std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, std::string_view input) {
+std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, const std::vector<std::uint8_t>& scanBytes, std::string_view input, std::vector<RoutedSyscallStub>* routedStubs) {
+    if (scanBytes.size() != bytes.size()) throw RelinkerException("Syscall scan image size differs from input");
     if (std::none_of(headers.begin(), headers.end(), [](const auto& header) { return header.Type == 0x61000000; })) return {};
     const auto ranges = CodeInstructionCollector().CollectTailReachableRanges(bytes, headers, [&](auto completed, auto total) { progress.Report({Domain::ProgressStage::Decode, std::string(input), completed, total}); });
     std::vector<RelinkPatch> patches;
@@ -355,10 +376,16 @@ std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std
         if (header == headers.end()) throw RelinkerException("Referenced code range exceeds executable segment", range.Begin);
         const auto offset = header->Offset + (range.Begin - header->MappedAddress);
         if (offset > bytes.size() || range.End - range.Begin > bytes.size() - offset) throw RelinkerException("Referenced code range exceeds image", range.Begin);
-        const std::vector<std::uint8_t> code(bytes.begin() + offset, bytes.begin() + offset + (range.End - range.Begin));
-        for (const auto trapped : ScanCodeSectionForSyscalls(code, range.Begin, code.size(), input, {})) {
+        const std::vector<std::uint8_t> code(scanBytes.begin() + offset, scanBytes.begin() + offset + (range.End - range.Begin));
+        std::vector<RoutedSyscallStub> rangeRoutedStubs;
+        for (const auto trapped : ScanCodeSectionForSyscalls(code, range.Begin, code.size(), input, {}, routedStubs ? &rangeRoutedStubs : nullptr)) {
             if (trapped > code.size() || code.size() - trapped < 2) throw RelinkerException("Syscall trap patch exceeds referenced code range", range.Begin + trapped);
             patches.push_back({offset + trapped, {0x0f, 0x0b}});
+        }
+        for (auto routed : rangeRoutedStubs) {
+            if (routed.StubOffset > code.size() || routed.StubLength > code.size() - routed.StubOffset) throw RelinkerException("Syscall route exceeds referenced code range", range.Begin + routed.StubOffset);
+            routed.StubOffset += offset;
+            routedStubs->push_back(routed);
         }
     }
     return patches;
@@ -366,8 +393,8 @@ std::vector<RelinkPatch> SyscallScanner::ScanReferencedTailForSyscalls(const std
 
 class NullSyscallScanner : public ISyscallScanner {
 public:
-    std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>&, FileByteOffset, FileByteOffset, std::string_view, const std::vector<CodeRange>&) override { return {}; }
-    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>&, const std::vector<ProgramHeader>&, std::string_view) override { return {}; }
+    std::vector<std::size_t> ScanCodeSectionForSyscalls(const std::vector<std::uint8_t>&, FileByteOffset, FileByteOffset, std::string_view, const std::vector<CodeRange>&, std::vector<RoutedSyscallStub>* = nullptr) override { return {}; }
+    std::vector<RelinkPatch> ScanReferencedTailForSyscalls(const std::vector<std::uint8_t>&, const std::vector<ProgramHeader>&, const std::vector<std::uint8_t>&, std::string_view, std::vector<RoutedSyscallStub>*) override { return {}; }
 };
 
 std::unique_ptr<ISyscallScanner> MakeNullSyscallScanner() {

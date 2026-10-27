@@ -229,6 +229,32 @@ def null_symbol(root, indexed, stale, body=TLS, shifted=False):
     return image
 
 
+def routed_tail(imported=True):
+    stub = bytes.fromhex("48 c7 c0 bf 00 00 00 49 89 ca 0f 05 c3")
+    image = fixture("entry", b"\xe8" + struct.pack("<i", 0x1050 - 0x1035) + TLS)
+    image[0x450:0x450 + len(stub)] = stub
+    if imported:
+        strings = b"\0libkernel.prx\0pathconf\0"
+        image[0xA00:0xA00 + len(strings)] = strings
+        struct.pack_into("<IBBHQQ", image, 0xA38, strings.index(b"pathconf"), 0x12, 0, 0, 0, 0)
+        struct.pack_into("<QQq", image, 0xA80, 0x2200, (1 << 32) | 6, 0)
+        tags = [(1, 1), (0x61000035, 0), (0x61000037, len(strings)),
+                (0x61000039, 0x20), (0x6100003B, 24), (0x6100003F, 48),
+                (0x6100002F, 0x80), (0x61000031, 24), (0x61000033, 24), (0, 0)]
+        for index, tag in enumerate(tags):
+            struct.pack_into("<qQ", image, 0x600 + index * 16, *tag)
+        struct.pack_into("<QQ", image, 176 + 32, len(tags) * 16, len(tags) * 16)
+    return image
+
+
+def masked_prefix_tail():
+    image, _ = plt_fixture(tls=True, gap_embedded_data=True)
+    image[0x380:0x380 + len(TLS)] = TLS
+    struct.pack_into("<qQqQ", image, 0x4D0, 12, 0x380, 0, 0)
+    struct.pack_into("<QQ", image, 120 + 32, 240, 240)
+    return image
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     systems = [sys.argv[2]] if len(sys.argv) > 2 else ["linux", "windows", "macos"]
@@ -246,6 +272,26 @@ def main():
             struct.pack_into("<QQ", image, 120 + 32, 240, 240)
             convert(relinker, work, "no-tail-identical-tags", image, "linux")
         for system in systems:
+            for module in (False, True):
+                name = f"{system}-{module}-masked-prefix-tail"
+                image = masked_prefix_tail()
+                table = bytes(image[0x220:0x230])
+                converted = convert(relinker, work, name, image, system, module=module)
+                assert table in converted.read_bytes(), name
+                if system != "linux":
+                    assert TLS not in converted.read_bytes(), name
+                name = f"{system}-{module}-routed-tail"
+                converted = convert(relinker, work, name, routed_tail(), system, module=module)
+                patch = output_bytes(converted.read_bytes(), system, 0x1050, 13)
+                assert patch[:2] == b"\xff\x25" and patch[6:] == b"\x90" * 7, (name, patch.hex())
+                assert 0x1056 + struct.unpack_from("<i", patch, 2)[0] == 0x2200, (name, patch.hex())
+                if system != "linux":
+                    assert output_bytes(converted.read_bytes(), system, TAIL + 5, 1) == b"\xe9", name
+                convert(relinker, work, name + "-unimported", routed_tail(False), system,
+                        "missing libkernel pathconf import", module=module)
+                converted = convert(relinker, work, name + "-trapped", routed_tail(False), system,
+                                    module=module, flags=("--trap-sdk-syscall-stubs",))
+                assert output_bytes(converted.read_bytes(), system, 0x105A, 2) == b"\x0f\x0b", name
             converted = convert(relinker, work, system + "-lea-observer-data", lea_observer(False), system)
             assert output_bytes(converted.read_bytes(), system, 0x1054, 1) == b"\x25"
             if os.name == "nt" and system == "windows":
