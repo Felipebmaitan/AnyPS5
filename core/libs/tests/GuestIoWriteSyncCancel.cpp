@@ -40,6 +40,7 @@ struct State {
     int file = -1;
     PthreadKey key = -1;
     std::string api, scenario;
+    bool metadata = false;
     std::atomic<unsigned> calls{0}, cleanups{0}, destructors{0}, signals{0};
     std::atomic<bool> entered{false}, finished{false}, returned{false};
     std::int64_t result = -2;
@@ -66,6 +67,7 @@ static int Flush(int file) {
     const bool completed = ::read(state->input, &token, 1) == 1;
 #endif
     if (!completed) return static_cast<int>(0x80020004u);
+    if (state->metadata) return 0;
 #ifdef _WIN32
     Require(::_commit(file) == 0, "native file flush failed");
 #else
@@ -132,6 +134,10 @@ int main(int argc, char** argv) {
     State storage;
     state = &storage;
     state->api = argv[1]; state->scenario = argv[2];
+    if (state->scenario.starts_with("metadata_")) {
+        state->metadata = true;
+        state->scenario.erase(0, 9);
+    }
     const auto path = "anyps5-sync-cancel-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     state->file = open_nid_postfix(path.c_str(), 2 | 0x200, 0600);
     Require(state->file >= 0 && fcntl_nid_postfix(state->file, 4, 0x80) == 0, "create synchronous file");
@@ -140,7 +146,8 @@ int main(int argc, char** argv) {
         state->file = open_nid_postfix(path.c_str(), 0x80, 0600);
         Require(state->file >= 0, "reopen read-only synchronous file");
     }
-    File::FileSetSynchronousWriteHookForTest_nid_no_patch(Flush);
+    if (state->metadata) File::FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(Flush);
+    else File::FileSetSynchronousWriteHookForTest_nid_no_patch(Flush);
     if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") {
         const auto result = Write(state->scenario == "error" ? 2 : 0);
         Require(result == (state->scenario == "error" ? -1 : 0), "zero or failed write result");
@@ -208,6 +215,7 @@ int main(int argc, char** argv) {
 #endif
     }
     File::FileSetSynchronousWriteHookForTest_nid_no_patch(nullptr);
+    File::FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(nullptr);
     if (state->scenario != "close") Require(close_nid_postfix(state->file) == 0, "close synchronous file");
     std::filesystem::remove(path);
     return 0;

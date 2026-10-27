@@ -22,6 +22,7 @@ bool Appends(int fd);
 bool SyncWrites(int fd);
 using SynchronousWriteHook = int (*)(int);
 extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWriteHook hook);
+extern "C" void FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(SynchronousWriteHook hook);
 
 class WriteSync {
 public:

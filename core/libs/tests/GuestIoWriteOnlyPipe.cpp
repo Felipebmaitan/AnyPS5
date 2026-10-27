@@ -34,6 +34,7 @@ static bool Observe(TPredicate predicate) {
 struct State {
     int file = -1;
     bool vector = false, disabled = false;
+    std::size_t bytes = 1;
     std::atomic<bool> ready{false}, returned{false}, done{false};
     std::atomic<unsigned> cleanups{0};
     std::int64_t result = -2;
@@ -52,9 +53,9 @@ static void* APS5_VABI Writer(void* opaque) {
     CleanupHandler cleanup{};
     __pthread_cleanup_push_imp_nid_postfix(Cleanup, &state, &cleanup);
     state.ready.store(true);
-    char byte = 'w';
-    const KernelIovec vectors[]{{nullptr, 0}, {&byte, 1}};
-    state.result = state.vector ? writev_nid_postfix(state.file, vectors, 2) : write_nid_postfix(state.file, &byte, 1);
+    char bytes[] = {'w', 'w'};
+    const KernelIovec vectors[]{{bytes, state.bytes / 2}, {bytes + state.bytes / 2, state.bytes - state.bytes / 2}};
+    state.result = state.vector ? writev_nid_postfix(state.file, vectors, 2) : write_nid_postfix(state.file, bytes, state.bytes);
     state.error = *__error_nid_postfix();
     state.returned.store(true);
     if (state.disabled) {
@@ -72,13 +73,14 @@ int main(int argc, char** argv) {
     State state;
     state.vector = std::string(argv[1]) == "writev";
     state.disabled = scenario == "disabled";
+    state.bytes = scenario == "nonblocking_partial" ? 2 : 1;
     const auto name = L"\\\\.\\pipe\\anyps5-minimal-writer-" + std::to_wstring(GetCurrentProcessId());
     const auto server = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
     Require(server != INVALID_HANDLE_VALUE, "create inbound pipe server");
     HANDLE client = CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     Require(client != INVALID_HANDLE_VALUE, "open write-only client");
     Require(ConnectNamedPipe(server, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED, "connect inbound pipe");
-    if (scenario == "nonblocking") {
+    if (scenario.starts_with("nonblocking")) {
         DWORD mode = PIPE_NOWAIT;
         Require(SetNamedPipeHandleState(client, &mode, nullptr, nullptr), "set nonblocking client");
     }
@@ -98,7 +100,7 @@ int main(int argc, char** argv) {
     Require(query && query(client, status, &access, sizeof(access), 8) >= 0 && (access & FILE_READ_ATTRIBUTES) == 0, "client unexpectedly has read-attribute access");
     state.file = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(client), _O_WRONLY | _O_BINARY);
     Require(state.file >= 0, "adopt minimal pipe client");
-    std::vector<char> fill(static_cast<std::size_t>(available), 'f');
+    std::vector<char> fill(static_cast<std::size_t>(available) - (scenario == "nonblocking_partial" ? 1 : 0), 'f');
     if (scenario != "complete") {
         DWORD count = 0;
         Require(WriteFile(client, fill.data(), static_cast<DWORD>(fill.size()), &count, nullptr) && count == fill.size(), "fill minimal pipe quota");
@@ -133,7 +135,11 @@ int main(int argc, char** argv) {
     Require(result == (canceled ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "minimal pipe join result");
     if (scenario == "cancel") Require(!state.returned.load(), "blocked minimal writer returned before cancellation");
     else if (scenario == "close") Require(state.result == -1 && state.error == 4, "minimal pipe close result");
-    else if (scenario == "nonblocking") Require(state.result == -1 && state.error == 35, "minimal pipe nonblocking result");
+    else if (scenario.starts_with("nonblocking")) {
+        Require(state.result == -1 && state.error == 35, "minimal pipe nonblocking result");
+        DWORD queued = 0;
+        Require(PeekNamedPipe(server, nullptr, 0, nullptr, &queued, nullptr) && queued == fill.size(), "small nonblocking write changed the pipe");
+    }
     else {
         Require(state.result == 1, "minimal pipe write lost count");
         char byte = 0; DWORD count = 0;

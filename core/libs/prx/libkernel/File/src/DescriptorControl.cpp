@@ -643,9 +643,14 @@ void ForgetDescriptor(int fd) {
 
 std::uint64_t g_synchronousWrites = 0;
 std::atomic<SynchronousWriteHook> g_synchronousWriteHook{nullptr};
+std::atomic<SynchronousWriteHook> g_synchronousWriteMetadataHook{nullptr};
 
 extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWriteHook hook) {
     g_synchronousWriteHook.store(hook);
+}
+
+extern "C" void FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(SynchronousWriteHook hook) {
+    g_synchronousWriteMetadataHook.store(hook);
 }
 
 bool SyncWrites(int fd) {
@@ -654,9 +659,22 @@ bool SyncWrites(int fd) {
         const auto found = g_entries.find(fd);
         if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return true;
     }
-    if (Classify(fd, "write") != Kind::File) return true;
     const auto hook = g_synchronousWriteHook.load();
-    if (const int result = ThreadCancel::Native([&] { return hook ? hook(fd) : sceKernelFsync(fd); }); result != 0) {
+    const auto metadataHook = g_synchronousWriteMetadataHook.load();
+    bool synchronized = false;
+    int result;
+    try {
+        result = ThreadCancel::Native([&] {
+            if (metadataHook && metadataHook(fd) != 0) throw std::runtime_error("write: synchronous metadata query failed");
+            if (Classify(fd, "write") != Kind::File) return 0;
+            synchronized = true;
+            return hook ? hook(fd) : sceKernelFsync(fd);
+        });
+    } catch (const std::runtime_error&) {
+        if (!ThreadCancel::IoActive() || !ThreadCancel::IoInterrupted()) throw;
+        result = -1;
+    }
+    if (result != 0) {
         if (ThreadCancel::IoActive() && (ThreadCancel::IoInterrupted() || (static_cast<unsigned>(result) & 0xffff) == EINTR)) {
             ThreadCancel::IoNoRestart();
             errno = EINTR;
@@ -664,6 +682,7 @@ bool SyncWrites(int fd) {
         }
         throw std::runtime_error("write: syncing an O_FSYNC file failed, fd=" + std::to_string(fd) + ", error=" + std::to_string(result & 0xffff));
     }
+    if (!synchronized) return true;
     std::lock_guard lock(g_mutex);
     ++g_synchronousWrites;
     return true;
