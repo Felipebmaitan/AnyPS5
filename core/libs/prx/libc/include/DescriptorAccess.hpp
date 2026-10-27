@@ -3,10 +3,21 @@
 
 #include <memory>
 #include <mutex>
+#include <cstdint>
 
 class GuestDescriptorAccess {
+    struct State;
 public:
-    enum class Mode { Read, Change };
+    class Version {
+    public:
+        bool Unchanged() const;
+    private:
+        friend class GuestDescriptorAccess;
+        Version(std::shared_ptr<State> state, std::uint64_t value);
+        std::shared_ptr<State> state;
+        std::uint64_t value;
+    };
+    enum class Mode { Read, Change, Update };
     GuestDescriptorAccess(int descriptor, Mode mode);
     GuestDescriptorAccess(int descriptor, Mode mode, std::defer_lock_t);
     ~GuestDescriptorAccess();
@@ -17,10 +28,10 @@ public:
     void Unlock();
     bool ReadOrWait();
     void Wake() noexcept;
+    Version Snapshot() const;
     static void LockTogether(GuestDescriptorAccess& first, GuestDescriptorAccess& second);
 
 private:
-    struct State;
     static std::shared_ptr<State> Get(int descriptor);
     std::shared_ptr<State> state;
     Mode mode;

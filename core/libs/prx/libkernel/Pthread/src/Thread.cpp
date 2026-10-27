@@ -731,6 +731,7 @@ static void finishThread(PthreadPrivate* self, void* retval) {
         throw std::runtime_error("Guest thread is already finishing");
     CurrentGuestState().finishing = true;
     CurrentGuestState().exiting = true;
+    ThreadCancel::RetireIoStack(std::numeric_limits<std::uintptr_t>::max());
     UnregisterStack(self);
     if (const auto callback = threadDtors.load())
         callback();
@@ -771,8 +772,11 @@ void ThreadCancel::EndWait() {
 
 static thread_local unsigned ioPoints = 0;
 
-ThreadCancel::IoPoint::IoPoint() { ++ioPoints; }
-ThreadCancel::IoPoint::~IoPoint() { --ioPoints; }
+ThreadCancel::IoPoint::IoPoint(IoRestart& restart) { BeginIoSignals(CurrentGuestState().current, restart); ++ioPoints; }
+ThreadCancel::IoPoint::~IoPoint() { --ioPoints; EndIoSignals(delivery); }
+
+bool ThreadCancel::IoActive() { return ioPoints != 0; }
+bool ThreadCancel::IoRestartError() { return *__error_nid_postfix() == 4; }
 
 bool ThreadCancel::IoEnabled() {
     return ioPoints != 0 && CurrentGuestState().current && !CurrentGuestState().exiting &&
@@ -780,17 +784,25 @@ bool ThreadCancel::IoEnabled() {
 }
 
 ThreadCancel::IoWait::IoWait(Interrupt interrupt, void* argument) : interrupt(interrupt), argument(argument) {
+    BeginSignal();
     if (!IoEnabled()) return;
     thread = CurrentGuestState().current;
-    std::lock_guard lock(thread->cancelLock);
-    previous = thread->cancelIo;
-    thread->cancelIo = this;
+    try {
+        std::lock_guard lock(thread->cancelLock);
+        previous = thread->cancelIo;
+        thread->cancelIo = this;
+    } catch (...) {
+        EndSignal();
+        throw;
+    }
 }
 
 ThreadCancel::IoWait::~IoWait() {
-    if (!thread) return;
-    std::lock_guard lock(thread->cancelLock);
-    thread->cancelIo = previous;
+    if (thread) {
+        std::lock_guard lock(thread->cancelLock);
+        thread->cancelIo = previous;
+    }
+    EndSignal();
 }
 
 extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
@@ -1242,6 +1254,7 @@ void APS5_VABI scePthreadExit(void* retval) {
         throw std::runtime_error("scePthreadExit: current thread is not registered");
     auto* self = CurrentGuestState().current;
     CurrentGuestState().exiting = true;
+    ThreadCancel::RetireIoStack(std::numeric_limits<std::uintptr_t>::max());
     while (CurrentGuestState().cleanupHandlers) __pthread_cleanup_pop_imp_nid_postfix(1);
     finishThread(self, retval);
     CurrentGuestState().current = nullptr;

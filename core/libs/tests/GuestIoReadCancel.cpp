@@ -33,6 +33,7 @@ struct State {
     bool waitAll = false;
     bool dontWait = false;
     bool zero = false;
+    bool zeroCancel = false;
     int error = 0;
     std::atomic<bool> ready{false};
     std::atomic<bool> release{false};
@@ -92,6 +93,11 @@ static void* APS5_VABI Reader(void* opaque) {
     else Require(false, "unknown read API");
     state.error = *__error_nid_postfix();
     state.returned.store(true);
+    if (state.zeroCancel) {
+        Require(state.transferred == 0, "zero receive returned an error without canceling");
+        Require(Observe([&] { return state.release.load(); }), "release successful zero receive");
+        scePthreadTestcancel();
+    }
     if (state.disabled || state.sce) {
         Require(state.zero ? state.transferred == 0 : state.transferred == 1 && state.buffer[0] == 'x', "disabled read lost data");
         Require(scePthreadSetcancelstate(GUEST_CANCEL_ENABLE, nullptr) == 0, "enable cancellation");
@@ -124,6 +130,7 @@ static void Run(int argc, char** argv) {
     state.zero = state.operation == "recvmsg_empty" || state.operation == "recvmsg_zero";
     state.sce = state.operation == "sce_read" || state.operation == "sce_readv";
     const std::string scenario = argv[3];
+    state.zeroCancel = state.zero && scenario == "cancel";
     state.disabled = scenario == "disabled";
     state.pending = scenario == "pending";
     state.partial = scenario == "partial";
@@ -203,7 +210,7 @@ static void Run(int argc, char** argv) {
     const bool partialCompletion = state.waitAll && result == reinterpret_cast<void*>(std::uintptr_t{7});
     const bool racingCompletion = race && result == reinterpret_cast<void*>(std::uintptr_t{7});
     Require(result == (completion || partialCompletion || racingCompletion || wouldBlock ? reinterpret_cast<void*>(std::uintptr_t{7}) : GUEST_CANCELED), "wrong thread result");
-    Require(state.returned.load() == (completion || partialCompletion || racingCompletion || wouldBlock || state.disabled || state.sce), "unexpected read return");
+    if (!state.zeroCancel) Require(state.returned.load() == (completion || partialCompletion || racingCompletion || wouldBlock || state.disabled || state.sce), "unexpected read return");
     if (partialCompletion) Require(state.transferred == 1 && state.buffer[0] == 'x', "interrupted WAITALL lost progress");
     if (completion || racingCompletion) Require(state.zero ? state.transferred == 0 : state.transferred == 1 && state.buffer[0] == 'x', "completion lost data");
     if (state.zero && (completion || state.disabled)) {

@@ -33,6 +33,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/NativeIo.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/IoSignals.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
@@ -100,6 +101,51 @@ endif()
 configure_windows_unwind(libkernel)
 
 if(BUILD_TESTING)
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(guest_io_signal_close_tests ${LIBS_INCLUDE_DIR}/tests/GuestIoSignalClose.cpp)
+        target_include_directories(guest_io_signal_close_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_io_signal_close_tests PRIVATE libkernel libc)
+        configure_windows_unwind(guest_io_signal_close_tests)
+        foreach(ioSignalSource native fault_signal exception native_socket exception_socket)
+            foreach(ioSignalMode enabled disabled unregistered)
+                if(WIN32 AND (NOT ioSignalSource MATCHES "^exception" OR ioSignalMode STREQUAL "unregistered"))
+                    continue()
+                endif()
+                if(ioSignalSource MATCHES "^exception" AND ioSignalMode STREQUAL "unregistered")
+                    continue()
+                endif()
+                set(ioSignalTest guest_io_signal_${ioSignalSource}_${ioSignalMode})
+                add_test(NAME ${ioSignalTest} COMMAND guest_io_signal_close_tests ${ioSignalSource} ${ioSignalMode})
+                set_tests_properties(${ioSignalTest} PROPERTIES TIMEOUT 15)
+                add_test(NAME ${ioSignalTest}_resume COMMAND guest_io_signal_close_tests ${ioSignalSource} ${ioSignalMode} resume)
+                set_tests_properties(${ioSignalTest}_resume PROPERTIES TIMEOUT 15)
+                foreach(ioSignalJump jump local_jump)
+                    add_test(NAME ${ioSignalTest}_${ioSignalJump} COMMAND guest_io_signal_close_tests ${ioSignalSource} ${ioSignalMode} ${ioSignalJump})
+                    set_tests_properties(${ioSignalTest}_${ioSignalJump} PROPERTIES TIMEOUT 15)
+                    if(WIN32)
+                        set_tests_properties(${ioSignalTest}_${ioSignalJump} PROPERTIES ENVIRONMENT_MODIFICATION
+                            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+                    endif()
+                endforeach()
+                if(NOT ioSignalSource MATCHES "^exception")
+                    add_test(NAME ${ioSignalTest}_interrupt COMMAND guest_io_signal_close_tests ${ioSignalSource} ${ioSignalMode} interrupt)
+                    set_tests_properties(${ioSignalTest}_interrupt PROPERTIES TIMEOUT 15)
+                endif()
+                if(ioSignalSource MATCHES "_socket$")
+                    add_test(NAME ${ioSignalTest}_timeout COMMAND guest_io_signal_close_tests ${ioSignalSource} ${ioSignalMode} timeout)
+                    set_tests_properties(${ioSignalTest}_timeout PROPERTIES TIMEOUT 15)
+                    if(WIN32)
+                        set_tests_properties(${ioSignalTest}_timeout PROPERTIES ENVIRONMENT_MODIFICATION
+                            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+                    endif()
+                endif()
+                if(WIN32)
+                    set_tests_properties(${ioSignalTest} ${ioSignalTest}_resume PROPERTIES ENVIRONMENT_MODIFICATION
+                        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+                endif()
+            endforeach()
+        endforeach()
+    endif()
     add_test_executable(guest_io_descriptor_access_tests ${LIBS_INCLUDE_DIR}/tests/GuestIoDescriptorAccess.cpp)
     target_include_directories(guest_io_descriptor_access_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_io_descriptor_access_tests PRIVATE libkernel libc libSceNet)

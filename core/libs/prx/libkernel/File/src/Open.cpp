@@ -77,6 +77,7 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     const auto positioned = File::IoPositionedTransfer(fd);
     if (!positioned) return -1;
     const int result = ThreadCancel::Native([&] { return ::_read(fd, buf, static_cast<unsigned int>(n)); });
+    if (result < 0 && _doserrno == ERROR_OPERATION_ABORTED) errno = EINTR;
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     return result;
 }

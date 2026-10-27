@@ -261,7 +261,7 @@ File::PositionedTransferLock File::LockPositionedTransfer(int descriptor) {
     return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex));
 }
 std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descriptor) {
-    if (!ThreadCancel::IoEnabled()) return LockPositionedTransfer(descriptor);
+    if (!ThreadCancel::IoActive()) return LockPositionedTransfer(descriptor);
     const auto entry = PositionedMutex(descriptor);
     TimedWait::Condition changed;
     std::mutex mutex;
@@ -269,7 +269,7 @@ std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descr
         static_cast<TimedWait::Condition*>(argument)->NotifyAll();
     }, &changed);
     for (;;) {
-        if (ThreadCancel::Requested()) {
+        if (ThreadCancel::IoInterrupted()) {
             errno = EINTR;
             return std::nullopt;
         }
@@ -320,7 +320,7 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
     }
     if (!ok) {
         if (!write && error == ERROR_HANDLE_EOF) return 0;
-        errno = error == ERROR_ACCESS_DENIED ? EBADF : EIO;
+        errno = ThreadCancel::IoInterrupted() ? EINTR : error == ERROR_ACCESS_DENIED ? EBADF : EIO;
         return -1;
     }
     return done;
@@ -363,7 +363,11 @@ static std::int64_t NativeTransferBuffer(int descriptor, void* buf, std::size_t 
             if (appended != -2) return appended;
         }
     }
-    if (!write) return ThreadCancel::Native([&] { return ::_read(descriptor, buf, static_cast<unsigned int>(nbytes)); });
+    if (!write) {
+        const auto result = ThreadCancel::Native([&] { return ::_read(descriptor, buf, static_cast<unsigned int>(nbytes)); });
+        if (result < 0 && _doserrno == ERROR_OPERATION_ABORTED) errno = EINTR;
+        return result;
+    }
     const int result = ::_write(descriptor, buf, static_cast<unsigned int>(nbytes));
     if (result < 0 && (_doserrno == ERROR_NO_DATA || _doserrno == ERROR_BROKEN_PIPE) && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor))) == FILE_TYPE_PIPE) errno = EPIPE;
     return result;
@@ -819,7 +823,17 @@ File::IoDescriptor::IoDescriptor(int descriptor)
         *__error_nid_postfix() = GUEST_EBADF;
         return;
     }
+    if (!ThreadCancel::TrackIoDescriptor(descriptor)) {
+        value = -1;
+        *__error_nid_postfix() = GUEST_EINTR;
+        return;
+    }
     if (access.TryLock()) {
+        if (!ThreadCancel::TrackIoDescriptor(descriptor)) {
+            value = -1;
+            *__error_nid_postfix() = GUEST_EINTR;
+            return;
+        }
         if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
             value = -1;
             *__error_nid_postfix() = GUEST_EBADF;
@@ -830,12 +844,17 @@ File::IoDescriptor::IoDescriptor(int descriptor)
         static_cast<GuestDescriptorAccess*>(argument)->Wake();
     }, &access);
     for (;;) {
-        if (ThreadCancel::IoEnabled() && ThreadCancel::Requested()) {
+        if (ThreadCancel::IoInterrupted()) {
             value = -1;
             *__error_nid_postfix() = GUEST_EINTR;
             return;
         }
         if (access.ReadOrWait()) {
+            if (!ThreadCancel::TrackIoDescriptor(descriptor)) {
+                value = -1;
+                *__error_nid_postfix() = GUEST_EINTR;
+                return;
+            }
             if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
                 value = -1;
                 *__error_nid_postfix() = GUEST_EBADF;

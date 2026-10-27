@@ -38,13 +38,40 @@ void BeginWait(TimedWait::Condition* condition);
 void EndWait();
 
 bool IoEnabled();
+bool IoActive();
+bool IoInterrupted();
+bool IoRestartError();
+class IoRestart {
+public:
+    struct State;
+    explicit IoRestart(bool allowed);
+    ~IoRestart();
+    bool Ready() const;
+    void Clear();
+    IoRestart(const IoRestart&) = delete;
+    IoRestart& operator=(const IoRestart&) = delete;
+private:
+    friend void BeginIoSignals(Pthread, IoRestart&);
+    State* state;
+};
+void BeginIoSignals(Pthread thread, IoRestart& restart);
+void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral);
+bool DeferIoSignal(int signal, bool restart = true);
+bool DeferIoCallback(void (*callback)(), void (*retire)());
+void WakeIoDelivery(Pthread thread);
+bool TrackIoDescriptor(int descriptor);
+void IoNoRestart();
+void RetireIoStack(std::uintptr_t stack);
 
 class IoPoint {
 public:
-    IoPoint();
+    explicit IoPoint(IoRestart& restart);
     ~IoPoint();
     IoPoint(const IoPoint&) = delete;
     IoPoint& operator=(const IoPoint&) = delete;
+
+private:
+    std::optional<TimedWait::DeliveryDeferral> delivery{std::in_place};
 };
 
 class IoWait {
@@ -57,10 +84,14 @@ public:
     void Wake() noexcept { interrupt(argument); }
 
 private:
+    void BeginSignal();
+    void EndSignal();
     Interrupt interrupt;
     void* argument;
     IoWait* previous = nullptr;
     Pthread thread = nullptr;
+    void* signalState = nullptr;
+    IoWait* signalPrevious = nullptr;
 };
 
 class NativeIo {
@@ -78,7 +109,7 @@ private:
 template <class TCall>
 auto Native(TCall&& call) {
     NativeIo operation;
-    if (IoEnabled() && Requested()) {
+    if (IoInterrupted()) {
         errno = EINTR;
         return static_cast<decltype(call())>(-1);
     }
@@ -86,15 +117,19 @@ auto Native(TCall&& call) {
 }
 
 template <class TCall>
-auto Io(TCall&& call) {
+auto Io(TCall&& call, bool restartable = true) {
     Check();
-    decltype(call()) result;
-    {
-        IoPoint point;
-        result = std::forward<TCall>(call)();
+    IoRestart restart(restartable);
+    for (;;) {
+        decltype(call()) result;
+        {
+            IoPoint point(restart);
+            result = call();
+        }
+        if (result >= 0) return result;
+        if (Requested()) { restart.Clear(); Check(); }
+        if (!restart.Ready()) return result;
     }
-    if (result < 0) Check();
-    return result;
 }
 
 template <class TLock>

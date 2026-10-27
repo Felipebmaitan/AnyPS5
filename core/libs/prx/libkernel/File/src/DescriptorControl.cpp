@@ -386,7 +386,7 @@ int ChangeStatus(int fd, Kind kind, int mask, int value, const char* function) {
             bool blocked = false;
             for (const auto& [descriptor, entry] : g_entries) {
                 if (entry.status.get() != &status) continue;
-                admissions.push_back(std::make_unique<GuestDescriptorAccess>(descriptor, GuestDescriptorAccess::Mode::Change, std::defer_lock));
+                admissions.push_back(std::make_unique<GuestDescriptorAccess>(descriptor, GuestDescriptorAccess::Mode::Update, std::defer_lock));
                 if (!admissions.back()->TryLock()) { blocked = true; break; }
             }
             if (blocked) {

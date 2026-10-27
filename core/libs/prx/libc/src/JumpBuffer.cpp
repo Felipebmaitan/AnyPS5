@@ -15,6 +15,7 @@ constexpr int SigBlock = 1;
 constexpr int SigSetmask = 3;
 
 std::atomic<Sigprocmask> guestSigprocmask{nullptr};
+std::atomic<StackRestore> ioStackRestore{nullptr};
 
 }
 
@@ -24,6 +25,8 @@ void GuestSigprocmaskRegister_nid_no_patch(Sigprocmask sigprocmask) {
     guestSigprocmask.store(sigprocmask);
 }
 
+void GuestIoJumpRegister_nid_no_patch(StackRestore restore) { ioStackRestore.store(restore); }
+
 void APS5_VABI JumpBufferSaveMask_nid_no_patch(unsigned char* buffer) {
     const auto sigprocmask = guestSigprocmask.load();
     const std::int32_t saved = sigprocmask != nullptr && sigprocmask(SigBlock, nullptr, buffer + MaskOffset) == 0;
@@ -31,6 +34,9 @@ void APS5_VABI JumpBufferSaveMask_nid_no_patch(unsigned char* buffer) {
 }
 
 void APS5_VABI JumpBufferRestoreMask_nid_no_patch(const unsigned char* buffer) {
+    std::uintptr_t stack = 0;
+    std::memcpy(&stack, buffer + 16, sizeof(stack));
+    if (const auto restore = ioStackRestore.load()) restore(stack);
     std::int32_t saved = 0;
     std::memcpy(&saved, buffer + MaskSavedOffset, sizeof(saved));
     const auto sigprocmask = guestSigprocmask.load();

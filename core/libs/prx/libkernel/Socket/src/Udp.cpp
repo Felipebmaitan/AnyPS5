@@ -775,7 +775,7 @@ int SocketSendFlags(Socket& socket, int flags) {
 }
 int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr* address, socklen_t* addressLength) {
 #ifdef _WIN32
-    const bool cancellable = ThreadCancel::IoEnabled();
+    const bool cancellable = ThreadCancel::IoActive();
     bool nonblocking = (flags & GuestDontWait) != 0;
     std::int64_t timeout = 0;
     {
@@ -784,6 +784,7 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
         timeout = socket.options.receiveTimeout;
     }
     if (cancellable) {
+        if (timeout != 0) ThreadCancel::IoNoRestart();
         const bool waitAll = socket.type == 1 && (flags & GuestWaitAll) != 0 && !nonblocking;
         if (waitAll && (flags & GuestPeek) != 0) {
             WSASetLastError(WSAEOPNOTSUPP);
@@ -819,7 +820,7 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
             int error = WSAEINTR;
             {
                 ThreadCancel::IoWait wait(Pending::Interrupt, &pending);
-                if (!ThreadCancel::Requested()) {
+                if (!ThreadCancel::IoInterrupted()) {
                     WSABUF destination{static_cast<ULONG>(length - transferred),
                         transferred == 0 ? static_cast<char*>(buffer) : static_cast<char*>(buffer) + transferred};
                     const int started = address
@@ -835,13 +836,14 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
                         error = completed ? 0 : WSAGetLastError();
                         if (waited == WAIT_TIMEOUT && error == WSA_OPERATION_ABORTED) error = WSAEWOULDBLOCK;
                     }
+                    if (error == WSA_OPERATION_ABORTED && ThreadCancel::IoInterrupted()) error = WSAEINTR;
                     if (error == 0) result = static_cast<int>(done);
                 }
             }
             WSASetLastError(error);
             if (result < 0) return transferred != 0 ? transferred : result;
             transferred += result;
-            if (!waitAll || result == 0 || transferred == length || ThreadCancel::Requested()) return transferred;
+            if (!waitAll || result == 0 || transferred == length || ThreadCancel::IoInterrupted()) return transferred;
         }
     }
     return address
@@ -855,7 +857,7 @@ int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr*
 }
 int WaitForTransfer(Socket& socket, bool send, int flags) {
 #ifdef _WIN32
-    if (!send && ThreadCancel::IoEnabled()) return 0;
+    if (!send && ThreadCancel::IoActive()) return 0;
 #endif
     if ((flags & GuestDontWait) != 0) {
 #ifdef _WIN32
@@ -874,10 +876,11 @@ int WaitForTransfer(Socket& socket, bool send, int flags) {
         timeout = send ? socket.options.sendTimeout : socket.options.receiveTimeout;
     }
     if (timeout == 0) return 0;
+    ThreadCancel::IoNoRestart();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout >> 32) +
         std::chrono::nanoseconds((static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000000) >> 32);
     for (;;) {
-        if (ThreadCancel::IoEnabled() && ThreadCancel::Requested()) return 4;
+        if (ThreadCancel::IoInterrupted()) return 4;
         const auto left = deadline - std::chrono::steady_clock::now();
         if (left <= std::chrono::steady_clock::duration::zero()) return 35;
         const int milliseconds = static_cast<int>(std::min<std::int64_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count(), INT_MAX));
@@ -1782,6 +1785,8 @@ static std::int64_t ReceiveMessage(int descriptor, GuestMsghdr* message, int fla
     header.iov = vectors.data();
     const auto total = MessageLength(&header);
     if (total < 0) return -1;
+    const File::IoDescriptor retained(descriptor);
+    if (retained.Value() < 0) return -1;
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if ((flags & ~GuestReceiveFlags) != 0) return Fail(45);
@@ -2116,11 +2121,15 @@ extern "C" bool GuestSocketReadGuest_nid_no_patch(void* destination, const void*
 }
 
 std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint64_t length, int flags) {
-    return ThreadCancel::Io([&] { return Receive(descriptor, buffer, length, flags); });
+    return ThreadCancel::Io([&] { return File::WithIoDescriptor(descriptor, [&](int descriptor) {
+        return Receive(descriptor, buffer, length, flags);
+    }); });
 }
 std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::uint64_t length,
     int flags, void* address, std::uint32_t* addressLength) {
-    return ThreadCancel::Io([&] { return ReceiveFrom(descriptor, buffer, length, flags, address, addressLength); });
+    return ThreadCancel::Io([&] { return File::WithIoDescriptor(descriptor, [&](int descriptor) {
+        return ReceiveFrom(descriptor, buffer, length, flags, address, addressLength);
+    }); });
 }
 std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message, int flags) {
     return ThreadCancel::Io([&] { return ReceiveMessage(descriptor, message, flags); });

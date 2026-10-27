@@ -70,6 +70,9 @@ struct NativeIo::State {
 
 private:
     void release() {
+#ifdef _WIN32
+        const DWORD error = GetLastError();
+#endif
         const int saved = errno;
         wait.reset();
 #ifdef _WIN32
@@ -84,13 +87,26 @@ private:
         pthread_sigmask(SIG_SETMASK, &previous, nullptr);
 #endif
         errno = saved;
+#ifdef _WIN32
+        SetLastError(error);
+#endif
     }
 };
 
 NativeIo::NativeIo() {
-    if (IoEnabled()) state = new State;
+    if (IoActive()) state = new State;
 }
 
-NativeIo::~NativeIo() { delete state; }
+NativeIo::~NativeIo() {
+#ifdef _WIN32
+    const DWORD error = GetLastError();
+#endif
+    const int saved = errno;
+    delete state;
+    errno = saved;
+#ifdef _WIN32
+    SetLastError(error);
+#endif
+}
 
 }

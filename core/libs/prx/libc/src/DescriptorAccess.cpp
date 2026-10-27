@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <map>
 #include <thread>
+#include <limits>
 
 struct GuestDescriptorAccess::State {
     std::mutex mutex;
@@ -11,6 +12,8 @@ struct GuestDescriptorAccess::State {
     unsigned changesWaiting = 0;
     std::thread::id writer;
     unsigned depth = 0;
+    std::uint64_t generation = 0;
+    bool replacement = false;
 
     bool CanRead() const {
         return writer == std::this_thread::get_id() || (writer == std::thread::id{} && changesWaiting == 0);
@@ -57,6 +60,7 @@ void GuestDescriptorAccess::Lock() {
         --state->changesWaiting;
         state->writer = std::this_thread::get_id();
         ++state->depth;
+        state->replacement = state->replacement || mode == Mode::Change;
     }
     held = true;
 }
@@ -71,6 +75,7 @@ bool GuestDescriptorAccess::TryLock() {
         if (!state->CanChange()) return false;
         state->writer = std::this_thread::get_id();
         ++state->depth;
+        state->replacement = state->replacement || mode == Mode::Change;
     }
     held = true;
     return true;
@@ -81,7 +86,11 @@ void GuestDescriptorAccess::Unlock() {
     {
         std::lock_guard lock(state->mutex);
         if (mode == Mode::Read) --state->readers;
-        else if (--state->depth == 0) state->writer = {};
+        else if (--state->depth == 0) {
+            state->writer = {};
+            if (state->replacement && state->generation != std::numeric_limits<std::uint64_t>::max()) ++state->generation;
+            state->replacement = false;
+        }
         held = false;
     }
     state->changed.notify_all();
@@ -100,6 +109,21 @@ bool GuestDescriptorAccess::ReadOrWait() {
 }
 
 void GuestDescriptorAccess::Wake() noexcept { if (state) state->changed.notify_all(); }
+
+GuestDescriptorAccess::Version::Version(std::shared_ptr<State> state, std::uint64_t value)
+    : state(std::move(state)), value(value) {}
+
+bool GuestDescriptorAccess::Version::Unchanged() const {
+    if (!state) return false;
+    std::lock_guard lock(state->mutex);
+    return value != std::numeric_limits<std::uint64_t>::max() && state->generation == value;
+}
+
+GuestDescriptorAccess::Version GuestDescriptorAccess::Snapshot() const {
+    if (!state) return Version(nullptr, 0);
+    std::lock_guard lock(state->mutex);
+    return Version(state, state->generation);
+}
 
 void GuestDescriptorAccess::LockTogether(GuestDescriptorAccess& first, GuestDescriptorAccess& second) {
     struct Lockable {
