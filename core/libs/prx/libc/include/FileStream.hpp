@@ -62,6 +62,39 @@ extern "C" int KeepHostStandardError_nid_no_patch();
 #endif
 
 class FileStream {
+    class NativeLock {
+        std::FILE* handle;
+    public:
+        explicit NativeLock(std::FILE* handle) : handle(handle) {
+            if (!handle) return;
+#ifdef _WIN32
+            ::_lock_file(handle);
+#else
+            ::flockfile(handle);
+#endif
+        }
+        ~NativeLock() {
+            if (!handle) return;
+#ifdef _WIN32
+            ::_unlock_file(handle);
+#else
+            ::funlockfile(handle);
+#endif
+        }
+        NativeLock(const NativeLock&) = delete;
+        NativeLock& operator=(const NativeLock&) = delete;
+        void Forget() { handle = nullptr; }
+        void Retain(std::FILE* value) { handle = value; }
+        int Close() {
+#ifdef _WIN32
+            const int result = ::_fclose_nolock(handle);
+            ::_unlock_file(std::exchange(handle, nullptr));
+            return result;
+#else
+            return std::fclose(std::exchange(handle, nullptr));
+#endif
+        }
+    };
     // Only the macro-accessed FreeBSD prefix is exposed. The remaining guest
     // FILE area is reserved; host state lives beyond it and is never a guest FILE*.
     GuestFilePrefix _guest{};
@@ -149,6 +182,7 @@ public:
     bool Reopen(const std::filesystem::path& filename, const char* mode,
         [[maybe_unused]] std::FILE* (*open)(const std::filesystem::path&, const std::string&) = nullptr) {
         auto* previous = GetHandle();
+        NativeLock streamLock(previous);
 #ifdef _WIN32
         const GuestDescriptorAccess descriptorAccess(previous ? ::_fileno(previous) : -1, GuestDescriptorAccess::Mode::Change);
 #else
@@ -167,7 +201,7 @@ public:
         if (open && !filename.empty()) {
             if (!IsHostStandard()) {
                 _handle = nullptr;
-                std::fclose(previous);
+                streamLock.Close();
                 _handle = open(filename, mode);
             } else {
                 std::wstring resetMode;
@@ -207,9 +241,12 @@ public:
         KeepStandardHandle_nid_no_patch(replaced, standard);
 #else
         if (::fileno(previous) == 2) KeepHostStandardError_nid_no_patch();
+        const bool hostStandard = IsHostStandard();
         const int kept = IsHostStandard() ? DuplicateHostDescriptor_nid_no_patch(::fileno(previous)) : -1;
         if (kept >= 0) ::flockfile(previous);
+        if (!hostStandard) streamLock.Forget();
         _handle = std::freopen(filename.c_str(), mode, previous);
+        if (!hostStandard && _handle) streamLock.Retain(_handle);
         if (kept >= 0) RestoreHostStandard(previous, kept);
 #endif
         if (!_handle) return false;
@@ -305,6 +342,7 @@ public:
 
     int Close() {
         GetHandle();
+        NativeLock streamLock(_handle);
 #ifdef _WIN32
         const GuestDescriptorAccess descriptorAccess(::_fileno(_handle), GuestDescriptorAccess::Mode::Change);
 #else
@@ -314,7 +352,8 @@ public:
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
 #endif
-        const int result = std::fclose(std::exchange(_handle, nullptr));
+        _handle = nullptr;
+        const int result = streamLock.Close();
         _guest.flags = 0;
         _guest.descriptor = -1;
         return result;

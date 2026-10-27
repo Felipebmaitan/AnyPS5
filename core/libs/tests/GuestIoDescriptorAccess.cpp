@@ -15,6 +15,10 @@
 #include <cstring>
 #include <vector>
 #include <optional>
+#include <barrier>
+#include <filesystem>
+#include <fstream>
+#include "prx/libc/include/FileStream.hpp"
 
 #ifdef _WIN32
 #include <io.h>
@@ -22,6 +26,7 @@
 static int NativeDescriptor(std::FILE* file) { return ::_fileno(file); }
 static int NativeDuplicate(int descriptor) { return ::_dup(descriptor); }
 static void NativeClose(int descriptor) { ::_close(descriptor); }
+static int NativeReplace(int from, int to) { return ::_dup2(from, to); }
 #else
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -30,6 +35,7 @@ static void NativeClose(int descriptor) { ::_close(descriptor); }
 static int NativeDescriptor(std::FILE* file) { return ::fileno(file); }
 static int NativeDuplicate(int descriptor) { return ::dup(descriptor); }
 static void NativeClose(int descriptor) { ::close(descriptor); }
+static int NativeReplace(int from, int to) { return ::dup2(from, to) < 0 ? -1 : 0; }
 #endif
 
 static void Require(bool condition, const char* message) {
@@ -187,7 +193,202 @@ static void AccessCancellation(bool positionedWait = false) {
     if (file) Require(std::fclose(file) == 0, "close positioned probe file");
 }
 
+static void ProtectedClose() {
+    const int saved = NativeDuplicate(0);
+    int pipe[2]{};
+    Require(pipe_nid_postfix(pipe) == 0, "create protected-stream pipe");
+    Require(NativeReplace(pipe[0], 0) == 0, "replace stdin for protected close");
+    BlockedRead read{0};
+    Pthread reader = nullptr;
+    Require(scePthreadCreate(&reader, nullptr, Reader, &read, nullptr) == 0, "start protected-stream reader");
+    const bool registered = Registered(reader);
+    std::atomic<bool> posixDone{false}, sceDone{false};
+    int posixResult = 0, posixError = 0, sceResult = 0;
+    std::thread posix([&] {
+        posixResult = close_nid_postfix(0);
+        posixError = *__error_nid_postfix();
+        posixDone.store(true);
+    });
+    std::thread sce([&] {
+        sceResult = sceKernelClose(0);
+        sceDone.store(true);
+    });
+    const bool prompt = Observe([&] { return posixDone.load() && sceDone.load(); });
+    const bool blocked = !reader->_finished.load();
+    Require(write_nid_postfix(pipe[1], "x", 1) == 1, "release protected-stream reader");
+    Require(Observe([&] { return reader->_finished.load(); }), "protected-stream reader did not finish");
+    Require(scePthreadJoin(reader, nullptr) == 0, "join protected-stream reader");
+    posix.join();
+    sce.join();
+    if (saved >= 0) {
+        Require(NativeReplace(saved, 0) == 0, "restore stdin");
+        NativeClose(saved);
+    } else NativeClose(0);
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close protected-stream pipe");
+    Require(registered && prompt && blocked && read.result == 1, "protected close waited for input");
+    Require(posixResult == -1 && posixError == 1 && sceResult == static_cast<int>(0x80020001u), "protected close returned wrong error");
+}
+
+struct StreamRead {
+    FileStream* stream;
+    int descriptor;
+    std::atomic<bool> held{false};
+    std::atomic<bool> go{false};
+    std::atomic<bool> returned{false};
+    std::atomic<int> unlocks{0};
+    std::int64_t result = -2;
+};
+
+static void APS5_VABI UnlockStream(void* argument) {
+    auto& read = *static_cast<StreamRead*>(argument);
+    funlockfile_nid_postfix(read.stream);
+    ++read.unlocks;
+}
+
+static void* APS5_VABI StreamReader(void* argument) {
+    auto& read = *static_cast<StreamRead*>(argument);
+    flockfile_nid_postfix(read.stream);
+    CleanupHandler cleanup{};
+    __pthread_cleanup_push_imp_nid_postfix(UnlockStream, &read, &cleanup);
+    read.held.store(true);
+    Require(Observe([&] { return read.go.load(); }), "release stdio reader");
+    char byte = 0;
+    read.result = read_nid_postfix(read.descriptor, &byte, 1);
+    Require(read.result == 1 && byte == 'x', "stdio reader lost input");
+    read.returned.store(true);
+    __pthread_cleanup_pop_imp_nid_postfix(1);
+    return nullptr;
+}
+
+static void StreamOrder(bool reopen) {
+    int pipe[2]{};
+    Require(pipe_nid_postfix(pipe) == 0, "create stdio ordering pipe");
+    Require(write_nid_postfix(pipe[1], "x", 1) == 1, "seed stdio ordering pipe");
 #ifdef _WIN32
+    auto* native = ::_fdopen(pipe[0], "rb");
+#else
+    auto* native = ::fdopen(pipe[0], "rb");
+#endif
+    Require(native != nullptr, "open stdio ordering stream");
+    FileStream stream(native);
+    const auto path = std::filesystem::path("io-stdio-order-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp");
+    if (reopen) {
+        std::ofstream output(path, std::ios::binary);
+        output.put('r');
+        Require(output.good(), "create reopen destination");
+    }
+    StreamRead read{&stream, pipe[0]};
+    Pthread reader = nullptr;
+    Require(scePthreadCreate(&reader, nullptr, StreamReader, &read, nullptr) == 0, "start stdio ordering reader");
+    Require(Observe([&] { return read.held.load(); }), "stdio reader did not acquire FILE lock");
+    std::atomic<bool> started{false}, done{false};
+    bool changed = false;
+    std::thread closer([&] {
+        started.store(true);
+        changed = reopen ? freopen_nid_postfix(path.string().c_str(), "rb", &stream) == &stream : fclose_nid_postfix(&stream) == 0;
+        done.store(true);
+    });
+    Require(Observe([&] { return started.load(); }), "stdio closer did not start");
+    const auto observation = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (std::chrono::steady_clock::now() < observation) {
+        GuestDescriptorAccess access(pipe[0], GuestDescriptorAccess::Mode::Read, std::defer_lock);
+        if (!access.TryLock()) break;
+        std::this_thread::yield();
+    }
+    read.go.store(true);
+    const bool progressed = Observe([&] { return read.returned.load(); });
+    if (!progressed) Require(pthread_cancel_nid_postfix(reader) == 0, "release failed stdio ordering reader");
+    Require(Observe([&] { return reader->_finished.load(); }), "stdio ordering reader did not finish");
+    Require(scePthreadJoin(reader, nullptr) == 0, "join stdio ordering reader");
+    Require(Observe([&] { return done.load(); }), "stdio close or reopen did not finish");
+    closer.join();
+    if (reopen && changed) Require(fclose_nid_postfix(&stream) == 0, "close reopened stream");
+    Require(close_nid_postfix(pipe[1]) == 0, "close stdio ordering writer");
+    if (reopen) Require(std::filesystem::remove(path), "remove reopen destination");
+    Require(progressed && changed && read.unlocks.load() == 1, "stdio FILE and descriptor locks inverted");
+}
+
+#ifdef __linux__
+static std::uint64_t PeakResidentKiB() {
+    rusage usage{};
+    Require(::getrusage(RUSAGE_SELF, &usage) == 0, "read resident memory");
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+}
+
+static void InvalidRegistry() {
+    char byte = 0;
+    for (int index = 0; index < 1024; ++index)
+        Require(read_nid_postfix(1000000000 + index, &byte, 0) == -1 && *__error_nid_postfix() == 9, "warm invalid read");
+    const auto before = PeakResidentKiB();
+    for (int index = 1024; index < 101024; ++index) {
+        Require(read_nid_postfix(1000000000 + index, &byte, 0) == -1 && *__error_nid_postfix() == 9, "invalid descriptor read");
+        Require(read_nid_postfix(-index, &byte, 0) == -1 && *__error_nid_postfix() == 9, "negative descriptor read");
+    }
+    Require(PeakResidentKiB() - before < 8192, "invalid reads retained descriptor registry allocations");
+}
+#endif
+
+#ifdef _WIN32
+struct VectorRace {
+    static constexpr std::size_t Readers = 3;
+    static constexpr std::size_t Records = 32;
+    static constexpr std::size_t Parts = 64;
+    std::barrier<> start{Readers + 1};
+    std::array<int, Readers> descriptors{};
+    std::array<std::array<std::array<std::uint16_t, Parts>, Records>, Readers> data{};
+};
+
+struct VectorReader {
+    VectorRace* race;
+    std::size_t index;
+};
+
+static void* APS5_VABI ReadRecords(void* argument) {
+    const auto reader = *static_cast<VectorReader*>(argument);
+    auto& race = *reader.race;
+    race.start.arrive_and_wait();
+    for (auto& record : race.data[reader.index]) {
+        std::int64_t read;
+        if (reader.index == VectorRace::Readers - 1) read = read_nid_postfix(race.descriptors[reader.index], record.data(), sizeof(record));
+        else {
+            std::array<KernelIovec, VectorRace::Parts> vectors{};
+            for (std::size_t part = 0; part < vectors.size(); ++part) vectors[part] = {&record[part], sizeof(record[part])};
+            read = readv_nid_postfix(race.descriptors[reader.index], vectors.data(), static_cast<int>(vectors.size()));
+        }
+        Require(read == sizeof(record), "pipe record was shortened");
+        for (std::size_t part = 0; part < record.size(); ++part)
+            Require(record[part] == record[0] + part, "pipe readv interleaved with another reader");
+    }
+    return nullptr;
+}
+
+static void PipeVectors() {
+    int pipe[2]{};
+    Require(pipe_nid_postfix(pipe) == 0, "create vector race pipe");
+    VectorRace race;
+    const int alias = dup_nid_postfix(pipe[0]);
+    Require(alias >= 0, "duplicate vector race reader");
+    race.descriptors = {pipe[0], alias, pipe[0]};
+    std::array<std::uint16_t, VectorRace::Readers * VectorRace::Records * VectorRace::Parts> source{};
+    for (std::size_t index = 0; index < source.size(); ++index) source[index] = static_cast<std::uint16_t>(index);
+    Require(write_nid_postfix(pipe[1], reinterpret_cast<const char*>(source.data()), sizeof(source)) == sizeof(source), "seed vector records");
+    std::array<Pthread, VectorRace::Readers> threads{};
+    std::array<VectorReader, VectorRace::Readers> readers{};
+    for (std::size_t index = 0; index < threads.size(); ++index) {
+        readers[index] = {&race, index};
+        Require(scePthreadCreate(&threads[index], nullptr, ReadRecords, &readers[index], nullptr) == 0, "start vector race reader");
+    }
+    race.start.arrive_and_wait();
+    for (const auto thread : threads) Require(scePthreadJoin(thread, nullptr) == 0, "join vector race reader");
+    std::array<bool, source.size()> seen{};
+    for (const auto& records : race.data) for (const auto& record : records) for (const auto value : record) {
+        Require(value < seen.size() && !seen[value], "pipe read lost ownership of a record");
+        seen[value] = true;
+    }
+    for (const bool value : seen) Require(value, "pipe read lost data");
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(alias) == 0 && close_nid_postfix(pipe[1]) == 0, "close vector race pipe");
+}
+
 static void CloseProgress() {
     int pipe[2]{};
     Require(pipe_nid_postfix(pipe) == 0, "create close-progress pipe");
@@ -300,9 +501,16 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[1], "capacity") == 0) Capacity();
     else if (std::strcmp(argv[1], "no_aliases") == 0) NoAliases();
     else if (std::strcmp(argv[1], "access_cancel") == 0) AccessCancellation();
+    else if (std::strcmp(argv[1], "protected_close") == 0) ProtectedClose();
+    else if (std::strcmp(argv[1], "stdio_close") == 0) StreamOrder(false);
+    else if (std::strcmp(argv[1], "stdio_reopen") == 0) StreamOrder(true);
+#ifdef __linux__
+    else if (std::strcmp(argv[1], "invalid_registry") == 0) InvalidRegistry();
+#endif
 #ifdef _WIN32
     else if (std::strcmp(argv[1], "close_progress") == 0) CloseProgress();
     else if (std::strcmp(argv[1], "position_cancel") == 0) AccessCancellation(true);
+    else if (std::strcmp(argv[1], "pipe_vectors") == 0) PipeVectors();
 #endif
 #ifndef _WIN32
     else if (std::strcmp(argv[1], "record_locks") == 0) RecordLocks();

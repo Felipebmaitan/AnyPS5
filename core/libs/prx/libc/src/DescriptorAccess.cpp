@@ -24,6 +24,7 @@ std::shared_ptr<GuestDescriptorAccess::State> GuestDescriptorAccess::Get(int des
     static std::mutex mutex;
     static std::map<int, std::weak_ptr<State>> entries;
     std::lock_guard lock(mutex);
+    std::erase_if(entries, [](const auto& entry) { return entry.second.expired(); });
     if (auto state = entries[descriptor].lock()) return state;
     auto state = std::make_shared<State>();
     entries[descriptor] = state;
@@ -31,7 +32,7 @@ std::shared_ptr<GuestDescriptorAccess::State> GuestDescriptorAccess::Get(int des
 }
 
 GuestDescriptorAccess::GuestDescriptorAccess(int descriptor, Mode mode, std::defer_lock_t)
-    : state(Get(descriptor)), mode(mode) {}
+    : state(descriptor < 0 ? nullptr : Get(descriptor)), mode(mode) {}
 
 GuestDescriptorAccess::GuestDescriptorAccess(int descriptor, Mode mode)
     : GuestDescriptorAccess(descriptor, mode, std::defer_lock) { Lock(); }
@@ -39,6 +40,7 @@ GuestDescriptorAccess::GuestDescriptorAccess(int descriptor, Mode mode)
 GuestDescriptorAccess::~GuestDescriptorAccess() { if (held) Unlock(); }
 
 void GuestDescriptorAccess::Lock() {
+    if (!state) { held = true; return; }
     std::unique_lock lock(state->mutex);
     if (mode == Mode::Read) {
         state->changed.wait(lock, [&] { return state->CanRead(); });
@@ -60,6 +62,7 @@ void GuestDescriptorAccess::Lock() {
 }
 
 bool GuestDescriptorAccess::TryLock() {
+    if (!state) { held = true; return true; }
     std::lock_guard lock(state->mutex);
     if (mode == Mode::Read) {
         if (!state->CanRead()) return false;
@@ -74,6 +77,7 @@ bool GuestDescriptorAccess::TryLock() {
 }
 
 void GuestDescriptorAccess::Unlock() {
+    if (!state) { held = false; return; }
     {
         std::lock_guard lock(state->mutex);
         if (mode == Mode::Read) --state->readers;
@@ -84,6 +88,7 @@ void GuestDescriptorAccess::Unlock() {
 }
 
 bool GuestDescriptorAccess::ReadOrWait() {
+    if (!state) { held = true; return true; }
     std::unique_lock lock(state->mutex);
     if (state->CanRead()) {
         ++state->readers;
@@ -94,7 +99,7 @@ bool GuestDescriptorAccess::ReadOrWait() {
     return false;
 }
 
-void GuestDescriptorAccess::Wake() noexcept { state->changed.notify_all(); }
+void GuestDescriptorAccess::Wake() noexcept { if (state) state->changed.notify_all(); }
 
 void GuestDescriptorAccess::LockTogether(GuestDescriptorAccess& first, GuestDescriptorAccess& second) {
     struct Lockable {

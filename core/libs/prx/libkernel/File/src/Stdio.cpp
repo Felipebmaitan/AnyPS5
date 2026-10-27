@@ -818,7 +818,13 @@ File::IoDescriptor::IoDescriptor(int descriptor)
         *__error_nid_postfix() = GUEST_EBADF;
         return;
     }
-    if (access.TryLock()) return;
+    if (access.TryLock()) {
+        if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
+            value = -1;
+            *__error_nid_postfix() = GUEST_EBADF;
+        }
+        return;
+    }
     ThreadCancel::IoWait wait([](void* argument) noexcept {
         static_cast<GuestDescriptorAccess*>(argument)->Wake();
     }, &access);
@@ -828,7 +834,13 @@ File::IoDescriptor::IoDescriptor(int descriptor)
             *__error_nid_postfix() = GUEST_EINTR;
             return;
         }
-        if (access.ReadOrWait()) return;
+        if (access.ReadOrWait()) {
+            if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
+                value = -1;
+                *__error_nid_postfix() = GUEST_EBADF;
+            }
+            return;
+        }
     }
 }
 
@@ -837,8 +849,8 @@ File::IoDescriptor::~IoDescriptor() = default;
 extern "C" {
 
 int APS5_VABI close_nid_postfix(int d) {
-    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
     if (File::IsHostStream(d)) return PosixFailure(GUEST_EPERM);
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) {
         if (socketError == 0) return 0;
@@ -1534,11 +1546,8 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* guestIov, int iovcn
     if (!write) {
         if (const auto archived = File::ReadArchivedIovecs(d, iov, iovcnt, offset)) return *archived;
     }
-    std::optional<std::unique_lock<std::mutex>> positioned;
-    if (write || offset != nullptr || NativeIsDisk(d)) {
-        positioned = File::IoPositionedTransfer(d);
-        if (!positioned) return SceErrorFromErrno(errno);
-    }
+    const auto positioned = File::IoPositionedTransfer(d);
+    if (!positioned) return SceErrorFromErrno(errno);
     if (total == 0) {
         char none = 0;
         const auto result = offset != nullptr ? NativePositionedTransfer(d, &none, 0, *offset, write) : NativeTransferBuffer(d, &none, 0, write);
