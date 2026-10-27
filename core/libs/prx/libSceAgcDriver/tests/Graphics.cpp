@@ -1292,8 +1292,40 @@ void ShaderStageTests() {
     queue.context[0x2db] = 0x40049;
     queue.context[0x286] = 0x42800000;
     queue.context[0x287] = 0x3f800000;
-    queue.context[0x2d5] = 0x202d;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "combined tessellation and geometry");
+    queue.context[0x2d5] = 0x0260210d;
+    {
+        const auto wave32 = AgcDriver::Graphics::DecodeState(queue).stages;
+        Require(wave32.path == AgcDriver::Graphics::ShaderPath::Tessellation && wave32.hullWaveSize == 32 && wave32.vertexWaveSize == 32 && !wave32.tessellationGeometry, "HS_W32 and GS_W32 tessellation routing decoded differently");
+    }
+    queue.context[0x2d5] = 0x60212d;
+    queue.context[0x29b] = 2;
+    queue.context[0x2ce] = 6;
+    queue.context[0x1ff] = 0xc0;
+    queue.context[0x2ab] = 4;
+    queue.userConfig[0x25b] = 0x4020;
+    queue.shader[0x8b] = 0x67001c;
+    {
+        std::vector<AgcDriver::Graphics::RegisterRead> geometryLog;
+        AgcDriver::Graphics::ShaderStages geometry;
+        {
+            const AgcDriver::Graphics::RegisterReadLogScope logScope(&geometryLog);
+            geometry = AgcDriver::Graphics::DecodeState(queue).stages;
+        }
+        for (const auto read : geometryLog) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a tessellation geometry register the decoder reads: " + std::to_string(read.offset));
+        Require(geometry.path == AgcDriver::Graphics::ShaderPath::TessellationGeometry && geometry.tessellation && !geometry.mesh && geometry.hullWaveSize == 32 && geometry.vertexWaveSize == 32, "tessellation followed by an NGG geometry stage decoded differently");
+        const auto& subgroup = geometry.tessellationGeometry;
+        Require(subgroup && subgroup->inputPrimitive == 4 && subgroup->primitivesPerGroup == 10 && subgroup->verticesPerGroup == 30 && subgroup->maxVertices == 192 && subgroup->maxPrimitives == 128 && subgroup->threadsPerGroup == 192 && subgroup->ldsSizeDwords == 1536 && subgroup->esgsItemSize == 4, "the geometry subgroup after tessellation decoded differently");
+    }
+    queue.context[0x2d5] = 0x0260212d;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported tessellation and geometry routing");
+    queue.context[0x2d5] = 0x60012d;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported tessellation and geometry routing");
+    queue.context.erase(0x29b);
+    queue.context.erase(0x2ce);
+    queue.context.erase(0x1ff);
+    queue.context.erase(0x2ab);
+    queue.shader.erase(0x8b);
+    queue.userConfig.erase(0x25b);
     queue.context[0x2d5] = 0x0200210d;
     queue.context[0x2d6] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "control-point counts");
@@ -4886,8 +4918,71 @@ void UnditheredAlphaToCoverageTests() {
     }
 }
 
+void TwoSampleDitheredAlphaToCoverageTests() {
+    auto dithered = makeState();
+    dithered.context[0x203] = 0x8010;
+    dithered.context[0x201] = 0x00101001;
+    dithered.context[0x2dc] = 0xe701;
+    dithered.context[0x2f8] = 0x00108001;
+    dithered.context[0x292] = 3;
+    dithered.context[0x31d] = 0x9000;
+    dithered.context[0x1c5] = 4;
+    dithered.context[0x1b3] = 2;
+    dithered.context[0x1b4] = 2;
+    const auto locate = [&](std::uint32_t locations) {
+        for (std::uint32_t pixel = 0; pixel < 4; ++pixel) dithered.context[0x2fe + pixel * 4u] = locations;
+    };
+    for (const auto locations : {0xcc44u, 0xc44cu}) {
+        locate(locations);
+        for (const auto eqaa : {0x00101001u, 0x00101101u}) {
+            dithered.context[0x201] = eqaa;
+            const auto rejection = AgcDriver::Graphics::DrawRejection(dithered, false);
+            Require(rejection.empty(), "two-sample DB_ALPHA_TO_MASK 0xe701 refused: " + rejection);
+            const auto state = AgcDriver::Graphics::DecodeState(dithered);
+            Require(state.alphaToCoverage && state.ditheredAlphaToCoverage && state.ditheredAlphaSamples == 2 && state.samples == 2, "two-sample DB_ALPHA_TO_MASK 0xe701 did not select the two-sample dither");
+        }
+    }
+    dithered.context[0x201] = 0x00101001;
+    for (const auto eqaa : {0x00103001u, 0x00101011u, 0x00101003u, 0x00101201u, 0x00301001u}) {
+        dithered.context[0x201] = eqaa;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "DB_EQAA");
+        Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("DB_EQAA") != std::string::npos, "the precheck accepted unmatched two-sample dither samples");
+    }
+    dithered.context[0x201] = 0x00101001;
+    locate(0x44ccu);
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "two-sample locations");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("two-sample locations") != std::string::npos, "the precheck accepted unmeasured two-sample dither locations");
+    locate(0xc44cu);
+    dithered.context[0x2fe + 12u] = 0xcc44u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "two-sample locations");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("two-sample locations") != std::string::npos, "the precheck accepted two-sample dither locations that vary by pixel");
+    locate(0xc44cu);
+    for (const auto format : {3u, 5u, 6u}) {
+        dithered.context[0x1c5] = format;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "FP16_ABGR or 32_ABGR");
+        Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("FP16_ABGR or 32_ABGR") != std::string::npos, "the precheck accepted an unmeasured two-sample dither export format");
+    }
+    dithered.context[0x1c5] = 9;
+    Require(AgcDriver::Graphics::DecodeState(dithered).ditheredAlphaSamples == 2, "a 32_ABGR export refused the two-sample dither");
+    dithered.context[0x1c5] = 4;
+    dithered.context[0x203] |= 0x800u;
+    Require(!AgcDriver::Graphics::DecodeState(dithered).alphaToCoverage, "the shader disable override was ignored for DB_ALPHA_TO_MASK 0xe701");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).empty(), "the precheck ignored the shader disable override for DB_ALPHA_TO_MASK 0xe701");
+    dithered.context[0x203] &= ~0x800u;
+    dithered.context[0x201] = 0x00133303;
+    dithered.context[0x2f8] = 0x0030e003;
+    dithered.context[0x31d] = 0x1b000;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        dithered.context[0x2fe + pixel * 4u] = 0xbd153fd1u;
+        dithered.context[0x2ff + pixel * 4u] = 0x9773f95bu;
+    }
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "DB_EQAA");
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("DB_EQAA") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0xe701 with eight samples");
+}
+
 void AlphaToCoverageTests() {
     UnditheredAlphaToCoverageTests();
+    TwoSampleDitheredAlphaToCoverageTests();
     auto dithered = makeState();
     dithered.context[0x203] = 0x8010;
     dithered.context[0x201] = 0x00133303;
@@ -4905,7 +5000,7 @@ void AlphaToCoverageTests() {
     Require(rejection.empty(), "eight-sample default dither refused: " + rejection);
     const auto ditheredState = AgcDriver::Graphics::DecodeState(dithered);
     Require(ditheredState.alphaToCoverage && ditheredState.samples == 8, "default dither did not enable eight-sample coverage");
-    Require(ditheredState.ditheredAlphaToCoverage, "default dither did not reach the shader state");
+    Require(ditheredState.ditheredAlphaToCoverage && ditheredState.ditheredAlphaSamples == 8, "default dither did not reach the shader state");
     for (const auto eqaa : {0x00133333u, 0x00132303u, 0x00133203u, 0x00333303u}) {
         dithered.context[0x201] = eqaa;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "DB_EQAA");
@@ -11992,6 +12087,14 @@ void pipelineJournalTests(bool longPath = false, bool extended = false) {
         GraphicsPipelineRecipe meshPointDecoded;
         Require(DecodeGraphicsPipelineRecipe(EncodeGraphicsPipelineRecipe(MakeGraphicsPipelineRecipe(meshPointState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL)), meshPointDecoded), "the mesh point recipe does not decode");
         Require(!meshPointDecoded.state.vertexPoints && meshPointDecoded.state.stages.mesh && meshPointDecoded.state.stages.mesh->outputPrimitiveSize == 1u && meshPointDecoded.state.pointSize == 4.0f && meshPointDecoded.state.pointSizeMin == 0.5f && meshPointDecoded.state.pointSizeMax == 8.0f, "the recipe dropped mesh points or their sizes without the vertex point flag");
+        auto hullState = state;
+        hullState.stages.hullWaveSize = 32u;
+        hullState.stages.tessellation->mergedHull = true;
+        hullState.stages.tessellationGeometry = ShaderRecompiler::MeshConfiguration{4, 10, 30, 30, 60, 192, 512, 0, 4, 3};
+        hullState.rasterizerDiscard = true;
+        GraphicsPipelineRecipe hullDecoded;
+        Require(DecodeGraphicsPipelineRecipe(EncodeGraphicsPipelineRecipe(MakeGraphicsPipelineRecipe(hullState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL)), hullDecoded), "the tessellation geometry recipe does not decode");
+        Require(hullDecoded.state.stages.hullWaveSize == 32u && hullDecoded.state.stages.tessellation && hullDecoded.state.stages.tessellation->mergedHull && hullDecoded.state.stages.tessellationGeometry && hullDecoded.state.stages.tessellationGeometry->threadsPerGroup == 192u && hullDecoded.state.rasterizerDiscard, "the recipe dropped the hull wave size, the merged hull, the geometry stage after tessellation or rasterizer discard");
         auto fourSampleState = state;
         fourSampleState.samples = 4;
         auto maskState = fourSampleState;

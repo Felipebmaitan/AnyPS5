@@ -5026,7 +5026,7 @@ ShaderResources::TableStage& ShaderResources::tableStage(const CompiledShader& s
     table.stage = shader.stage;
     table.program = shader.program;
     table.poison = shader.program->imageTablePoison;
-    table.messages.assign(table.poison.size(), std::string{});
+    table.messages.assign(table.poison.size(), nullptr);
     return table;
 }
 
@@ -5037,7 +5037,8 @@ std::uint32_t ShaderResources::rejectTableElement(TableStage& table, std::span<c
     poison.resource = ShaderRecompiler::NoTable;
     poison.reason = static_cast<std::uint32_t>(ShaderRecompiler::ImageTableAbi::PoisonReason::DriverRejected);
     table.poison.push_back(poison);
-    table.messages.push_back(message);
+    const bool repeated = !table.messages.empty() && table.messages.back() != nullptr && *table.messages.back() == message;
+    table.messages.push_back(repeated ? table.messages.back() : std::make_shared<const std::string>(message));
     faultChecks = true;
     return ShaderRecompiler::ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(table.poison.size() - 1u));
 }
@@ -5332,7 +5333,7 @@ void ShaderResources::finishImageTables() {
             poison.resource = index;
             poison.reason = static_cast<std::uint32_t>(Abi::PoisonReason::HeapWritten);
             table.poison.push_back(poison);
-            table.messages.push_back("the table at 0x" + HexText(base) + " is written by its own dispatch");
+            table.messages.push_back(std::make_shared<const std::string>("the table at 0x" + HexText(base) + " is written by its own dispatch"));
             map[header + Abi::TableFault] = Abi::PoisonCode(static_cast<std::uint32_t>(table.poison.size() - 1u));
             faultChecks = true;
         }
@@ -5764,7 +5765,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
                 const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+                buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             }
         }
     }
