@@ -13,6 +13,7 @@ extern "C" {
 
 void GuestSigprocmaskRegister_nid_no_patch(Sigprocmask sigprocmask);
 void GuestIoJumpRegister_nid_no_patch(StackRestore restore);
+void APS5_VABI GuestIoStackRestore_nid_no_patch(std::uintptr_t stack);
 
 }
 

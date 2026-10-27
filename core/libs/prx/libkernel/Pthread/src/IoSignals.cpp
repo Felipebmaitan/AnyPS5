@@ -1,6 +1,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libc/include/JumpBuffer.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -34,10 +35,13 @@ struct IoRestart::State {
     };
     State* previous;
     std::uintptr_t stack;
+    GuestStacks::Bounds bounds;
     bool allowed;
     bool ready = false;
     std::vector<Descriptor> expected;
-    State(State* previous, std::uintptr_t stack, bool allowed) : previous(previous), stack(stack), allowed(allowed) {}
+    State(State* previous, std::uintptr_t stack, bool allowed)
+        : previous(previous), stack(stack), bounds(GuestStacks::GuestStackBounds_nid_no_patch(stack)), allowed(allowed) {}
+    bool Abandoned(std::uintptr_t target) const { return bounds.Contains(target) && stack < target; }
 };
 
 namespace {
@@ -85,6 +89,8 @@ struct SignalState {
     std::shared_ptr<SignalState> previousDelivery;
 #ifndef _WIN32
     sigset_t deliveryMask{};
+    sigset_t suspendedMask{};
+    bool suspended = false;
 #endif
 
     bool Pending() const { return signals.load() != 0 || delivery.load(); }
@@ -210,9 +216,11 @@ IoRestart::~IoRestart() {
     const int saved = errno;
     const SetupBlock blocked;
     auto** cursor = &restarts;
-    while (*cursor && *cursor != state) cursor = &(*cursor)->previous;
-    if (*cursor) *cursor = state->previous;
-    delete state;
+    while (*cursor && (*cursor != state || (*cursor)->stack != reinterpret_cast<std::uintptr_t>(this))) cursor = &(*cursor)->previous;
+    if (*cursor) {
+        *cursor = state->previous;
+        delete state;
+    }
     errno = saved;
 }
 
@@ -290,7 +298,9 @@ void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
         state->replay->ready = pending && state->restart.load() && state->replay->allowed && !state->descriptors.empty() && unchanged;
         if (state->replay->ready) state->replay->expected = std::move(state->descriptors);
         else state->replay->expected.clear();
-        delivering = std::move(state->previousDelivery);
+        auto* cursor = &delivering;
+        while (*cursor && cursor->get() != state) cursor = &(*cursor)->previousDelivery;
+        if (*cursor) *cursor = std::move(state->previousDelivery);
     }
     errno = saved;
 }
@@ -345,17 +355,50 @@ void RetireIoStack(std::uintptr_t stack) {
     {
         const SetupBlock blocked;
         const bool exiting = stack == std::numeric_limits<std::uintptr_t>::max();
-        while (delivering && delivering->replay->stack < stack) {
-            signals |= delivering->signals.load();
-            if (const auto next = exiting ? delivering->retire : delivering->callback) callback = next;
+        auto* deliveryCursor = &delivering;
 #ifndef _WIN32
-            if (!exiting) mask = delivering->deliveryMask;
+        const auto here = reinterpret_cast<std::uintptr_t>(&blocked);
+        bool savedCurrent = false;
 #endif
-            delivering = std::move(delivering->previousDelivery);
+        while (*deliveryCursor) {
+            auto& delivery = **deliveryCursor;
+#ifndef _WIN32
+            if (!exiting && !savedCurrent && delivery.replay->bounds.Contains(here) && here < delivery.replay->stack) {
+                delivery.suspendedMask = blocked.Previous();
+                delivery.suspended = true;
+                savedCurrent = true;
+                mask = delivery.deliveryMask;
+            }
+#endif
+            if (!exiting && !delivery.replay->Abandoned(stack)) {
+                deliveryCursor = &delivery.previousDelivery;
+                continue;
+            }
+            signals |= delivery.signals.load();
+            if (const auto next = exiting ? delivery.retire : delivery.callback) callback = next;
+#ifndef _WIN32
+            if (!exiting) mask = delivery.deliveryMask;
+#endif
+            *deliveryCursor = std::move(delivery.previousDelivery);
         }
-        while (restarts && restarts->stack < stack) {
-            auto* retired = restarts;
-            restarts = retired->previous;
+#ifndef _WIN32
+        if (!exiting) {
+            for (auto delivery = delivering; delivery; delivery = delivery->previousDelivery) {
+                if (delivery->suspended && delivery->replay->bounds.Contains(stack) && stack < delivery->replay->stack) {
+                    mask = delivery->suspendedMask;
+                    break;
+                }
+            }
+        }
+#endif
+        auto** restartCursor = &restarts;
+        while (*restartCursor) {
+            if (!exiting && !(*restartCursor)->Abandoned(stack)) {
+                restartCursor = &(*restartCursor)->previous;
+                continue;
+            }
+            auto* retired = *restartCursor;
+            *restartCursor = retired->previous;
             delete retired;
         }
         if (exiting) signals = 0;

@@ -223,6 +223,7 @@ int APS5_VABI setcontext_nid_postfix(const UserUcontext* context) {
     std::memcpy(&mxcsr, frame.fxsave + FxsaveMxcsr, sizeof(mxcsr));
     mxcsr &= HostMxcsrMask();
     std::memcpy(frame.fxsave + FxsaveMxcsr, &mxcsr, sizeof(mxcsr));
+    JumpBuffer::GuestIoStackRestore_nid_no_patch(machine.rsp);
     sigprocmask_nid_postfix(GuestSigSetmask, context->sigmask, nullptr);
 
     Aps5ContextRestore_nid_no_patch(&frame);

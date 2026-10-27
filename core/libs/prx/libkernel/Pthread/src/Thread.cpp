@@ -779,7 +779,7 @@ ThreadCancel::IoPoint::IoPoint(IoRestart& restart) {
     BeginIoSignals(CurrentGuestState().current, restart, delivery);
     ++ioPoints;
 }
-ThreadCancel::IoPoint::~IoPoint() { --ioPoints; EndIoSignals(delivery); }
+ThreadCancel::IoPoint::~IoPoint() noexcept(false) { --ioPoints; EndIoSignals(delivery); }
 
 bool ThreadCancel::IoActive() { return ioPoints != 0; }
 bool ThreadCancel::IoRestartError() { return *__error_nid_postfix() == 4; }

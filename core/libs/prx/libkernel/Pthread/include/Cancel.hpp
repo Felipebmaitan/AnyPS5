@@ -66,7 +66,7 @@ void RetireIoStack(std::uintptr_t stack);
 class IoPoint {
 public:
     explicit IoPoint(IoRestart& restart);
-    ~IoPoint();
+    ~IoPoint() noexcept(false);
     IoPoint(const IoPoint&) = delete;
     IoPoint& operator=(const IoPoint&) = delete;
 
