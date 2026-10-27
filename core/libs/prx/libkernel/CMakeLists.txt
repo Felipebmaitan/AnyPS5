@@ -32,6 +32,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Cond.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Thread.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/NativeIo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
@@ -99,6 +100,48 @@ endif()
 configure_windows_unwind(libkernel)
 
 if(BUILD_TESTING)
+    add_test_executable(guest_io_read_cancel_tests ${LIBS_INCLUDE_DIR}/tests/GuestIoReadCancel.cpp)
+    target_include_directories(guest_io_read_cancel_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_io_read_cancel_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_io_read_cancel_tests)
+    foreach(ioReadTransport pipe loopback datagram)
+        if(ioReadTransport STREQUAL "pipe")
+            set(ioReadApis read alias readv)
+        else()
+            set(ioReadApis read alias readv recv recvfrom recvmsg)
+        endif()
+        foreach(ioReadApi IN LISTS ioReadApis)
+            foreach(ioReadScenario cancel complete disabled pending reuse reuse_complete partial)
+                set(ioReadTest guest_io_read_${ioReadTransport}_${ioReadApi}_${ioReadScenario})
+                add_test(NAME ${ioReadTest} COMMAND guest_io_read_cancel_tests ${ioReadTransport} ${ioReadApi} ${ioReadScenario})
+                set_tests_properties(${ioReadTest} PROPERTIES TIMEOUT 15)
+                if(WIN32)
+                    set_tests_properties(${ioReadTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+                endif()
+            endforeach()
+        endforeach()
+    endforeach()
+    foreach(ioReadWaitAllApi recv recvfrom recvmsg)
+        set(ioReadWaitAllTest guest_io_read_waitall_${ioReadWaitAllApi})
+        add_test(NAME ${ioReadWaitAllTest} COMMAND guest_io_read_cancel_tests loopback ${ioReadWaitAllApi} waitall)
+        set_tests_properties(${ioReadWaitAllTest} PROPERTIES TIMEOUT 15)
+        if(WIN32)
+            set_tests_properties(${ioReadWaitAllTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
+    endforeach()
+    foreach(ioReadSceTransport pipe loopback datagram)
+        foreach(ioReadSceApi sce_read sce_readv)
+            set(ioReadSceTest guest_io_read_${ioReadSceTransport}_${ioReadSceApi})
+            add_test(NAME ${ioReadSceTest} COMMAND guest_io_read_cancel_tests ${ioReadSceTransport} ${ioReadSceApi} cancel)
+            set_tests_properties(${ioReadSceTest} PROPERTIES TIMEOUT 15)
+            if(WIN32)
+                set_tests_properties(${ioReadSceTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+            endif()
+        endforeach()
+    endforeach()
     add_test_executable(kernel_error_tests ${LIBS_INCLUDE_DIR}/tests/KernelError.cpp)
     target_include_directories(kernel_error_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(kernel_error_tests PRIVATE libkernel libc)

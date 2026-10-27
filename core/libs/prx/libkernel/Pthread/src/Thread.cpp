@@ -769,6 +769,30 @@ void ThreadCancel::EndWait() {
     BeginWait(nullptr);
 }
 
+static thread_local unsigned ioPoints = 0;
+
+ThreadCancel::IoPoint::IoPoint() { ++ioPoints; }
+ThreadCancel::IoPoint::~IoPoint() { --ioPoints; }
+
+bool ThreadCancel::IoEnabled() {
+    return ioPoints != 0 && CurrentGuestState().current && !CurrentGuestState().exiting &&
+        CurrentGuestState().cancelState == GUEST_CANCEL_ENABLE;
+}
+
+ThreadCancel::IoWait::IoWait(Interrupt interrupt, void* argument) : interrupt(interrupt), argument(argument) {
+    if (!IoEnabled()) return;
+    thread = CurrentGuestState().current;
+    std::lock_guard lock(thread->cancelLock);
+    previous = thread->cancelIo;
+    thread->cancelIo = this;
+}
+
+ThreadCancel::IoWait::~IoWait() {
+    if (!thread) return;
+    std::lock_guard lock(thread->cancelLock);
+    thread->cancelIo = previous;
+}
+
 extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
 
 asm(".text\n"
@@ -1298,8 +1322,9 @@ int APS5_VABI scePthreadCancel(Pthread thread) {
     for (;;) {
         {
             std::lock_guard lock(thread->cancelLock);
-            if (!thread->cancelWait) return SCE_OK;
-            thread->cancelWait->NotifyAll();
+            if (thread->cancelIo) thread->cancelIo->Wake();
+            else if (!thread->cancelWait) return SCE_OK;
+            if (thread->cancelWait) thread->cancelWait->NotifyAll();
         }
         scePthreadYield();
 

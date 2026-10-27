@@ -4,7 +4,9 @@
 #include "SceTypes.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include <cstdint>
+#include <cerrno>
 #include <optional>
+#include <utility>
 
 inline constexpr int GUEST_CANCEL_ENABLE = 0;
 inline constexpr int GUEST_CANCEL_DISABLE = 1;
@@ -34,6 +36,66 @@ void* CleanupMark();
 void CleanupRestore(void* mark);
 void BeginWait(TimedWait::Condition* condition);
 void EndWait();
+
+bool IoEnabled();
+
+class IoPoint {
+public:
+    IoPoint();
+    ~IoPoint();
+    IoPoint(const IoPoint&) = delete;
+    IoPoint& operator=(const IoPoint&) = delete;
+};
+
+class IoWait {
+public:
+    using Interrupt = void (*)(void*) noexcept;
+    IoWait(Interrupt interrupt, void* argument);
+    ~IoWait();
+    IoWait(const IoWait&) = delete;
+    IoWait& operator=(const IoWait&) = delete;
+    void Wake() noexcept { interrupt(argument); }
+
+private:
+    Interrupt interrupt;
+    void* argument;
+    IoWait* previous = nullptr;
+    Pthread thread = nullptr;
+};
+
+class NativeIo {
+public:
+    NativeIo();
+    ~NativeIo();
+    NativeIo(const NativeIo&) = delete;
+    NativeIo& operator=(const NativeIo&) = delete;
+
+private:
+    struct State;
+    State* state = nullptr;
+};
+
+template <class TCall>
+auto Native(TCall&& call) {
+    NativeIo operation;
+    if (IoEnabled() && Requested()) {
+        errno = EINTR;
+        return static_cast<decltype(call())>(-1);
+    }
+    return std::forward<TCall>(call)();
+}
+
+template <class TCall>
+auto Io(TCall&& call) {
+    Check();
+    decltype(call()) result;
+    {
+        IoPoint point;
+        result = std::forward<TCall>(call)();
+    }
+    if (result < 0) Check();
+    return result;
+}
 
 template <class TLock>
 struct WaitLock {

@@ -19,6 +19,7 @@
 #include "prx/libkernel/File/include/HostStreams.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "SceTypes.hpp"
 
@@ -70,8 +71,10 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
         errno = EISDIR;
         return -1;
     }
-    const auto positioned = File::LockPositionedTransfer(fd);
-    const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
+    std::optional<std::unique_lock<std::mutex>> positioned;
+    if (GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) != FILE_TYPE_PIPE)
+        positioned.emplace(File::LockPositionedTransfer(fd));
+    const int result = ThreadCancel::Native([&] { return ::_read(fd, buf, static_cast<unsigned int>(n)); });
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     return result;
 }
@@ -151,7 +154,7 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
     return result == -2 ? ::lseek(fd, static_cast<off_t>(offset), whence) : result;
 }
 static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
-    return ::read(fd, buf, n);
+    return ThreadCancel::Native([&] { return ::read(fd, buf, n); });
 }
 static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
     const auto result = File::WriteSharedMemory_nid_no_patch(fd, buf, n);
@@ -319,6 +322,7 @@ int OpenInDirectory_nid_no_patch(int directory, const char* path, int flags, std
 }
 
 int APS5_VABI sceKernelClose(int d) {
+    std::lock_guard descriptorLock(File::DescriptorMutex());
     if (File::IsHostStream(d)) return SCE_KERNEL_ERROR_EPERM;
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) return socketError == 0 ? 0 : SceKernelError(socketError);

@@ -32,6 +32,27 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
 bool DescriptorIsOpen_nid_no_patch(int descriptor);
 
 namespace File {
+std::recursive_mutex& DescriptorMutex();
+
+class IoDescriptor {
+public:
+    explicit IoDescriptor(int descriptor);
+    ~IoDescriptor();
+    IoDescriptor(const IoDescriptor&) = delete;
+    IoDescriptor& operator=(const IoDescriptor&) = delete;
+    int Value() const { return value; }
+
+private:
+    int value;
+};
+
+template <class TCall>
+std::int64_t WithIoDescriptor(int descriptor, TCall&& call) {
+    IoDescriptor retained(descriptor);
+    if (retained.Value() < 0) return -1;
+    return call(retained.Value());
+}
+
 #ifdef _WIN32
 std::optional<std::filesystem::path> WindowsDescriptorPath_nid_no_patch(int descriptor);
 #endif
