@@ -72,8 +72,10 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
         return -1;
     }
     std::optional<std::unique_lock<std::mutex>> positioned;
-    if (GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) != FILE_TYPE_PIPE)
-        positioned.emplace(File::LockPositionedTransfer(fd));
+    if (GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) != FILE_TYPE_PIPE) {
+        positioned = File::IoPositionedTransfer(fd);
+        if (!positioned) return -1;
+    }
     const int result = ThreadCancel::Native([&] { return ::_read(fd, buf, static_cast<unsigned int>(n)); });
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     return result;
@@ -322,7 +324,7 @@ int OpenInDirectory_nid_no_patch(int directory, const char* path, int flags, std
 }
 
 int APS5_VABI sceKernelClose(int d) {
-    std::lock_guard descriptorLock(File::DescriptorMutex());
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
     if (File::IsHostStream(d)) return SCE_KERNEL_ERROR_EPERM;
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) return socketError == 0 ? 0 : SceKernelError(socketError);

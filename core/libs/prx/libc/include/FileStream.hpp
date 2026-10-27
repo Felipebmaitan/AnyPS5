@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
+#include "prx/libc/include/DescriptorAccess.hpp"
 #ifdef _WIN32
 #include <io.h>
 #include "prx/libc/include/FileLock.hpp"
@@ -148,6 +149,11 @@ public:
     bool Reopen(const std::filesystem::path& filename, const char* mode,
         [[maybe_unused]] std::FILE* (*open)(const std::filesystem::path&, const std::string&) = nullptr) {
         auto* previous = GetHandle();
+#ifdef _WIN32
+        const GuestDescriptorAccess descriptorAccess(previous ? ::_fileno(previous) : -1, GuestDescriptorAccess::Mode::Change);
+#else
+        const GuestDescriptorAccess descriptorAccess(previous ? ::fileno(previous) : -1, GuestDescriptorAccess::Mode::Change);
+#endif
         _guest = {};
         guestError = false;
         randomDevice = false;
@@ -299,6 +305,11 @@ public:
 
     int Close() {
         GetHandle();
+#ifdef _WIN32
+        const GuestDescriptorAccess descriptorAccess(::_fileno(_handle), GuestDescriptorAccess::Mode::Change);
+#else
+        const GuestDescriptorAccess descriptorAccess(::fileno(_handle), GuestDescriptorAccess::Mode::Change);
+#endif
 #ifdef _WIN32
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));

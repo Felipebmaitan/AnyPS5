@@ -12,6 +12,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/DescriptorAccess.hpp"
 
 extern "C" {
 
@@ -32,8 +33,6 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
 bool DescriptorIsOpen_nid_no_patch(int descriptor);
 
 namespace File {
-std::recursive_mutex& DescriptorMutex();
-
 class IoDescriptor {
 public:
     explicit IoDescriptor(int descriptor);
@@ -44,6 +43,7 @@ public:
 
 private:
     int value;
+    GuestDescriptorAccess access;
 };
 
 template <class TCall>
@@ -55,6 +55,7 @@ std::int64_t WithIoDescriptor(int descriptor, TCall&& call) {
 
 #ifdef _WIN32
 std::optional<std::filesystem::path> WindowsDescriptorPath_nid_no_patch(int descriptor);
+std::optional<std::unique_lock<std::mutex>> IoPositionedTransfer(int descriptor);
 #endif
 int HostStandardError();
 [[nodiscard]] std::unique_lock<std::mutex> LockPositionedTransfer(int descriptor);

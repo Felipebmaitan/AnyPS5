@@ -161,11 +161,16 @@ static void Run(int argc, char** argv) {
         Require(registered, "read never registered its blocked operation");
     }
     int replacement[2]{-1, -1};
+    std::thread replacer;
+    std::atomic<bool> replaced{false};
     if (reuse) {
         Require(pipe_nid_postfix(replacement) == 0, "create replacement pipe");
-        Require(dup2_nid_postfix(replacement[0], state.input) == state.input, "replace blocked descriptor");
-        Require(close_nid_postfix(replacement[0]) == 0, "close replacement source");
         Require(write_nid_postfix(replacement[1], "n", 1) == 1, "seed replacement pipe");
+        replacer = std::thread([&] {
+            Require(dup2_nid_postfix(replacement[0], state.input) == state.input, "replace blocked descriptor");
+            Require(close_nid_postfix(replacement[0]) == 0, "close replacement source");
+            replaced.store(true);
+        });
     }
     bool prompt = true;
     if (!completion && !wouldBlock) {
@@ -203,6 +208,8 @@ static void Run(int argc, char** argv) {
     if (wouldBlock) Require(state.transferred == -1 && state.error == 35, "wrong would-block result");
     if (scenario == "timeout") Require(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(50), "receive timeout returned early");
     if (reuse) {
+        Require(Observe([&] { return replaced.load(); }), "descriptor replacement did not finish");
+        replacer.join();
         char byte = 0;
         Require(read_nid_postfix(state.input, &byte, 1) == 1 && byte == 'n', "operation consumed the replacement descriptor");
         Require(close_nid_postfix(replacement[1]) == 0, "close replacement writer");

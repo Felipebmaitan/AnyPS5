@@ -404,6 +404,7 @@ void GuestAddress(const sockaddr_storage& native, void* output, std::uint32_t* l
 }
 
 int GuestSockets::Close(int descriptor) {
+    const GuestDescriptorAccess descriptorLock(descriptor, GuestDescriptorAccess::Mode::Change);
     std::shared_ptr<Socket> released;
     {
         std::lock_guard lock(socketsMutex);
@@ -541,6 +542,7 @@ extern "C" int KernelReserveSocketNumber_nid_no_patch(std::uintptr_t native) {
 }
 
 extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number) {
+    const GuestDescriptorAccess descriptorLock(number, GuestDescriptorAccess::Mode::Change);
     ReleaseNumber(number);
 }
 

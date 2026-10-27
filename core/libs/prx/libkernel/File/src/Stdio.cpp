@@ -246,7 +246,7 @@ struct PositionedLock {
 };
 std::mutex g_positionedTableLock;
 std::unordered_map<int, std::shared_ptr<PositionedLock>> g_positionedLocks;
-std::unique_lock<std::mutex> File::LockPositionedTransfer(int descriptor) {
+static std::shared_ptr<PositionedLock> PositionedMutex(int descriptor) {
     std::shared_ptr<PositionedLock> entry;
     {
         std::lock_guard table(g_positionedTableLock);
@@ -254,7 +254,29 @@ std::unique_lock<std::mutex> File::LockPositionedTransfer(int descriptor) {
         if (!slot) slot = std::make_shared<PositionedLock>();
         entry = slot;
     }
-    return std::unique_lock<std::mutex>(entry->mutex);
+    return entry;
+}
+std::unique_lock<std::mutex> File::LockPositionedTransfer(int descriptor) {
+    return std::unique_lock<std::mutex>(PositionedMutex(descriptor)->mutex);
+}
+std::optional<std::unique_lock<std::mutex>> File::IoPositionedTransfer(int descriptor) {
+    if (!ThreadCancel::IoEnabled()) return LockPositionedTransfer(descriptor);
+    const auto entry = PositionedMutex(descriptor);
+    TimedWait::Condition changed;
+    std::mutex mutex;
+    ThreadCancel::IoWait wait([](void* argument) noexcept {
+        static_cast<TimedWait::Condition*>(argument)->NotifyAll();
+    }, &changed);
+    for (;;) {
+        if (ThreadCancel::Requested()) {
+            errno = EINTR;
+            return std::nullopt;
+        }
+        std::unique_lock lock(entry->mutex, std::try_to_lock);
+        if (lock.owns_lock()) return lock;
+        std::unique_lock sleep(mutex);
+        changed.WaitUntil(sleep, TimedWait::DeadlineNanos(1000));
+    }
 }
 void File::SharePositionedTransfer(int from, int to) {
     std::lock_guard table(g_positionedTableLock);
@@ -303,7 +325,8 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
     return done;
 }
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
-    const auto positioned = File::LockPositionedTransfer(descriptor);
+    const auto positioned = File::IoPositionedTransfer(descriptor);
+    if (!positioned) return -1;
     return NativePositionedTransfer(descriptor, buf, nbytes, offset, write);
 }
 std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbytes) {
@@ -457,6 +480,7 @@ static constexpr int GUEST_ENOTDIR = 20;
 static constexpr int GUEST_EISDIR = 21;
 static constexpr int GUEST_EWOULDBLOCK = 35;
 static constexpr int GUEST_EOPNOTSUPP = 45;
+static constexpr int GUEST_EINTR = 4;
 static constexpr int GUEST_ENOTEMPTY = 66;
 static constexpr int GUEST_EDEADLK = 11;
 static constexpr int GUEST_ELOOP = 62;
@@ -788,28 +812,32 @@ int APS5_VABI nmount_nid_postfix(const KernelIovec* iov, unsigned int niov, int 
 
 }
 
-std::recursive_mutex& File::DescriptorMutex() {
-    static std::recursive_mutex mutex;
-    return mutex;
+File::IoDescriptor::IoDescriptor(int descriptor)
+    : value(descriptor), access(descriptor, GuestDescriptorAccess::Mode::Read, std::defer_lock) {
+    if (descriptor < 0) {
+        *__error_nid_postfix() = GUEST_EBADF;
+        return;
+    }
+    if (access.TryLock()) return;
+    ThreadCancel::IoWait wait([](void* argument) noexcept {
+        static_cast<GuestDescriptorAccess*>(argument)->Wake();
+    }, &access);
+    for (;;) {
+        if (ThreadCancel::IoEnabled() && ThreadCancel::Requested()) {
+            value = -1;
+            *__error_nid_postfix() = GUEST_EINTR;
+            return;
+        }
+        if (access.ReadOrWait()) return;
+    }
 }
 
-File::IoDescriptor::IoDescriptor(int descriptor) {
-    std::lock_guard lock(DescriptorMutex());
-    value = dup_nid_postfix(descriptor);
-}
-
-File::IoDescriptor::~IoDescriptor() {
-    const int saved = errno;
-    const int guestError = *__error_nid_postfix();
-    if (value >= 0) close_nid_postfix(value);
-    *__error_nid_postfix() = guestError;
-    errno = saved;
-}
+File::IoDescriptor::~IoDescriptor() = default;
 
 extern "C" {
 
 int APS5_VABI close_nid_postfix(int d) {
-    std::lock_guard descriptorLock(File::DescriptorMutex());
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
     if (File::IsHostStream(d)) return PosixFailure(GUEST_EPERM);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) {
@@ -864,7 +892,7 @@ int File::HostStandardError() {
 extern "C" {
 
 int APS5_VABI dup_nid_postfix(int d) {
-    std::lock_guard descriptorLock(File::DescriptorMutex());
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Read);
     if (GuestSockets::IsOpen(d)) return GuestSockets::Duplicate(d);
     if (d < 0) return PosixFailure(GUEST_EBADF);
     if (IsKqueueDescriptor(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
@@ -883,8 +911,11 @@ int APS5_VABI dup_nid_postfix(int d) {
 }
 
 int APS5_VABI dup2_nid_postfix(int from, int to) {
-    std::lock_guard descriptorLock(File::DescriptorMutex());
     if (from < 0 || to < 0) return PosixFailure(GUEST_EBADF);
+    GuestDescriptorAccess source(from, GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    GuestDescriptorAccess target(to, GuestDescriptorAccess::Mode::Change, std::defer_lock);
+    if (from == to) source.Lock();
+    else GuestDescriptorAccess::LockTogether(source, target);
     if (GuestSockets::IsOpen(from)) {
         if (from != to && to <= 2)
             throw std::runtime_error(std::string(__func__) + ": moving a guest socket onto standard descriptor " + std::to_string(to) + " is not supported");
@@ -1504,7 +1535,10 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* guestIov, int iovcn
         if (const auto archived = File::ReadArchivedIovecs(d, iov, iovcnt, offset)) return *archived;
     }
     std::optional<std::unique_lock<std::mutex>> positioned;
-    if (write || offset != nullptr || NativeIsDisk(d)) positioned.emplace(File::LockPositionedTransfer(d));
+    if (write || offset != nullptr || NativeIsDisk(d)) {
+        positioned = File::IoPositionedTransfer(d);
+        if (!positioned) return SceErrorFromErrno(errno);
+    }
     if (total == 0) {
         char none = 0;
         const auto result = offset != nullptr ? NativePositionedTransfer(d, &none, 0, *offset, write) : NativeTransferBuffer(d, &none, 0, write);
