@@ -1,4 +1,4 @@
-#include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libSceFreeType/include/Api.hpp"
 
 #include <bit>
 #include <cstdint>
