@@ -1,6 +1,7 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/Api.hpp"
@@ -41,6 +42,7 @@ struct State {
     PthreadKey key = -1;
     std::string api, scenario;
     bool metadata = false;
+    unsigned preflight = 0;
     std::atomic<unsigned> calls{0}, cleanups{0}, destructors{0}, signals{0};
     std::atomic<bool> entered{false}, finished{false}, returned{false};
     std::int64_t result = -2;
@@ -56,7 +58,8 @@ static State* state = nullptr;
 
 static int Flush(int file) {
     Require(file == state->file, "flush used a different descriptor");
-    ++state->calls;
+    const auto call = state->calls.fetch_add(1) + 1;
+    if (state->preflight != 0 && call != state->preflight) return 0;
     if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") return 0;
     state->entered.store(true);
     char token = 0;
@@ -67,7 +70,7 @@ static int Flush(int file) {
     const bool completed = ::read(state->input, &token, 1) == 1;
 #endif
     if (!completed) return static_cast<int>(0x80020004u);
-    if (state->metadata) return 0;
+    if (state->metadata || state->preflight != 0) return 0;
 #ifdef _WIN32
     Require(::_commit(file) == 0, "native file flush failed");
 #else
@@ -134,19 +137,24 @@ int main(int argc, char** argv) {
     State storage;
     state = &storage;
     state->api = argv[1]; state->scenario = argv[2];
+    if (state->scenario.starts_with("preflight")) {
+        state->preflight = state->scenario[9] == '1' ? 1 : 2;
+        state->scenario.erase(0, 11);
+    }
     if (state->scenario.starts_with("metadata_")) {
         state->metadata = true;
         state->scenario.erase(0, 9);
     }
     const auto path = "anyps5-sync-cancel-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     state->file = open_nid_postfix(path.c_str(), 2 | 0x200, 0600);
-    Require(state->file >= 0 && fcntl_nid_postfix(state->file, 4, 0x80) == 0, "create synchronous file");
+    Require(state->file >= 0 && (state->preflight != 0 || fcntl_nid_postfix(state->file, 4, 0x80) == 0), "create synchronous file");
     if (state->scenario == "error") {
         Require(close_nid_postfix(state->file) == 0, "close writable file");
         state->file = open_nid_postfix(path.c_str(), 0x80, 0600);
         Require(state->file >= 0, "reopen read-only synchronous file");
     }
-    if (state->metadata) File::FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(Flush);
+    if (state->preflight != 0) File::FileSetSharedMemoryMetadataHookForTest_nid_no_patch(Flush);
+    else if (state->metadata) File::FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(Flush);
     else File::FileSetSynchronousWriteHookForTest_nid_no_patch(Flush);
     if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") {
         const auto result = Write(state->scenario == "error" ? 2 : 0);
@@ -166,7 +174,7 @@ int main(int argc, char** argv) {
 #else
             GuestSigaction action{};
             action.handler = reinterpret_cast<std::uintptr_t>(&Handler);
-            action.flags = 2;
+            action.flags = state->preflight != 0 ? 0 : 2;
             Require(sigaction_nid_postfix(2, &action, nullptr) == 0, "install restartable handler");
 #endif
         }
@@ -201,8 +209,8 @@ int main(int argc, char** argv) {
         Require(waiting || woke, "cancellation or close did not wake native flush");
         const bool canceled = state->scenario == "cancel" || state->scenario == "disabled" || state->api == "sce";
         Require(joined == (canceled ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "unexpected flush join result");
-        Require(state->cleanups.load() == 1 && state->destructors.load() == 1 && state->calls.load() == 1, "flush repeated or cleanup lost");
-        Require(std::filesystem::file_size(path) == 2, "flush interruption changed write progress");
+        Require(state->cleanups.load() == 1 && state->destructors.load() == 1 && state->calls.load() == (state->preflight != 0 ? (waiting ? 2u : state->preflight) : 1u), "flush repeated or cleanup lost");
+        Require(std::filesystem::file_size(path) == (state->preflight != 0 && !waiting ? 0u : 2u), "flush interruption changed write progress");
         if (canceled) Require(state->returned.load() == waiting, "canceled flush completion state");
         else if (state->scenario == "complete") Require(state->result == 2, "completed flush lost positive result");
         else Require(state->result == -1 && state->error == 4, "interrupted flush did not return EINTR");
@@ -214,6 +222,7 @@ int main(int argc, char** argv) {
         ::close(state->input); ::close(state->output);
 #endif
     }
+    File::FileSetSharedMemoryMetadataHookForTest_nid_no_patch(nullptr);
     File::FileSetSynchronousWriteHookForTest_nid_no_patch(nullptr);
     File::FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(nullptr);
     if (state->scenario != "close") Require(close_nid_postfix(state->file) == 0, "close synchronous file");

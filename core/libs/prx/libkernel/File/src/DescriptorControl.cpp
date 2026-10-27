@@ -700,7 +700,7 @@ bool IsCharacterDevice(int fd) {
     return DescriptorIsOpen_nid_no_patch(fd) && !GuestSockets::IsOpen(fd) && !File::DirectoryDescriptorPath(fd) && ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_CHAR;
 #else
     struct stat status{};
-    return ::fstat(fd, &status) == 0 && S_ISCHR(status.st_mode);
+    return ThreadCancel::Native([&] { return ::fstat(fd, &status); }) == 0 && S_ISCHR(status.st_mode);
 #endif
 }
 
@@ -717,7 +717,7 @@ bool IsVnode(int fd) {
     return File::DirectoryDescriptorPath(fd) || ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_DISK;
 #else
     struct stat status{};
-    return ::fstat(fd, &status) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
+    return ThreadCancel::Native([&] { return ::fstat(fd, &status); }) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
 #endif
 }
 

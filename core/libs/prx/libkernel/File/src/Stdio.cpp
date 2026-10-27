@@ -518,7 +518,9 @@ static std::int64_t NativePread(int descriptor, void* buf, std::size_t nbytes, s
 #ifdef __APPLE__
 std::int64_t File::WritevAtEnd(int descriptor, const iovec* iov, int iovcnt) {
     struct stat status{};
-    if (!File::Appends(descriptor) || ::fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) return -2;
+    if (!File::Appends(descriptor)) return -2;
+    if (ThreadCancel::Native([&] { return ::fstat(descriptor, &status); }) != 0) return ThreadCancel::IoActive() && ThreadCancel::IoInterrupted() ? -1 : -2;
+    if (!S_ISREG(status.st_mode)) return -2;
     const off_t position = ::lseek(descriptor, 0, SEEK_CUR);
     if (position < 0) return -1;
     const auto result = ThreadCancel::Native([&] { return static_cast<std::int64_t>(::writev(descriptor, iov, iovcnt)); });
@@ -596,7 +598,7 @@ static int PositionedArgumentError(int descriptor, bool write, bool nullBuffer, 
     if (IsKqueueDescriptor(descriptor)) return GUEST_ESPIPE;
     if (!nullBuffer && offset >= 0) return 0;
     if (!GuestSockets::IsOpen(descriptor) && !DescriptorIsOpen_nid_no_patch(descriptor)) return GUEST_EBADF;
-    if (!IsSeekableDescriptor(descriptor)) return GUEST_ESPIPE;
+    if (!IsSeekableDescriptor(descriptor)) return ThreadCancel::IoActive() && ThreadCancel::IoInterrupted() ? EINTR : GUEST_ESPIPE;
     if (!File::GrantsAccess(descriptor, write)) return GUEST_EBADF;
     return offset < 0 ? GUEST_EINVAL : GUEST_EFAULT;
 }

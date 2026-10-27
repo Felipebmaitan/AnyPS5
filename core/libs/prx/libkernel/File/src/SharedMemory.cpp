@@ -45,6 +45,17 @@ extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handle
 
 namespace {
 
+std::atomic<File::SharedMemoryMetadataHook> sharedMemoryMetadataHook{nullptr};
+
+template <class TCall>
+int SharedMemoryMetadata(int descriptor, TCall&& call) {
+    return ThreadCancel::Native([&] {
+        const auto hook = sharedMemoryMetadataHook.load();
+        if (hook && hook(descriptor) != 0) { errno = EINTR; return -1; }
+        return call();
+    });
+}
+
 #ifdef _WIN32
 std::mutex sharedDescriptorAccessMutex;
 std::unordered_map<int, bool> sharedDescriptorAccess;
@@ -692,6 +703,11 @@ int CreateAnonymousFile() {
 
 namespace File {
 
+extern "C" void FileSetSharedMemoryMetadataHookForTest_nid_no_patch(SharedMemoryMetadataHook hook) {
+    sharedMemoryMetadataHook.store(hook);
+}
+
+
 bool IsSharedMemoryDescriptor_nid_no_patch(int descriptor) {
     return IsHostSharedMemoryDescriptor(descriptor);
 }
@@ -741,7 +757,7 @@ public:
     explicit SharedMemoryLock(int value) {
 #ifdef __linux__
         struct stat originalStatus{};
-        if (::fstat(value, &originalStatus) != 0) { shared = true; error = errno; return; }
+        if (SharedMemoryMetadata(value, [&] { return ::fstat(value, &originalStatus); }) != 0) { shared = true; error = errno; return; }
 #elif defined(_WIN32)
         if (!IsHostSharedMemoryDescriptor(value)) return;
         const auto originalValue = ::_get_osfhandle(value);
@@ -758,7 +774,7 @@ public:
         if (!IsHostSharedMemoryDescriptor(value)) {
 #ifdef __linux__
             struct stat currentStatus{};
-            if (::fstat(value, &currentStatus) != 0) { shared = true; error = errno; return; }
+            if (SharedMemoryMetadata(value, [&] { return ::fstat(value, &currentStatus); }) != 0) { shared = true; error = errno; return; }
             if (currentStatus.st_dev != originalStatus.st_dev || currentStatus.st_ino != originalStatus.st_ino) {
                 shared = true;
                 error = EBADF;
@@ -806,11 +822,11 @@ public:
     bool Refresh() {
 #ifdef _WIN32
         struct _stat64 nativeStatus{};
-        if (::_fstat64(descriptor, &nativeStatus) != 0) return false;
+        if (SharedMemoryMetadata(descriptor, [&] { return ::_fstat64(descriptor, &nativeStatus); }) != 0) return false;
         status.st_size = nativeStatus.st_size;
         return true;
 #else
-        return ::fstat(descriptor, &status) == 0;
+        return SharedMemoryMetadata(descriptor, [&] { return ::fstat(descriptor, &status); }) == 0;
 #endif
     }
     struct stat status{};
@@ -951,7 +967,7 @@ static std::int64_t TransferSharedMemoryVectors(int descriptor, const struct iov
     if ((access & O_ACCMODE) == O_RDONLY) { errno = EBADF; return -1; }
     if (positioned && offset < 0) { errno = EINVAL; return -1; }
     struct stat status{};
-    if (::fstat(fd, &status) != 0) return -1;
+    if (SharedMemoryMetadata(fd, [&] { return ::fstat(fd, &status); }) != 0) return -1;
     std::uint64_t total = 0;
     constexpr auto maxTransfer = static_cast<std::uint64_t>(std::numeric_limits<ssize_t>::max());
     for (int i = 0; i < count; ++i) {
