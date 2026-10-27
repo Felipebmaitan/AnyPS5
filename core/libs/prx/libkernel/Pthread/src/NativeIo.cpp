@@ -1,6 +1,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -95,6 +96,14 @@ private:
 
 NativeIo::NativeIo() {
     if (IoActive()) state = new State;
+}
+
+void NativeIo::InterruptError() {
+    errno = EINTR;
+#ifdef _WIN32
+    _doserrno = ERROR_OPERATION_ABORTED;
+    SetLastError(ERROR_OPERATION_ABORTED);
+#endif
 }
 
 NativeIo::~NativeIo() {

@@ -233,7 +233,7 @@ static void* APS5_VABI ReadUntilClose(void* argument) {
     return nullptr;
 }
 
-static void PosixClose(bool socket, int api, bool disabled, bool direct = false) {
+static void PosixClose(bool socket, int api, bool disabled, int entry = 0) {
     int descriptors[2]{};
     Require((socket ? socketpair_nid_postfix(1, 1, 0, descriptors) : pipe_nid_postfix(descriptors)) == 0, "create close-read transport");
     const int alias = dup_nid_postfix(descriptors[0]);
@@ -263,7 +263,7 @@ static void PosixClose(bool socket, int api, bool disabled, bool direct = false)
     if (disabled) Require(pthread_cancel_nid_postfix(reader) == 0, "leave cancellation pending in close reader");
     std::atomic<bool> closed{false};
     std::thread closer([&] {
-        Require((direct ? GuestSockets::Close(descriptors[0]) : close_nid_postfix(descriptors[0])) == 0, "close active read descriptor");
+        Require((entry == 1 ? GuestSockets::Close(descriptors[0]) : entry == 2 ? sceKernelClose(descriptors[0]) : close_nid_postfix(descriptors[0])) == 0, "close active read descriptor");
         closed.store(true);
     });
     const bool prompt = Observe([&] { return closed.load(); });
@@ -282,6 +282,32 @@ static void PosixClose(bool socket, int api, bool disabled, bool direct = false)
     Require(close_nid_postfix(descriptors[0]) == 0 && close_nid_postfix(alias) == 0 && close_nid_postfix(descriptors[1]) == 0, "close close-read endpoints");
     Require(scePthreadKeyDelete(key) == 0, "delete close reader TSD key");
 }
+
+#ifdef _WIN32
+static void CloseNativeErrors() {
+    int descriptors[2]{};
+    Require(pipe_nid_postfix(descriptors) == 0, "create native-error close pipe");
+    std::atomic<bool> admitted{false};
+    std::thread reader([&] {
+        bool called = false;
+        const auto result = ThreadCancel::Io([&] { return File::WithIoDescriptor(descriptors[0], [&](int) -> std::int64_t {
+            admitted.store(true);
+            Require(Observe([] { return GuestDescriptorAccess::Operation::CurrentInterrupted(); }), "close did not interrupt pre-call reader");
+            _doserrno = ERROR_NO_DATA;
+            SetLastError(ERROR_HANDLE_EOF);
+            const auto transferred = ThreadCancel::Native([&] { called = true; return std::int64_t{0}; });
+            const DWORD error = GetLastError();
+            Require(!called && transferred == -1 && errno == EINTR && _doserrno == ERROR_OPERATION_ABORTED && error == ERROR_OPERATION_ABORTED, "pre-call close interruption left stale native errors");
+            return transferred;
+        }); });
+        Require(result == -1, "pre-call close read returned success");
+    });
+    Require(Observe([&] { return admitted.load(); }), "pre-call reader did not enter");
+    Require(close_nid_postfix(descriptors[0]) == 0, "close pre-call descriptor");
+    reader.join();
+    Require(close_nid_postfix(descriptors[1]) == 0, "close pre-call peer");
+}
+#endif
 
 static void CloseUnregistered(bool socket) {
     int descriptors[2]{};
@@ -698,7 +724,7 @@ int main(int argc, char** argv) {
     Require(argc >= 2, "expected descriptor-access case");
     if (std::strcmp(argv[1], "posix_close") == 0) {
         Require(argc == 6, "expected close transport, API, cancellation state and entry point");
-        PosixClose(std::atoi(argv[2]) != 0, std::atoi(argv[3]), std::atoi(argv[4]) != 0, std::atoi(argv[5]) != 0);
+        PosixClose(std::atoi(argv[2]) != 0, std::atoi(argv[3]), std::atoi(argv[4]) != 0, std::atoi(argv[5]));
         return 0;
     }
     if (std::strcmp(argv[1], "close_unregistered") == 0 || std::strcmp(argv[1], "close_readers") == 0) {
@@ -718,6 +744,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[1], "invalid_registry") == 0) InvalidRegistry();
 #endif
 #ifdef _WIN32
+    else if (std::strcmp(argv[1], "close_native_errors") == 0) CloseNativeErrors();
     else if (std::strcmp(argv[1], "append_status") == 0) AppendOwnership(false);
     else if (std::strcmp(argv[1], "append_stream") == 0) AppendOwnership(true);
     else if (std::strcmp(argv[1], "close_progress") == 0) CloseProgress();

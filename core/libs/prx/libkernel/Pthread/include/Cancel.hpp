@@ -100,6 +100,7 @@ class NativeIo {
 public:
     NativeIo();
     ~NativeIo();
+    static void InterruptError();
     NativeIo(const NativeIo&) = delete;
     NativeIo& operator=(const NativeIo&) = delete;
 
@@ -112,7 +113,7 @@ template <class TCall>
 auto Native(TCall&& call) {
     NativeIo operation;
     if (IoInterrupted()) {
-        errno = EINTR;
+        NativeIo::InterruptError();
         return static_cast<decltype(call())>(-1);
     }
     return std::forward<TCall>(call)();

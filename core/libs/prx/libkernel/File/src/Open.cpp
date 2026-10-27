@@ -378,7 +378,7 @@ int OpenInDirectory_nid_no_patch(int directory, const char* path, int flags, std
 
 int APS5_VABI sceKernelClose(int d) {
     if (File::IsHostStream(d)) return SCE_KERNEL_ERROR_EPERM;
-    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Close);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) return socketError == 0 ? 0 : SceKernelError(socketError);
     if (GuestSockets::IsOpen(d)) return GuestSockets::Close(d) == 0 ? 0 : SceKernelError(*__error_nid_postfix());
