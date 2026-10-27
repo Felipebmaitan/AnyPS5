@@ -18,6 +18,7 @@ public:
     void WritePointer(std::uint64_t address, std::uint64_t value);
     void RequireWritable(std::uint64_t address, std::uint64_t size) const;
     void RecordRelocation(std::uint64_t address);
+    bool HasRelocation(std::uint64_t address, std::uint64_t size) const;
     void RequireNoRelocation(std::uint64_t address, std::uint64_t size) const;
     std::vector<PeSection> BuildSections() const;
 

@@ -120,6 +120,12 @@ void WindowsLoadImage::RecordRelocation(const std::uint64_t address) {
     relocationTargets.insert(address);
 }
 
+bool WindowsLoadImage::HasRelocation(const std::uint64_t address, const std::uint64_t size) const {
+    const auto target = relocationTargets.lower_bound(address);
+    return (target != relocationTargets.end() && *target - address < size) ||
+        (target != relocationTargets.begin() && address - *std::prev(target) < 8);
+}
+
 void WindowsLoadImage::RequireNoRelocation(const std::uint64_t address, const std::uint64_t size) const {
     const auto target = relocationTargets.lower_bound(address);
     if (target != relocationTargets.end() && *target - address < size)

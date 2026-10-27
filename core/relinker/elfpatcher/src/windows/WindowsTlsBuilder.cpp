@@ -48,6 +48,8 @@ struct TlsAccess {
 struct GsTrap {
     std::uint32_t Rva;
     std::size_t Length;
+    std::size_t OriginalLength;
+    Domain::FileByteOffset FileOffset;
     std::optional<Domain::FileByteOffset> Entry;
     std::vector<MovedInstruction> Moved;
     std::optional<std::uint32_t> Replay;
@@ -212,7 +214,7 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
 
     std::vector<TlsAccess> accesses;
     std::vector<GsTrap> gsTraps;
-    std::optional<Domain::FileByteOffset> overlappingGs;
+    std::vector<std::uint32_t> overlappingGs;
     PeSection gsSection{".ggs", nextRva, SectionRead | SectionExecute | 0x40u, {}};
     std::vector<std::uint32_t> branchTargets;
     std::set<Domain::VirtualAddress> entryRoots;
@@ -254,15 +256,15 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
             const bool gsBaseRegister = info.IsTwoByteOpcode && info.Opcode == 0xae && info.HasModRm && (info.ModRmByte >> 6) == 3 &&
                 (info.ModRmRegField == 1 || info.ModRmRegField == 3) && std::find(bytes, bytes + info.OpcodeOffset, 0xf3) != bytes + info.OpcodeOffset;
             const bool gsState = gsSelector || gsStack || gsBaseRegister;
-            if (insidePrevious && ((info.SegmentPrefix == 0x65 && info.HasMemoryOperand) || gsState) && !overlappingGs)
-                overlappingGs = header.Offset + offset;
+            if (insidePrevious && ((info.SegmentPrefix == 0x65 && info.HasMemoryOperand) || gsState))
+                overlappingGs.push_back(rva);
             if ((info.SegmentPrefix == 0x65 || gsState) && !insidePrevious) {
                 if (info.HasMemoryOperand || gsState) {
                     image.RequireNoRelocation(*instruction, info.Length);
                     const auto entry = entryRoots.upper_bound(*instruction);
                     const auto previousSize = gsSection.Data.size();
                     bool replayable = !gsState && WindowsGuestGs::TryAppend(gsSection, rva, bytes, info);
-                    GsTrap trap{rva, info.Length, std::nullopt, {}, std::nullopt};
+                    GsTrap trap{rva, info.Length, info.Length, header.Offset + offset, std::nullopt, {}, std::nullopt};
                     PeSection probe{"", 0, 0, {}};
                     while (replayable && trap.Length < kJumpSize) {
                         if (trap.Length >= header.FileSize - offset) { replayable = false; break; }
@@ -283,16 +285,17 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
                         if (trap.Length < kJumpSize && next.FlowKind != Codegen::ControlFlowKind::Sequential && next.FlowKind != Codegen::ControlFlowKind::ConditionalBranch)
                             replayable = false;
                     }
+                    for (const auto& moved : trap.Moved)
+                        if (image.HasRelocation(*instruction + moved.Rva - rva, moved.OriginalLength)) replayable = false;
                     if (replayable) {
                         trap.Replay = CheckedRva(static_cast<std::uint64_t>(gsSection.Rva) + gsSection.Data.size() - 64 + 24);
-                        for (const auto& moved : trap.Moved) image.RequireNoRelocation(*instruction + moved.Rva - rva, moved.OriginalLength);
                     } else {
                         gsSection.Data.resize(previousSize);
                         if (previousSize != 0) Io::WriteU32(gsSection.Data, 8, CheckedRva((previousSize - 16) / 64));
                         trap.Length = info.Length;
                         trap.Moved.clear();
                     }
-                    const auto patchLength = trap.Replay ? kJumpSize : info.Length;
+                    const auto patchLength = trap.Replay && info.Length >= kJumpSize ? kJumpSize : trap.Length;
                     if (entry != entryRoots.end() && *entry - *instruction < patchLength)
                         trap.Entry = header.Offset + *entry - header.MappedAddress;
                     gsTraps.push_back(std::move(trap));
@@ -366,6 +369,32 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
     }
 
     report(9000);
+    std::sort(branchTargets.begin(), branchTargets.end());
+    branchTargets.erase(std::unique(branchTargets.begin(), branchTargets.end()), branchTargets.end());
+    std::vector<std::uint8_t> retained;
+    for (auto& trap : gsTraps) {
+        const auto target = std::upper_bound(branchTargets.begin(), branchTargets.end(), trap.Rva);
+        if (trap.Replay && trap.OriginalLength < kJumpSize &&
+            ((target != branchTargets.end() && *target >= trap.Rva + trap.OriginalLength && *target < trap.Rva + trap.Length) ||
+             (trap.Entry && *trap.Entry - trap.FileOffset >= trap.OriginalLength) ||
+             std::any_of(overlappingGs.begin(), overlappingGs.end(), [&](const auto address) { return address >= trap.Rva && address - trap.Rva < trap.Length; }))) {
+            trap.Replay.reset();
+            trap.Length = trap.OriginalLength;
+            trap.Moved.clear();
+            if (trap.Entry && *trap.Entry - trap.FileOffset >= trap.OriginalLength) trap.Entry.reset();
+        }
+        if (target != branchTargets.end() && *target < trap.Rva + (trap.Replay ? kJumpSize : trap.Length))
+            throw Domain::RelinkerException("Branch enters a guest GS instruction", *target);
+        if (trap.Entry)
+            throw Domain::RelinkerException("GS trap would overwrite an executable entry point", *trap.Entry);
+        if (!trap.Replay) continue;
+        if (retained.empty()) retained.assign(gsSection.Data.begin(), gsSection.Data.begin() + 16);
+        const auto offset = *trap.Replay - gsSection.Rva - 24;
+        trap.Replay = CheckedRva(static_cast<std::uint64_t>(gsSection.Rva) + retained.size() + 24);
+        retained.insert(retained.end(), gsSection.Data.begin() + offset, gsSection.Data.begin() + offset + 64);
+    }
+    gsSection.Data = std::move(retained);
+    if (!gsSection.Data.empty()) Io::WriteU32(gsSection.Data, 8, CheckedRva((gsSection.Data.size() - 16) / 64));
     for (auto& trap : gsTraps) {
         for (auto& moved : trap.Moved) {
             const auto info = decoder.DecodeInstruction(moved.Bytes.data(), moved.Bytes.size());
@@ -376,18 +405,8 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
             gsSection.Data[gsSection.Data.size() - 64 + 14] = 1;
         }
     }
-    std::sort(branchTargets.begin(), branchTargets.end());
-    branchTargets.erase(std::unique(branchTargets.begin(), branchTargets.end()), branchTargets.end());
-    for (const auto& [rva, length, entry, moved, replay] : gsTraps) {
-        const auto target = std::upper_bound(branchTargets.begin(), branchTargets.end(), rva);
-        if (target != branchTargets.end() && *target < rva + (replay ? kJumpSize : length))
-            throw Domain::RelinkerException("Branch enters a guest GS instruction", *target);
-        if (entry)
-            throw Domain::RelinkerException("GS trap would overwrite an executable entry point", *entry);
-        patchGsInstruction(sections, rva, length, replay);
-    }
-    if (overlappingGs)
-        throw Domain::RelinkerException("Overlapping Windows guest GS instruction streams are unsupported", *overlappingGs);
+    for (const auto& trap : gsTraps)
+        patchGsInstruction(sections, trap.Rva, trap.Length, trap.Replay);
     if (!gsSection.Data.empty()) {
         nextRva = AlignRva(static_cast<std::uint64_t>(nextRva) + gsSection.Data.size());
         sections.push_back(std::move(gsSection));

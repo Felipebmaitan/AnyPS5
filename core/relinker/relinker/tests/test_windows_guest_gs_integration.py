@@ -95,6 +95,15 @@ def skipped_gs_image():
     return image
 
 
+def borrowed_entry_image():
+    image = make_image("relative")
+    image[0x210:0x219] = bytes.fromhex("65 8b 02 b8 2a 00 00 00 c3")
+    struct.pack_into("<Q", image, 24, 0x213)
+    struct.pack_into("<I", image, 176, 0)
+    struct.pack_into("<q", image, 0x728, 0x213)
+    return image
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("relinker", type=Path)
@@ -133,6 +142,7 @@ def main():
             for label, image, module, required in (
                 ("plain", startup_image(False), None, False),
                 ("skipped-gs", skipped_gs_image(), None, False),
+                ("borrowed-entry", borrowed_entry_image(), None, False),
                 ("gs", startup_image(True), None, True),
                 ("guest-initializer", main_fixture(), guest_initializer(), True),
                 ("short-gs", startup_image(True, short=True), None, True),
