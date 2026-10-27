@@ -164,6 +164,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
     std::set<std::uint64_t> roots;
     std::set<std::uint64_t> strongRoots;
     std::set<std::uint64_t> flowRoots;
+    std::set<std::uint64_t> symbolAnchors;
     std::map<std::uint64_t, std::uint64_t> functions;
     std::map<std::uint64_t, std::uint64_t> tables;
     const auto inTable = [&](std::uint64_t address) { const auto after = tables.upper_bound(address); return after != tables.begin() && address < std::prev(after)->second; };
@@ -327,6 +328,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
         for (std::uint64_t index = 0; index < symbolCount; ++index) {
             const auto offset = symbols + index * 24;
             const auto section = Io::ReadU16(bytes, offset + 6);
+            if (forceAuthoritative && section != 0 && section < Elfpatcher::SHN_LORESERVE && (bytes[offset + 4] & 15) != Elfpatcher::STT_TLS) {
+                const auto address = Io::ReadU64(bytes, offset + 8);
+                if (isCode(address)) symbolAnchors.insert(address);
+            }
             if ((bytes[offset + 4] & 15) == 2 && section != 0 && section != Elfpatcher::SHN_ABS) {
                 const auto address = Io::ReadU64(bytes, offset + 8);
                 addStrongRoot(address);
@@ -672,7 +677,10 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::collect(const std::ve
         text << "Took " << std::dec << dataTargets.size() << " pointer target(s) outside the unwind functions as data, the first at 0x" << std::hex << *dataTargets.begin() << '\n';
         message(text.str());
     }
-    if (entryRoots) roots.insert(dataTargets.begin(), dataTargets.end());
+    if (entryRoots) {
+        roots.insert(dataTargets.begin(), dataTargets.end());
+        roots.insert(symbolAnchors.begin(), symbolAnchors.end());
+    }
     report(10000);
     if (entryRoots) *entryRoots = std::move(roots);
     if (tailReachableRanges) *tailReachableRanges = std::move(tailRanges);

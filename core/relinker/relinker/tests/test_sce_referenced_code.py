@@ -275,6 +275,21 @@ def interior_route(kind):
     return image
 
 
+def route_alias(info, delta):
+    image = routed_tail()
+    image[0x45D:0x463] = bytes.fromhex("b8 25 00 00 00 c3")
+    strings = b"\0libkernel.prx\0pathconf\0alias\0"
+    image[0xA00:0xA00 + len(strings)] = strings
+    struct.pack_into("<IBBHQQ", image, 0xA50, strings.index(b"alias"), info, 0, 1, 0x1050 + delta, 0)
+    for at in range(0x600, 0x6A0, 16):
+        tag = struct.unpack_from("<Q", image, at)[0]
+        if tag == 0x61000037:
+            struct.pack_into("<Q", image, at + 8, len(strings))
+        if tag == 0x6100003F:
+            struct.pack_into("<Q", image, at + 8, 72)
+    return image
+
+
 def padded_interior_route():
     image = bytearray(numbered_route_fixture(STUB_191))
     image[0x1000:0x1200] = b"\xcc" * 0x200
@@ -340,6 +355,23 @@ def main():
                     patch = output_bytes(data, system, address, 13)
                     assert patch[:2] == b"\xff\x25" and address + 6 + struct.unpack_from("<i", patch, 2)[0] == 0x2200, (name, patch.hex())
             for module in (False, True):
+                for info in (0x10, 0x11, 0x12):
+                    for delta in (7, 12, 13):
+                        name = f"{system}-{module}-route-alias-{info}-{delta}"
+                        converted = convert(relinker, work, name, route_alias(info, delta), system,
+                                            "Syscall route would overwrite an interior reference" if delta < 13 else None,
+                                            module=module)
+                        if delta == 13:
+                            assert output_bytes(converted.read_bytes(), system, 0x105D, 6) == bytes.fromhex("b8 25 00 00 00 c3"), name
+                            if os.name == "nt" and system == "windows" and module and info == 0x10:
+                                child = "import ctypes,sys;k=ctypes.WinDLL('kernel32',use_last_error=True);k.LoadLibraryExW.argtypes=[ctypes.c_wchar_p,ctypes.c_void_p,ctypes.c_uint32];k.LoadLibraryExW.restype=ctypes.c_void_p;k.GetProcAddress.argtypes=[ctypes.c_void_p,ctypes.c_char_p];k.GetProcAddress.restype=ctypes.c_void_p;h=k.LoadLibraryExW(sys.argv[1],None,1);assert h,ctypes.get_last_error();a=k.GetProcAddress(h,b'alias');assert a,ctypes.get_last_error();sys.exit(ctypes.CFUNCTYPE(ctypes.c_int)(a)())"
+                                run = subprocess.run([sys.executable, "-B", "-c", child, str(converted)], capture_output=True, timeout=5)
+                                assert run.returncode == 37, (name, run.returncode, run.stderr)
+                for info in (0x00, 0x20):
+                    convert(relinker, work, f"{system}-{module}-route-alias-binding-{info}", route_alias(info, 12), system,
+                            "Syscall route would overwrite an interior reference", module=module)
+                converted = convert(relinker, work, f"{system}-{module}-untyped-data-export", route_alias(0x10, -0x30), system, module=module)
+                assert output_bytes(converted.read_bytes(), system, 0x1020, len(LOOKALIKE)) == LOOKALIKE
                 for mixed in (False, True):
                     for reverse in ((False, True) if mixed else (False,)):
                         image = routed_tail()
