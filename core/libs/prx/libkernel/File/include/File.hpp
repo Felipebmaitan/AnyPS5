@@ -45,6 +45,7 @@ public:
 private:
     int value;
     GuestDescriptorAccess access;
+    std::optional<GuestDescriptorAccess::Operation> operation;
 };
 
 template <class TCall>

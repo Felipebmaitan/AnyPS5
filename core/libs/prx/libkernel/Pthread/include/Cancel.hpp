@@ -3,6 +3,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include <cstdint>
 #include <cerrno>
 #include <optional>
@@ -92,6 +93,7 @@ private:
     Pthread thread = nullptr;
     void* signalState = nullptr;
     IoWait* signalPrevious = nullptr;
+    GuestDescriptorAccess::Operation::WakeRegistration descriptorWake;
 };
 
 class NativeIo {

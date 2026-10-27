@@ -404,7 +404,7 @@ void GuestAddress(const sockaddr_storage& native, void* output, std::uint32_t* l
 }
 
 int GuestSockets::Close(int descriptor) {
-    const GuestDescriptorAccess descriptorLock(descriptor, GuestDescriptorAccess::Mode::Change);
+    const GuestDescriptorAccess descriptorLock(descriptor, GuestDescriptorAccess::Mode::Close);
     std::shared_ptr<Socket> released;
     {
         std::lock_guard lock(socketsMutex);

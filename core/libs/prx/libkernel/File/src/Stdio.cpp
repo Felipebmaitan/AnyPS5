@@ -837,7 +837,7 @@ File::IoDescriptor::IoDescriptor(int descriptor)
         if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
             value = -1;
             *__error_nid_postfix() = GUEST_EBADF;
-        }
+        } else operation.emplace(access);
         return;
     }
     ThreadCancel::IoWait wait([](void* argument) noexcept {
@@ -858,19 +858,21 @@ File::IoDescriptor::IoDescriptor(int descriptor)
             if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
                 value = -1;
                 *__error_nid_postfix() = GUEST_EBADF;
-            }
+            } else operation.emplace(access);
             return;
         }
     }
 }
 
-File::IoDescriptor::~IoDescriptor() = default;
+File::IoDescriptor::~IoDescriptor() {
+    if (operation && operation->Interrupted()) ThreadCancel::IoNoRestart();
+}
 
 extern "C" {
 
 int APS5_VABI close_nid_postfix(int d) {
     if (File::IsHostStream(d)) return PosixFailure(GUEST_EPERM);
-    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Change);
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Close);
     int socketError = 0;
     if (KernelCloseSocket_nid_no_patch(d, &socketError)) {
         if (socketError == 0) return 0;

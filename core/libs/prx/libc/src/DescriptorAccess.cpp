@@ -4,6 +4,8 @@
 #include <map>
 #include <thread>
 #include <limits>
+#include <vector>
+#include <chrono>
 
 struct GuestDescriptorAccess::State {
     std::mutex mutex;
@@ -14,6 +16,12 @@ struct GuestDescriptorAccess::State {
     unsigned depth = 0;
     std::uint64_t generation = 0;
     bool replacement = false;
+    unsigned closesWaiting = 0;
+    std::vector<Operation*> operations;
+
+    void Interrupt() noexcept {
+        for (auto* operation : operations) operation->Interrupt();
+    }
 
     bool CanRead() const {
         return writer == std::this_thread::get_id() || (writer == std::thread::id{} && changesWaiting == 0);
@@ -50,17 +58,25 @@ void GuestDescriptorAccess::Lock() {
         ++state->readers;
     } else {
         ++state->changesWaiting;
+        if (mode == Mode::Close) ++state->closesWaiting;
         try {
-            state->changed.wait(lock, [&] { return state->CanChange(); });
+            if (mode == Mode::Close) {
+                while (!state->CanChange()) {
+                    state->Interrupt();
+                    state->changed.wait_for(lock, std::chrono::milliseconds(1));
+                }
+            } else state->changed.wait(lock, [&] { return state->CanChange(); });
         } catch (...) {
             --state->changesWaiting;
+            if (mode == Mode::Close) --state->closesWaiting;
             state->changed.notify_all();
             throw;
         }
         --state->changesWaiting;
+        if (mode == Mode::Close) --state->closesWaiting;
         state->writer = std::this_thread::get_id();
         ++state->depth;
-        state->replacement = state->replacement || mode == Mode::Change;
+        state->replacement = state->replacement || mode == Mode::Change || mode == Mode::Close;
     }
     held = true;
 }
@@ -75,7 +91,7 @@ bool GuestDescriptorAccess::TryLock() {
         if (!state->CanChange()) return false;
         state->writer = std::this_thread::get_id();
         ++state->depth;
-        state->replacement = state->replacement || mode == Mode::Change;
+        state->replacement = state->replacement || mode == Mode::Change || mode == Mode::Close;
     }
     held = true;
     return true;
@@ -116,7 +132,7 @@ GuestDescriptorAccess::Version::Version(std::shared_ptr<State> state, std::uint6
 bool GuestDescriptorAccess::Version::Unchanged() const {
     if (!state) return false;
     std::lock_guard lock(state->mutex);
-    return value != std::numeric_limits<std::uint64_t>::max() && state->generation == value;
+    return value != std::numeric_limits<std::uint64_t>::max() && state->generation == value && state->closesWaiting == 0;
 }
 
 GuestDescriptorAccess::Version GuestDescriptorAccess::Snapshot() const {
@@ -133,4 +149,45 @@ void GuestDescriptorAccess::LockTogether(GuestDescriptorAccess& first, GuestDesc
         void unlock() { access.Unlock(); }
     } firstLock{first}, secondLock{second};
     std::lock(firstLock, secondLock);
+}
+
+thread_local GuestDescriptorAccess::Operation* GuestDescriptorAccess::Operation::current = nullptr;
+
+GuestDescriptorAccess::Operation::Operation(GuestDescriptorAccess& access) : state(access.state), previous(current) {
+    if (state) {
+        std::lock_guard lock(state->mutex);
+        state->operations.push_back(this);
+        interrupted.store(state->closesWaiting != 0);
+    }
+    current = this;
+}
+
+GuestDescriptorAccess::Operation::~Operation() {
+    current = previous;
+    if (state) {
+        std::lock_guard lock(state->mutex);
+        std::erase(state->operations, this);
+    }
+}
+
+bool GuestDescriptorAccess::Operation::CurrentInterrupted() { return current && current->Interrupted(); }
+
+void GuestDescriptorAccess::Operation::Interrupt() noexcept {
+    interrupted.store(true);
+    for (auto* registration = wake; registration; registration = registration->previous)
+        registration->interrupt(registration->argument);
+}
+
+GuestDescriptorAccess::Operation::WakeRegistration::WakeRegistration(void (*interrupt)(void*) noexcept, void* argument)
+    : operation(Operation::current), interrupt(interrupt), argument(argument) {
+    if (!operation || !operation->state) { operation = nullptr; return; }
+    std::lock_guard lock(operation->state->mutex);
+    previous = operation->wake;
+    operation->wake = this;
+}
+
+GuestDescriptorAccess::Operation::WakeRegistration::~WakeRegistration() {
+    if (!operation) return;
+    std::lock_guard lock(operation->state->mutex);
+    operation->wake = previous;
 }

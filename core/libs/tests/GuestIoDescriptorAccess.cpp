@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
@@ -189,6 +190,143 @@ static bool Registered(Pthread reader) {
         std::lock_guard lock(reader->cancelLock);
         return reader->cancelIo != nullptr;
     });
+}
+
+struct CloseRead {
+    int descriptor;
+    int api;
+    bool disabled;
+    PthreadKey key;
+    std::int64_t result = -2;
+    int error = 0;
+    std::atomic<bool> returned{false};
+    std::atomic<int> cleanups{0}, destructors{0};
+    std::array<char, 4> data{};
+};
+
+static void APS5_VABI CloseCleanup(void* argument) { ++static_cast<CloseRead*>(argument)->cleanups; }
+static void APS5_VABI CloseDestructor(void* argument) { ++static_cast<CloseRead*>(argument)->destructors; }
+
+static void* APS5_VABI ReadUntilClose(void* argument) {
+    auto& read = *static_cast<CloseRead*>(argument);
+    if (read.disabled) Require(scePthreadSetcancelstate(GUEST_CANCEL_DISABLE, nullptr) == 0, "disable close reader cancellation");
+    Require(scePthreadSetspecific(read.key, &read) == 0, "set close reader TSD");
+    CleanupHandler cleanup{};
+    __pthread_cleanup_push_imp_nid_postfix(CloseCleanup, &read, &cleanup);
+    char byte = 0;
+    KernelIovec vector{&byte, 1};
+    GuestMsghdr message{};
+    message.iov = &vector;
+    message.iovLength = 1;
+    if (read.api == 0) read.result = read_nid_postfix(read.descriptor, &byte, 1);
+    else if (read.api == 1) read.result = readv_nid_postfix(read.descriptor, &vector, 1);
+    else if (read.api == 2) read.result = recv_nid_postfix(read.descriptor, &byte, 1, 0);
+    else if (read.api == 3) read.result = recvmsg_nid_postfix(read.descriptor, &message, 0);
+    else read.result = recv_nid_postfix(read.descriptor, read.data.data(), read.data.size(), 0x40);
+    read.error = *__error_nid_postfix();
+    read.returned.store(true);
+    if (read.disabled) {
+        Require(scePthreadSetcancelstate(GUEST_CANCEL_ENABLE, nullptr) == 0, "enable close reader cancellation");
+        scePthreadTestcancel();
+    }
+    __pthread_cleanup_pop_imp_nid_postfix(1);
+    return nullptr;
+}
+
+static void PosixClose(bool socket, int api, bool disabled, bool direct = false) {
+    int descriptors[2]{};
+    Require((socket ? socketpair_nid_postfix(1, 1, 0, descriptors) : pipe_nid_postfix(descriptors)) == 0, "create close-read transport");
+    const int alias = dup_nid_postfix(descriptors[0]);
+    Require(alias >= 0, "duplicate close-read endpoint");
+    PthreadKey key = -1;
+    Require(scePthreadKeyCreate(&key, reinterpret_cast<pthread_key_destructor_func_t>(CloseDestructor)) == 0, "create close reader TSD key");
+    CloseRead read{descriptors[0], api, disabled, key};
+    if (api == 4) {
+        Require(write_nid_postfix(descriptors[1], "p", 1) == 1, "seed partial close read");
+        Require(Observe([&] {
+            int available = -1;
+            Require(ioctl_nid_postfix(descriptors[0], 0x4004667f, &available) == 0, "inspect partial input");
+            return available == 1;
+        }), "partial input did not arrive");
+    }
+    Pthread reader = nullptr;
+    Require(scePthreadCreate(&reader, nullptr, ReadUntilClose, &read, nullptr) == 0, "start close reader");
+    const bool admitted = Observe([&] {
+        GuestDescriptorAccess probe(descriptors[0], GuestDescriptorAccess::Mode::Update, std::defer_lock);
+        return !probe.TryLock();
+    });
+    if (api == 4) Require(Observe([&] {
+        int available = -1;
+        Require(ioctl_nid_postfix(descriptors[0], 0x4004667f, &available) == 0, "inspect partial progress");
+        return available == 0;
+    }), "WAITALL read did not consume its partial input");
+    if (disabled) Require(pthread_cancel_nid_postfix(reader) == 0, "leave cancellation pending in close reader");
+    std::atomic<bool> closed{false};
+    std::thread closer([&] {
+        Require((direct ? GuestSockets::Close(descriptors[0]) : close_nid_postfix(descriptors[0])) == 0, "close active read descriptor");
+        closed.store(true);
+    });
+    const bool prompt = Observe([&] { return closed.load(); });
+    if (!prompt) Require(write_nid_postfix(descriptors[1], "xxxx", api == 4 ? 4 : 1) == (api == 4 ? 4 : 1), "release failed close reader");
+    Require(Observe([&] { return reader->_finished.load(); }), "close reader did not finish");
+    void* result = nullptr;
+    Require(scePthreadJoin(reader, &result) == 0, "join close reader");
+    closer.join();
+    Require(admitted && prompt && read.returned.load() && (api == 4 ? read.result == 1 && read.data[0] == 'p' : read.result == -1 && read.error == 4), "close waited for external input or returned the wrong read result");
+    Require(result == (disabled ? GUEST_CANCELED : nullptr) && read.cleanups.load() == 1 && read.destructors.load() == 1, "close reader lost pending cancellation or repeated cleanup/TSD");
+    Require(write_nid_postfix(descriptors[1], "a", 1) == 1, "write surviving alias");
+    char byte = 0;
+    Require(read_nid_postfix(alias, &byte, 1) == 1 && byte == 'a', "close shut down a surviving alias");
+    Require(dup2_nid_postfix(alias, descriptors[0]) == descriptors[0], "reuse closed descriptor");
+    Require(write_nid_postfix(descriptors[1], "b", 1) == 1 && read_nid_postfix(descriptors[0], &byte, 1) == 1 && byte == 'b', "old close interruption affected reused descriptor");
+    Require(close_nid_postfix(descriptors[0]) == 0 && close_nid_postfix(alias) == 0 && close_nid_postfix(descriptors[1]) == 0, "close close-read endpoints");
+    Require(scePthreadKeyDelete(key) == 0, "delete close reader TSD key");
+}
+
+static void CloseUnregistered(bool socket) {
+    int descriptors[2]{};
+    Require((socket ? socketpair_nid_postfix(1, 1, 0, descriptors) : pipe_nid_postfix(descriptors)) == 0, "create unregistered close transport");
+    BlockedRead read{descriptors[0]};
+    std::thread reader([&] { Reader(&read); });
+    const bool admitted = Observe([&] {
+        GuestDescriptorAccess probe(descriptors[0], GuestDescriptorAccess::Mode::Update, std::defer_lock);
+        return !probe.TryLock();
+    });
+    std::atomic<bool> closed{false};
+    std::thread closer([&] {
+        Require(close_nid_postfix(descriptors[0]) == 0, "close unregistered read");
+        closed.store(true);
+    });
+    const bool prompt = Observe([&] { return closed.load(); });
+    if (!prompt) Require(write_nid_postfix(descriptors[1], "x", 1) == 1, "release unregistered close failure");
+    closer.join();
+    reader.join();
+    Require(admitted && prompt && read.result == -1, "close did not interrupt an unregistered reader");
+    Require(close_nid_postfix(descriptors[1]) == 0, "close unregistered peer");
+}
+
+static void CloseReaders(bool socket) {
+    int descriptors[2]{};
+    Require((socket ? socketpair_nid_postfix(1, 1, 0, descriptors) : pipe_nid_postfix(descriptors)) == 0, "create multiple-reader close transport");
+    std::array<BlockedRead, 3> reads{{{descriptors[0]}, {descriptors[0]}, {descriptors[0]}}};
+    std::array<Pthread, 3> readers{};
+    for (std::size_t index = 0; index < readers.size(); ++index) {
+        Require(scePthreadCreate(&readers[index], nullptr, Reader, &reads[index], nullptr) == 0, "start close cohort reader");
+        Require(Registered(readers[index]), "close cohort reader did not register");
+    }
+    std::atomic<bool> closed{false};
+    std::thread closer([&] {
+        Require(close_nid_postfix(descriptors[0]) == 0, "close multiple readers");
+        closed.store(true);
+    });
+    const bool prompt = Observe([&] { return closed.load(); });
+    if (!prompt) Require(write_nid_postfix(descriptors[1], "xxx", 3) == 3, "release multiple-reader close failure");
+    closer.join();
+    for (std::size_t index = 0; index < readers.size(); ++index) {
+        Require(Observe([&] { return readers[index]->_finished.load(); }), "close cohort did not finish");
+        Require(scePthreadJoin(readers[index], nullptr) == 0 && reads[index].result == -1, "close cohort read did not fail");
+    }
+    Require(prompt && close_nid_postfix(descriptors[1]) == 0, "close failed to wake every admitted reader");
 }
 
 static void InvalidDuplicate() {
@@ -504,7 +642,7 @@ static bool ChildBlocked(int descriptor) {
     return WEXITSTATUS(status) == 7;
 }
 
-static void BorrowedNetClose() {
+static void BorrowedNetClose(bool posix = false) {
     const int listener = sceNetSocket("io-read-listener", 2, 1, 0);
     Require(listener >= 0, "create borrowed listener");
     std::array<unsigned char, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
@@ -522,7 +660,7 @@ static void BorrowedNetClose() {
     const bool registered = Registered(reader);
     std::atomic<bool> closed{false};
     std::thread closer([&] {
-        Require(sceNetSocketClose(accepted) == 0, "close borrowed socket");
+        Require((posix ? close_nid_postfix(accepted) : sceNetSocketClose(accepted)) == 0, "close borrowed socket");
         closed.store(true);
     });
     const bool prompt = Observe([&] { return closed.load(); });
@@ -530,7 +668,7 @@ static void BorrowedNetClose() {
     closer.join();
     Require(Observe([&] { return reader->_finished.load(); }), "borrowed reader did not finish");
     Require(scePthreadJoin(reader, nullptr) == 0, "join borrowed reader");
-    Require(registered && prompt && read.result == 0, "SCE socket close did not wake the borrowed POSIX read");
+    Require(registered && prompt && (posix ? read.result == -1 : read.result == 0), "socket close did not wake the borrowed POSIX read");
     Require(sceNetSocketClose(client) == 0 && sceNetSocketClose(listener) == 0, "close borrowed socket pair");
 }
 
@@ -557,7 +695,18 @@ static void RecordLocks() {
 #endif
 
 int main(int argc, char** argv) {
-    Require(argc == 2, "expected descriptor-access case");
+    Require(argc >= 2, "expected descriptor-access case");
+    if (std::strcmp(argv[1], "posix_close") == 0) {
+        Require(argc == 6, "expected close transport, API, cancellation state and entry point");
+        PosixClose(std::atoi(argv[2]) != 0, std::atoi(argv[3]), std::atoi(argv[4]) != 0, std::atoi(argv[5]) != 0);
+        return 0;
+    }
+    if (std::strcmp(argv[1], "close_unregistered") == 0 || std::strcmp(argv[1], "close_readers") == 0) {
+        Require(argc == 3, "expected close transport");
+        if (std::strcmp(argv[1], "close_unregistered") == 0) CloseUnregistered(std::atoi(argv[2]) != 0);
+        else CloseReaders(std::atoi(argv[2]) != 0);
+        return 0;
+    }
     if (std::strcmp(argv[1], "capacity") == 0) Capacity();
     else if (std::strcmp(argv[1], "no_aliases") == 0) NoAliases();
     else if (std::strcmp(argv[1], "access_cancel") == 0) AccessCancellation();
@@ -578,6 +727,7 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
     else if (std::strcmp(argv[1], "record_locks") == 0) RecordLocks();
     else if (std::strcmp(argv[1], "borrowed_net_close") == 0) BorrowedNetClose();
+    else if (std::strcmp(argv[1], "borrowed_posix_close") == 0) BorrowedNetClose(true);
 #endif
     else Require(false, "unknown descriptor-access case");
 }

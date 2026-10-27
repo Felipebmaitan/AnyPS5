@@ -305,6 +305,7 @@ void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
 }
 
 bool IoInterrupted() {
+    if (GuestDescriptorAccess::Operation::CurrentInterrupted()) { IoNoRestart(); return true; }
     return (current && current->Pending()) || (IoEnabled() && Requested());
 }
 

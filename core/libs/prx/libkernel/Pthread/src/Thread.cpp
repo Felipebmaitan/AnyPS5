@@ -789,7 +789,8 @@ bool ThreadCancel::IoEnabled() {
         CurrentGuestState().cancelState == GUEST_CANCEL_ENABLE;
 }
 
-ThreadCancel::IoWait::IoWait(Interrupt interrupt, void* argument) : interrupt(interrupt), argument(argument) {
+ThreadCancel::IoWait::IoWait(Interrupt interrupt, void* argument)
+    : interrupt(interrupt), argument(argument), descriptorWake(interrupt, argument) {
     BeginSignal();
     if (!IoEnabled()) return;
     thread = CurrentGuestState().current;
