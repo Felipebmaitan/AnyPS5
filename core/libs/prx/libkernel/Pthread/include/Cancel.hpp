@@ -51,10 +51,10 @@ public:
     IoRestart(const IoRestart&) = delete;
     IoRestart& operator=(const IoRestart&) = delete;
 private:
-    friend void BeginIoSignals(Pthread, IoRestart&);
+    friend void BeginIoSignals(Pthread, IoRestart&, std::optional<TimedWait::DeliveryDeferral>&);
     State* state;
 };
-void BeginIoSignals(Pthread thread, IoRestart& restart);
+void BeginIoSignals(Pthread thread, IoRestart& restart, std::optional<TimedWait::DeliveryDeferral>& deferral);
 void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral);
 bool DeferIoSignal(int signal, bool restart = true);
 bool DeferIoCallback(void (*callback)(), void (*retire)());
@@ -71,7 +71,7 @@ public:
     IoPoint& operator=(const IoPoint&) = delete;
 
 private:
-    std::optional<TimedWait::DeliveryDeferral> delivery{std::in_place};
+    std::optional<TimedWait::DeliveryDeferral> delivery;
 };
 
 class IoWait {

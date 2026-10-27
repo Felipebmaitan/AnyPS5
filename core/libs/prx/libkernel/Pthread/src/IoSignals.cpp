@@ -43,6 +43,7 @@ struct IoRestart::State {
 namespace {
 
 class SignalManager;
+std::atomic<SignalManager*> published{nullptr};
 
 class SetupBlock {
 public:
@@ -188,7 +189,11 @@ private:
 };
 
 SignalManager& Manager() {
-    static auto* manager = new SignalManager;
+    static auto* manager = [] {
+        auto* value = new SignalManager;
+        published.store(value, std::memory_order_release);
+        return value;
+    }();
     return *manager;
 }
 
@@ -221,8 +226,12 @@ void IoRestart::Clear() {
 
 bool IoRestart::Ready() const { return state->ready && IoRestartError(); }
 
-void BeginIoSignals(Pthread thread, IoRestart& restart) {
-    if (current) { ++depth; return; }
+void BeginIoSignals(Pthread thread, IoRestart& restart, std::optional<TimedWait::DeliveryDeferral>& deferral) {
+    if (current) {
+        if (!deferral) deferral.emplace();
+        ++depth;
+        return;
+    }
     const SetupBlock blocked;
     auto& manager = Manager();
     auto state = std::make_shared<SignalState>();
@@ -230,6 +239,7 @@ void BeginIoSignals(Pthread thread, IoRestart& restart) {
     state->guest = thread;
     state->replay = restart.state;
     restart.state->ready = false;
+    if (!deferral) deferral.emplace();
     {
         std::lock_guard lock(manager.mutex);
         manager.entries.push_back(state);
@@ -237,6 +247,9 @@ void BeginIoSignals(Pthread thread, IoRestart& restart) {
     owner = std::move(state);
     current = owner.get();
     depth = 1;
+#ifdef _WIN32
+    TimedWait::DeliverDeferred();
+#endif
 }
 
 void EndIoSignals(std::optional<TimedWait::DeliveryDeferral>& deferral) {
@@ -357,12 +370,13 @@ void RetireIoStack(std::uintptr_t stack) {
 
 void WakeIoDelivery(Pthread thread) {
     if (!thread) return;
-    auto& manager = Manager();
-    std::lock_guard registered(manager.mutex);
-    for (const auto& state : manager.entries) {
+    auto* manager = published.load(std::memory_order_acquire);
+    if (!manager) return;
+    std::lock_guard registered(manager->mutex);
+    for (const auto& state : manager->entries) {
         if (state->guest != thread) continue;
         state->delivery.store(true);
-        manager.Notify();
+        manager->Notify();
     }
 }
 

@@ -50,6 +50,7 @@ struct State {
     std::intptr_t nativeInput = -1;
     alignas(16) std::array<std::uint64_t, 12> jump{};
     std::atomic<long> nativeId{0};
+    std::atomic<bool> entering{false};
     std::atomic<bool> finished{false};
     std::atomic<int> handlers{0};
     int closed = -2;
@@ -93,6 +94,7 @@ static void* APS5_VABI Reader(void* opaque) {
     Require(pthread_sigmask(SIG_SETMASK, nullptr, &before) == 0, "get native mask before read");
     reading.nativeId.store(::syscall(SYS_gettid));
 #endif
+    reading.entering.store(true);
     if (reading.leave && setjmp_nid_postfix(reading.jump.data()) != 0) reading.result = -3;
     else reading.result = reading.socket ? recv_nid_postfix(reading.input, &reading.byte, 1, 0) : read_nid_postfix(reading.input, &reading.byte, 1);
     reading.error = *__error_nid_postfix();
@@ -122,7 +124,7 @@ static bool NativeReadBlocked(const State& reading) {
 }
 #endif
 
-int main(int argc, char** argv) {
+static void RunCase(int argc, char** argv) {
     Require(argc == 3 || argc == 4, "expected signal source, cancellation mode and optional action");
     const std::string source = argv[1];
     const bool exception = source.starts_with("exception");
@@ -131,7 +133,8 @@ int main(int argc, char** argv) {
     state = &reading;
     reading.disabled = std::strcmp(argv[2], "disabled") == 0;
     reading.socket = source.ends_with("_socket");
-    const bool resume = argc == 4 && std::strcmp(argv[3], "resume") == 0;
+    const bool starting = argc == 4 && std::strcmp(argv[3], "starting") == 0;
+    const bool resume = starting || (argc == 4 && std::strcmp(argv[3], "resume") == 0);
     const bool interrupt = argc == 4 && std::strcmp(argv[3], "interrupt") == 0;
     const bool timeout = argc == 4 && std::strcmp(argv[3], "timeout") == 0;
     reading.leave = argc == 4 && std::strcmp(argv[3], "jump") == 0;
@@ -161,6 +164,8 @@ int main(int argc, char** argv) {
     std::thread native;
     if (unregistered) native = std::thread([&] { Reader(&reading); });
     else Require(scePthreadCreate(&thread, nullptr, Reader, &reading, nullptr) == 0, "create signal reader");
+    if (starting) Require(Observe([&] { return reading.entering.load(); }), "reader did not start");
+    else {
 #ifdef _WIN32
     Require(Observe([&] {
         BOOL pending = FALSE;
@@ -169,6 +174,7 @@ int main(int argc, char** argv) {
 #else
     Require(Observe([&] { return NativeReadBlocked(reading); }), "read did not enter native syscall");
 #endif
+    }
     std::atomic<bool> requested{false};
     std::thread sender([&] {
         if (exception) Require(sceKernelRaiseException(thread, 30) == 0, "raise exception during read");
@@ -209,4 +215,9 @@ int main(int argc, char** argv) {
         close_nid_postfix(replacement[0]) == 0 && close_nid_postfix(replacement[1]) == 0, "close signal pipes");
     if (exception) Require(sceKernelRemoveExceptionHandler(30) == 0, "remove exception handler");
     else signal_nid_postfix(guestSignal, previous);
+}
+
+int main(int argc, char** argv) {
+    const int rounds = argc == 4 && std::strcmp(argv[3], "starting") == 0 ? 32 : 1;
+    for (int round = 0; round < rounds; ++round) RunCase(argc, argv);
 }

@@ -772,7 +772,13 @@ void ThreadCancel::EndWait() {
 
 static thread_local unsigned ioPoints = 0;
 
-ThreadCancel::IoPoint::IoPoint(IoRestart& restart) { BeginIoSignals(CurrentGuestState().current, restart); ++ioPoints; }
+ThreadCancel::IoPoint::IoPoint(IoRestart& restart) {
+#ifdef _WIN32
+    delivery.emplace();
+#endif
+    BeginIoSignals(CurrentGuestState().current, restart, delivery);
+    ++ioPoints;
+}
 ThreadCancel::IoPoint::~IoPoint() { --ioPoints; EndIoSignals(delivery); }
 
 bool ThreadCancel::IoActive() { return ioPoints != 0; }
