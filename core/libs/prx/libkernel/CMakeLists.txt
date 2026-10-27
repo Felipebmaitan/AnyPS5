@@ -35,6 +35,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/MainThreadMacOs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Atfork.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Barrier.cpp
@@ -85,6 +86,9 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/ParamJsonParser.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/ParamSfoParser.cpp
 )
+if(APPLE)
+    target_link_libraries(libkernel PRIVATE "-framework CoreFoundation")
+endif()
 
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR}/nid/include)
@@ -260,7 +264,7 @@ if(BUILD_TESTING)
     configure_windows_unwind(guest_module_fixture)
     set_target_properties(guest_module_fixture PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "$ORIGIN")
     if(Python3_Interpreter_FOUND)
-        if(NOT WIN32)
+        if(NOT WIN32 AND NOT APPLE)
             target_link_options(guest_module_fixture PRIVATE -Wl,--no-as-needed)
             add_test(NAME nid_patcher_dynamic_strings COMMAND ${Python3_EXECUTABLE}
                 ${LIBS_INCLUDE_DIR}/nid/tests/test_dynamic_strings.py $<TARGET_FILE:guest_module_fixture>)
@@ -637,6 +641,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_pthread_getname PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_pthread_posix_calls_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadPosixCalls.cpp)
+    target_include_directories(guest_pthread_posix_calls_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_pthread_posix_calls_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_pthread_posix_calls_tests)
+    add_test(NAME guest_pthread_posix_calls COMMAND guest_pthread_posix_calls_tests)
+    set_tests_properties(guest_pthread_posix_calls PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_pthread_posix_calls PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_pthread_attr_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadAttr.cpp)
     target_include_directories(guest_pthread_attr_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_pthread_attr_tests PRIVATE libkernel libc)
@@ -827,6 +841,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_cpu_time_clocks PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_cpu_time_clocks PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_usleep_tests ${LIBS_INCLUDE_DIR}/tests/GuestUsleep.cpp)
+    target_include_directories(guest_usleep_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_usleep_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_usleep_tests)
+    add_test(NAME guest_usleep COMMAND guest_usleep_tests)
+    set_tests_properties(guest_usleep PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_usleep PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_freebsd_clocks_tests ${LIBS_INCLUDE_DIR}/tests/GuestFreebsdClocks.cpp)
@@ -1198,6 +1222,11 @@ if(BUILD_TESTING)
         target_link_libraries(guest_unwind_module_info_failure_tests PRIVATE libkernel libc)
         set_target_properties(guest_unwind_module_info_failure_tests PROPERTIES ENABLE_EXPORTS ON)
         add_test(NAME guest_unwind_module_info_failure COMMAND guest_unwind_module_info_failure_tests)
+    elseif(APPLE)
+        add_test_executable(guest_unwind_module_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestUnwindModuleInfoMacos.cpp)
+        target_include_directories(guest_unwind_module_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_unwind_module_info_tests PRIVATE libkernel libc)
+        add_test(NAME guest_unwind_module_info COMMAND guest_unwind_module_info_tests)
     endif()
     add_test_executable(guest_sync_on_address_tests ${LIBS_INCLUDE_DIR}/tests/GuestSyncOnAddress.cpp)
     target_include_directories(guest_sync_on_address_tests PRIVATE ${LIBS_INCLUDE_DIR})

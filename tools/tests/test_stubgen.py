@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import check_conventions
 import stubgen
+from nid_names import compute_nid
 
 
 class StubgenTests(unittest.TestCase):
@@ -30,6 +31,29 @@ class StubgenTests(unittest.TestCase):
         code, _ = stubgen.generate("libkernel", ["AC1FtjqMCL0"], {})
         self.assertIn("APS5_VABI", code)
         self.assertIn("NotImplemented_nid_no_patch", code)
+
+    def test_unknown_exports_cannot_consume_verified_known_names(self):
+        known_name = "sceAmprUnknown00"
+        known_nid = compute_nid(known_name)
+        unknown_nid = "AAAAAAAAAAA"
+        for order in ((unknown_nid, known_nid), (known_nid, unknown_nid)):
+            with self.subTest(order=order):
+                code, debt = stubgen.generate("libSceAmpr", order, {known_nid: known_name})
+                self.assertIn("int APS5_VABI sceAmprUnknown00(void)", code)
+                self.assertIn('APS5_EXPORT("AAAAAAAAAAA", sceAmprUnknown01);', code)
+                self.assertIn("int APS5_VABI sceAmprUnknown01(void)", code)
+                self.assertIn("[sceAmprUnknown00]", debt)
+                self.assertIn("[AAAAAAAAAAA]", debt)
+                self.assertNotIn(f'APS5_EXPORT("{known_nid}", sceAmprUnknown', code)
+
+    def test_generate_preserves_single_pass_iterable_inputs(self):
+        known = "6OkOa1SOKuY"
+        db = {known: "sceAmprUnknown00"}
+        for values in (("AAAAAAAAAAA", known), (known, "AAAAAAAAAAA")):
+            expected = stubgen.generate("libSceAmpr", values, db)
+            for label, factory in (("iterator", iter), ("generator", lambda items: (nid for nid in items))):
+                with self.subTest(values=values, input=label):
+                    self.assertEqual(stubgen.generate("libSceAmpr", factory(values), db), expected)
 
     def test_prx_suffix_is_stripped_from_module_name(self):
         nids = ["AAAAAAAAAAA", "BBBBBBBBBBB"]
