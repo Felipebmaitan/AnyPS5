@@ -573,8 +573,11 @@ if(BUILD_TESTING)
         if((MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64")
             add_test_executable(guest_gs_runner relinker/tests/GuestGsRunner.cpp)
             target_include_directories(guest_gs_runner PRIVATE ../libs)
+            add_test_executable(guest_gs_vector_runner relinker/tests/GuestGsVectorRunner.cpp)
+            target_include_directories(guest_gs_vector_runner PRIVATE ../libs)
             if(WIN32)
                 target_sources(guest_gs_runner PRIVATE ../libs/prx/libc/src/specifics/windows/GuestGs.cpp)
+                target_sources(guest_gs_vector_runner PRIVATE ../libs/prx/libc/src/specifics/windows/GuestGs.cpp)
             endif()
         endif()
         if(TARGET guest_gs_runner AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
@@ -586,6 +589,12 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs.py
                 $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_runner> ${guestGsMode})
             set_tests_properties(windows_guest_gs PROPERTIES TIMEOUT 30)
+            foreach(group IN ITEMS packed scalar lanes address faults fallback)
+                add_test(NAME windows_guest_gs_sse_${group} COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs_sse.py
+                    $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_vector_runner> ${group} ${guestGsMode})
+                set_tests_properties(windows_guest_gs_sse_${group} PROPERTIES TIMEOUT 30)
+            endforeach()
         endif()
         if(MINGW AND TARGET libc)
             add_library(guest_gs_state_only_runtime SHARED ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/GuestGsStateOnlyRuntime.cpp)
@@ -597,6 +606,18 @@ if(BUILD_TESTING)
             target_compile_definitions(guest_gs_runtime_runner PRIVATE GUEST_GS_RUNTIME)
             target_link_libraries(guest_gs_runtime_runner PRIVATE libc)
             configure_windows_unwind(guest_gs_runtime_runner)
+            add_test_executable(guest_gs_vector_runtime_runner ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/GuestGsVectorRunner.cpp)
+            target_include_directories(guest_gs_vector_runtime_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+            target_compile_definitions(guest_gs_vector_runtime_runner PRIVATE GUEST_GS_RUNTIME)
+            target_link_libraries(guest_gs_vector_runtime_runner PRIVATE libc)
+            configure_windows_unwind(guest_gs_vector_runtime_runner)
+            foreach(group IN ITEMS packed scalar lanes address faults fallback)
+                add_test(NAME windows_guest_gs_sse_runtime_${group} COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs_sse.py
+                    $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_vector_runtime_runner> ${group})
+                set_tests_properties(windows_guest_gs_sse_runtime_${group} PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endforeach()
             add_test(NAME windows_guest_gs_runtime COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_guest_gs.py
                 $<TARGET_FILE:relinker> $<TARGET_FILE:guest_gs_runtime_runner> --runtime)

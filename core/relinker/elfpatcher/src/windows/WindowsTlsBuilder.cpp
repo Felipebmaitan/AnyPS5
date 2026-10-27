@@ -71,9 +71,9 @@ std::optional<MovedInstruction> moveGsFollower(const std::uint8_t* bytes, const 
     if (encoded == 0xc4 || encoded == 0xc5 || encoded == 0x62 || encoded == 0x8f) return std::nullopt;
     for (std::size_t index = 0; index < info.OpcodeOffset; ++index) {
         const auto prefix = bytes[index];
-        if (prefix != 0x66 && prefix != 0x67 && !(prefix == 0xf0 && info.HasMemoryOperand) && !(prefix >= 0x40 && prefix <= 0x4f && index + 1 == info.OpcodeOffset)) return std::nullopt;
+        if (prefix != 0x66 && prefix != 0x67 && !((prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3) && info.HasMemoryOperand) && !(prefix >= 0x40 && prefix <= 0x4f && index + 1 == info.OpcodeOffset)) return std::nullopt;
     }
-    if (!branch && (!scalar || info.FlowKind != Codegen::ControlFlowKind::Sequential || (info.HasBranchTarget && !info.HasRipRelativeDisp))) return std::nullopt;
+    if (!branch && ((!scalar && !info.HasMemoryOperand) || info.FlowKind != Codegen::ControlFlowKind::Sequential || (info.HasBranchTarget && !info.HasRipRelativeDisp))) return std::nullopt;
     if (!info.HasMemoryOperand && !info.IsTwoByteOpcode && (opcode == 0xf6 || opcode == 0xf7) && info.ModRmRegField >= 6) return std::nullopt;
     MovedInstruction moved{rva, {bytes, bytes + info.Length}, info.HasRipRelativeDisp ? std::optional<std::size_t>(info.RipRelativeDispOffset) : std::nullopt, std::nullopt, 0, info.Length};
     if (branch) {

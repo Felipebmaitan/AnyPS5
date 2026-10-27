@@ -13,6 +13,20 @@ bool WindowsGuestGs::TryAppend(PeSection& section, const std::uint32_t rva, cons
         (encodedOpcode == 0x8f && info.OpcodeOffset + 1 < info.Length && (bytes[info.OpcodeOffset + 1] & 0x1f) >= 8)) return false;
     const auto opcode = info.Opcode;
     const auto group = info.ModRmRegField;
+    std::uint8_t mandatory = 0;
+    bool multipleMandatory = false;
+    for (std::size_t index = 0; index < info.OpcodeOffset; ++index) {
+        const auto prefix = bytes[index];
+        if (prefix != 0x66 && prefix != 0xf2 && prefix != 0xf3) continue;
+        multipleMandatory = multipleMandatory || mandatory != 0;
+        mandatory = prefix;
+    }
+    const bool vectorMove = info.IsTwoByteOpcode && !multipleMandatory &&
+        ((opcode == 0x10 || opcode == 0x11) ||
+         ((opcode == 0x28 || opcode == 0x29 || opcode == 0x12 || opcode == 0x13 || opcode == 0x16 || opcode == 0x17) && (mandatory == 0 || mandatory == 0x66)) ||
+         ((opcode == 0x6f || opcode == 0x7f) && (mandatory == 0x66 || mandatory == 0xf3)) ||
+         ((opcode == 0x6e || opcode == 0x7e || opcode == 0xd6) && mandatory == 0x66) ||
+         (opcode == 0x7e && mandatory == 0xf3));
     const bool moffs = !info.IsTwoByteOpcode && opcode >= 0xa0 && opcode <= 0xa3;
     const bool scalar = !info.IsTwoByteOpcode && ((opcode <= 0x3b && (opcode & 7) <= 3) ||
         (opcode >= 0x80 && opcode <= 0x8b && opcode != 0x82) || opcode == 0xc0 || opcode == 0xc1 ||
@@ -21,23 +35,23 @@ bool WindowsGuestGs::TryAppend(PeSection& section, const std::uint32_t rva, cons
     const bool extended = info.IsTwoByteOpcode && ((opcode >= 0x40 && opcode <= 0x4f) ||
         (opcode >= 0x90 && opcode <= 0x9f) || opcode == 0xaf || opcode == 0xb0 || opcode == 0xb1 ||
         opcode == 0xb6 || opcode == 0xb7 || opcode == 0xbe || opcode == 0xbf || opcode == 0xc0 || opcode == 0xc1);
-    if ((!moffs && (!info.HasModRm || (info.ModRmByte >> 6) == 3 || (!scalar && !extended))) || info.Length > 15)
+    if ((!moffs && (!info.HasModRm || (info.ModRmByte >> 6) == 3 || (!scalar && !extended && !vectorMove))) || info.Length > 15)
         return false;
     std::vector<std::uint8_t> replay;
     for (std::size_t index = 0; index < info.OpcodeOffset; ++index) {
         const auto prefix = bytes[index];
         if (prefix == 0x65 || prefix == 0x67) continue;
-        if (prefix == 0x66 || prefix == 0xf0) replay.push_back(prefix);
+        if (prefix == 0x66 || (prefix == 0xf0 && !vectorMove) || (vectorMove && (prefix == 0xf2 || prefix == 0xf3))) replay.push_back(prefix);
         else if (prefix >= 0x40 && prefix <= 0x4f && index + 1 == info.OpcodeOffset)
             replay.push_back(static_cast<std::uint8_t>(prefix & ~(moffs ? 7 : 3)));
         else return false;
     }
-    const bool explicitRegister = !moffs && (extended || (opcode <= 0x3b && (opcode & 7) <= 3) || (opcode >= 0x84 && opcode <= 0x8b));
+    const bool explicitRegister = !moffs && !vectorMove && (extended || (opcode <= 0x3b && (opcode & 7) <= 3) || (opcode >= 0x84 && opcode <= 0x8b));
     const bool byteRegister = info.IsTwoByteOpcode ? opcode == 0xb0 || opcode == 0xc0 :
         (opcode <= 0x3b && (opcode & 1) == 0) || opcode == 0x84 || opcode == 0x86 || opcode == 0x88 || opcode == 0x8a;
     if (explicitRegister && group == 4 && (info.RexPrefix & 4) == 0 && (!byteRegister || info.RexPrefix != 0) && !(info.IsTwoByteOpcode && opcode >= 0x90 && opcode <= 0x9f)) return false;
-    const auto reg = moffs ? 0 : static_cast<unsigned>(group | ((info.RexPrefix & 4) << 1));
-    const std::uint8_t scratch = reg == 3 || (info.RexPrefix == 0 && group == 7) ? 6 : 3;
+    const auto reg = moffs || vectorMove ? 0 : static_cast<unsigned>(group | ((info.RexPrefix & 4) << 1));
+    const std::uint8_t scratch = reg == 3 || (!vectorMove && info.RexPrefix == 0 && group == 7) ? 6 : 3;
     std::uint8_t base = 0xff;
     std::uint8_t index = 0xff;
     std::uint8_t scale = 0;

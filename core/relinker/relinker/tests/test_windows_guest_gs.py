@@ -202,7 +202,7 @@ def main():
             assert pe_bytes_at(output.read_bytes(), 0x10212, len(instruction)) == patched[:-1], encoding
             run = subprocess.run([str(args.runner.resolve()), str(source if args.native else output), "0x210" if args.native else "0x10210"], capture_output=True, text=True, timeout=10)
             assert run.returncode == 0 and int(run.stdout.split()[0], 16) == INITIAL, (encoding, run)
-        for encoding in ("65 48 8b 00 c3", "65 8b 00 90 c3", "65 8b 00 e8 00 00 00 00", "65 8b 00 ff d0", "65 8b 00 f7 f1", "65 8b 00 0f 10 00", "65 8b 00 c5 f9 ef c0", "65 8b 00 62 f1 7c 48 58 c0", "65 8b 00 8f e8 78 c0 44 24 f0 01", "65 8b 00 c7 f8 03 00 00 00 c6 f8 01", "65 8b 00 66 c7 f8 03 00 c6 f8 01", "65 8b 00 c6 f8 01"):
+        for encoding in ("65 48 8b 00 c3", "65 8b 00 90 c3", "65 8b 00 e8 00 00 00 00", "65 8b 00 ff d0", "65 8b 00 f7 f1", "65 8b 00 c5 f9 ef c0", "65 8b 00 62 f1 7c 48 58 c0", "65 8b 00 8f e8 78 c0 44 24 f0 01", "65 8b 00 c7 f8 03 00 00 00 c6 f8 01", "65 8b 00 66 c7 f8 03 00 c6 f8 01", "65 8b 00 c6 f8 01"):
             body = bytes.fromhex(encoding)
             length = 4 if body[1] == 0x48 else 3
             source.write_bytes(fixture(body + b"\xc3"))

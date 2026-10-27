@@ -1,3 +1,4 @@
+#include "GuestGsTestImage.hpp"
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -15,12 +16,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
-
-template<typename TValue> TValue Read(const std::uint8_t* bytes) {
-    TValue value;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
 
 #ifdef _WIN32
 static std::uintptr_t faultSite;
@@ -54,28 +49,11 @@ int main(int argc, char** argv) {
     GuestGsInstallContinuation_nid_no_patch();
     AddVectoredExceptionHandler(1, Handle);
 #endif
-    const auto nt = Read<std::uint32_t>(bytes.data() + 0x3c);
-    const auto optional = nt + 24;
-    const auto size = Read<std::uint32_t>(bytes.data() + optional + 56);
-    image = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+#endif
+    image = GuestGsMapTestImage(bytes);
     if (!image) return 4;
-    std::memcpy(image, bytes.data(), Read<std::uint32_t>(bytes.data() + optional + 60));
-    const auto sections = optional + Read<std::uint16_t>(bytes.data() + nt + 20);
-    for (unsigned index = 0; index < Read<std::uint16_t>(bytes.data() + nt + 6); ++index) {
-        const auto* section = bytes.data() + sections + index * 40;
-        std::memcpy(image + Read<std::uint32_t>(section + 12), bytes.data() + Read<std::uint32_t>(section + 20), Read<std::uint32_t>(section + 16));
-    }
-#else
-    image = static_cast<std::uint8_t*>(mmap(nullptr, bytes.size(), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (image == MAP_FAILED) return 4;
-    std::memcpy(image, bytes.data(), bytes.size());
-#endif
-    std::uint64_t* storage;
-#ifdef _WIN32
-    storage = static_cast<std::uint64_t*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-    storage = static_cast<std::uint64_t*>(mmap(nullptr, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-#endif
+    auto* storage = reinterpret_cast<std::uint64_t*>(GuestGsAllocate(65536, false));
+    if (!storage) return 4;
     std::span<std::uint64_t> cells(storage, 8192);
     for (std::size_t index = 0; index < cells.size(); ++index) cells[index] = 0x1122334455667788ull;
     auto base = argc > 3 && std::strcmp(argv[3], "zero") == 0 ? 0 : reinterpret_cast<std::uintptr_t>(cells.data() + 4096);

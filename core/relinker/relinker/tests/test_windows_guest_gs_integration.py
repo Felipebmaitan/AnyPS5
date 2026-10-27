@@ -46,27 +46,32 @@ def guest_relocation(kind):
     return image
 
 
-def startup_image(gs, short=False):
+def startup_image(gs, short=False, sse=False):
     image = make_image()
     code = bytes.fromhex("48 8b 05 01 00 00 00 c3")
     if gs:
         code = b"\x65" + code
     if short:
         code = bytes.fromhex("48 8d 15 09 00 00 00 48 8d 52 01 65 48 8b 02 90 c3")
-    image[0x210:0x210 + len(code) + 8] = code + struct.pack("<Q", 42)
+    if sse:
+        code = bytes.fromhex("48 8d 15 0d 00 00 00 48 8d 52 01 65 0f 10 22 90 66 0f 7e e0 c3")
+    payload = struct.pack("<Q", 42) * (2 if sse else 1)
+    image[0x210:0x210 + len(code) + len(payload)] = code + payload
     struct.pack_into("<Q", image, 24, 0x210)
     struct.pack_into("<I", image, 176, 0)
     struct.pack_into("<qQ", image, 0x440, 0, 0)
     return image
 
 
-def guest_initializer(short=False):
+def guest_initializer(short=False, sse=False):
     image = module_with_symbol(True)
     code = bytes.fromhex("65 48 8b 05 01 00 00 00 c3") + struct.pack("<Q", 42)
     image[0x400:0x400 + len(code)] = code
-    if short:
+    if short or sse:
         image[0x400:0x407] = bytes.fromhex("8b 05 ea 13 00 00 c3")
         code = bytes.fromhex("48 8d 15 a9 13 00 00 b8 2a 00 00 00 65 89 02 90 90 c3")
+        if sse:
+            code = bytes.fromhex("48 8d 15 a9 13 00 00 b8 2a 00 00 00 66 44 0f 6e e0 65 f3 44 0f 11 22 c3")
         image[0x440:0x440 + len(code)] = code
     tags = []
     for offset in range(0x600, 0x700, 16):
@@ -74,7 +79,7 @@ def guest_initializer(short=False):
         if tag[0] == 0:
             break
         tags.append(tag)
-    tags += [(12, 0x1040 if short else 0x1000), (0, 0)]
+    tags += [(12, 0x1040 if short or sse else 0x1000), (0, 0)]
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", image, 0x600 + index * 16, *tag)
     struct.pack_into("<QQ", image, 176 + 32, len(tags) * 16, len(tags) * 16)
@@ -132,6 +137,8 @@ def main():
                 ("guest-initializer", main_fixture(), guest_initializer(), True),
                 ("short-gs", startup_image(True, short=True), None, True),
                 ("short-guest-initializer", executable("consumer.prx"), guest_initializer(short=True), True),
+                ("short-sse", startup_image(True, sse=True), None, True),
+                ("sse-guest-initializer", executable("consumer.prx"), guest_initializer(sse=True), True),
             ):
                 result, output = convert(image, f"startup-{label}", module)
                 assert result.returncode == 0, result
