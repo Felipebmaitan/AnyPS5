@@ -52,6 +52,7 @@ def cases():
     yield "short-follow-fault", "65 ff 02 48 8b 87 00 10 00 00", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL + 1, None
     yield "short-follow-fault-locked", "65 ff 02 f0 48 ff 87 00 10 00 00 48 8b 87 00 10 00 00", bytes.fromhex("31 d2 f9"), INITIAL + 1, INITIAL + 1, None
     yield "short-multiple-records", "65 8b 02 48 8b 07 65 48 8b 04 25 00 00 00 00", bytes.fromhex("31 d2 f9"), INITIAL, INITIAL, 0x45
+    yield "short-pruned-record", "65 48 8b 04 25 00 00 00 00 72 08 65 8b 02 b8 90 90 90 90 65 48 8b 04 25 00 00 00 00", b"", INITIAL, INITIAL, 0x45
     yield "short-mov-group-byte", "65 8b 02 c6 c1 2a 48 89 c8", bytes.fromhex("31 d2 f9"), 42, INITIAL, 0x45
     yield "short-mov-group-dword", "65 8b 02 c7 c1 2a 00 00 00 48 89 c8", bytes.fromhex("31 d2 f9"), 42, INITIAL, 0x45
     yield "load", "65 48 8b 04 25 00 00 00 00", b"", INITIAL, INITIAL, 0x45
@@ -125,9 +126,15 @@ def main():
                 body += struct.pack("<Q", result)
             source = work / (name + ".elf")
             output = source.with_suffix(".exe")
-            source.write_bytes(fixture(body))
+            entry = 0x210 + body.index(bytes.fromhex(encoding)) + 15 if name == "short-pruned-record" else None
+            source.write_bytes(fixture(body, extra_entry=entry))
             converted = subprocess.run([str(args.relinker.resolve()), "--skip-sce-module", "--windows", str(source), str(output)], capture_output=True, text=True, timeout=10)
             assert converted.returncode == 0, (name, converted.stderr)
+            if name == "short-pruned-record":
+                pe = output.read_bytes()
+                position = pe.index(b"APS5GGS1")
+                assert struct.unpack_from("<I", pe, position + 8)[0] == 2 and b"APS5GGM1" not in pe
+                assert pe_bytes_at(pe, entry - 4 + 0x10000, 8) == b"\x0f\x0b\x90" + bytes.fromhex("b8 90 90 90 90")
             mode = ["zero"] if name == "rip" else []
             if name.startswith("eip32-"):
                 resume = (0x210 if args.native else 0x10210) + body.index(bytes.fromhex(encoding)) + len(bytes.fromhex(encoding))
