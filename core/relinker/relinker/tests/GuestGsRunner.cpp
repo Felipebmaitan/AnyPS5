@@ -78,7 +78,9 @@ int main(int argc, char** argv) {
 #endif
     std::span<std::uint64_t> cells(storage, 8192);
     for (std::size_t index = 0; index < cells.size(); ++index) cells[index] = 0x1122334455667788ull;
-    const auto base = argc > 3 && std::strcmp(argv[3], "zero") == 0 ? 0 : reinterpret_cast<std::uintptr_t>(cells.data() + 4096);
+    auto base = argc > 3 && std::strcmp(argv[3], "zero") == 0 ? 0 : reinterpret_cast<std::uintptr_t>(cells.data() + 4096);
+    if (argc > 4 && std::strcmp(argv[3], "eip") == 0)
+        base -= static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(image) + std::stoull(argv[4], nullptr, 0));
 #ifdef _WIN32
     GuestGsSet_nid_no_patch(base);
 #else

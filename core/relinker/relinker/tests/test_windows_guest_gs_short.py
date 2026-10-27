@@ -7,6 +7,7 @@ import tempfile
 from test_windows_guest_gs_integration import executable_relocation, guest_relocation
 from test_windows_tls_protected_entries import make_image, pe_bytes_at
 from test_guest_intel_trampolines import main_fixture
+from test_guest_module_directories import module_with_symbol
 
 
 SHORT = bytes.fromhex("65 8b 02 b8 90 90 90 90 c3")
@@ -69,6 +70,19 @@ def main():
             struct.pack_into("<Q", image, 0x900, 0x1009)
             run, output = convert(main_fixture(), image)
             assert run.returncode == 2 and "Relocation overlaps a Windows guest GS instruction" in run.stderr and not output.exists(), (kind, run)
+        for tail in ("65 8b 04 25 00 00 00 00", "f3 48 0f ae d8 90 90 90", "65 0f 10 00 90 90 90 90"):
+            code = bytes.fromhex("65 8b 02 48 b8 " + tail + " c3")
+            image = make_image("relative")
+            image[0x210:0x210 + len(code)] = code
+            struct.pack_into("<q", image, 0x728, 0x215)
+            run, output = convert(image)
+            assert run.returncode == 2 and "Overlapping Windows guest GS instruction streams" in run.stderr and not output.exists(), (tail, run)
+            module = module_with_symbol(True)
+            module[0x400:0x400 + len(code)] = code
+            struct.pack_into("<Q", module, 0x668, 24)
+            struct.pack_into("<QQq", module, 0x900, 0x2320, 8, 0x1005)
+            run, output = convert(main_fixture(), module)
+            assert run.returncode == 2 and "Overlapping Windows guest GS instruction streams" in run.stderr and not output.exists(), (tail, run)
     print("Short guest GS entry and relocation safety passed")
 
 

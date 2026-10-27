@@ -9,8 +9,8 @@ import tempfile
 
 from test_guest_module_directories import module_with_symbol
 from test_guest_intel_trampolines import main_fixture
-from test_windows_tls_protected_entries import make_image
 from guest_import_fixtures import executable
+from test_windows_tls_protected_entries import make_image, pe_bytes_at
 
 
 GS = bytes.fromhex("65 48 a1 00 00 00 00 00 00 00 00 c3")
@@ -81,6 +81,15 @@ def guest_initializer(short=False):
     return image
 
 
+def skipped_gs_image():
+    image = make_image()
+    image[0x210:0x21a] = bytes.fromhex("eb 02 65 a4 b8 2a 00 00 00 c3")
+    struct.pack_into("<Q", image, 24, 0x210)
+    struct.pack_into("<I", image, 176, 0)
+    struct.pack_into("<q", image, 0x710, 0x212)
+    return image
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("relinker", type=Path)
@@ -118,6 +127,7 @@ def main():
             ctypes.windll.kernel32.SetErrorMode(3)
             for label, image, module, required in (
                 ("plain", startup_image(False), None, False),
+                ("skipped-gs", skipped_gs_image(), None, False),
                 ("gs", startup_image(True), None, True),
                 ("guest-initializer", main_fixture(), guest_initializer(), True),
                 ("short-gs", startup_image(True, short=True), None, True),
@@ -125,6 +135,8 @@ def main():
             ):
                 result, output = convert(image, f"startup-{label}", module)
                 assert result.returncode == 0, result
+                if label == "skipped-gs":
+                    assert pe_bytes_at(output.read_bytes(), 0x10212, 2) == b"\x0f\x0b"
                 missing = subprocess.run([str(output)], capture_output=True, text=True, timeout=10)
                 if required:
                     assert missing.returncode != 42 and "libc.prx" in missing.stderr, missing
