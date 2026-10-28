@@ -715,6 +715,29 @@ void TestResolveFailures() {
     std::remove(paths[0]);
 }
 
+void TestResolveForEachVariants() {
+    const char* paths[]{"ampr_foreach_existing.bin", "ampr_foreach_missing.bin"};
+    const char* names[]{"foreach_existing.bin", "foreach_missing.bin"};
+    { std::ofstream file(paths[0], std::ios::binary); file << "data"; }
+    std::uint32_t expected = 0;
+    std::uint32_t failed = 99;
+    Require(sceKernelAprResolveFilepathsToIds(paths, 1, &expected, &failed) == 0);
+    std::uint32_t ids[]{123, 123};
+    int results[]{123, 123};
+    Require(sceKernelAprResolveFilepathsToIdsForEach(paths, 2, ids, results) == 1);
+    Require(ids[0] == expected && ids[1] == 0xffffffffu && results[0] == 0 && results[1] == static_cast<int>(0x80020002));
+    ids[0] = ids[1] = 123;
+    results[0] = results[1] = 123;
+    Require(sceKernelAprResolveFilepathsWithPrefixToIdsForEach("ampr_", names, 2, ids, results) == 1);
+    Require(ids[0] == expected && ids[1] == 0xffffffffu && results[0] == 0 && results[1] == static_cast<int>(0x80020002));
+    std::uint64_t sizes[]{123, 123};
+    ids[0] = ids[1] = 123;
+    results[0] = results[1] = 123;
+    Require(sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach("ampr_", names, 2, ids, sizes, results) == 1);
+    Require(ids[0] == expected && ids[1] == 0xffffffffu && sizes[0] == 4 && sizes[1] == 0 && results[0] == 0 && results[1] == static_cast<int>(0x80020002));
+    std::remove(paths[0]);
+}
+
 void TestMalformedCommandSizes() {
     const auto requireFailure = [](const void* record, std::size_t recordBytes, std::uint32_t bufferBytes, const char* expected) {
         std::array<std::uint8_t, 16> memory{};
@@ -1351,6 +1374,26 @@ void TestAmmPrt() {
     Require(sceAmprAmmMeasureAmmCommandSizeAllocatePaForPrt(prt + 8, page, 0, cpuReadWrite) == ammRejected);
 }
 
+void TestWriteAddressCommand() {
+    Recorder recorder;
+    alignas(8) std::uint64_t target = 0;
+    const auto offset = recorder.Offset();
+    const auto commands = recorder.Commands();
+    Require(sceAmprCommandBufferWriteAddress_04_00(&recorder.buffer, &target, 0x1122334455667788ull, 0) == 0);
+    RequireAppended(recorder, offset, commands, Apr::Opcode::WriteAddress, sceAmprMeasureCommandSizeWriteAddress_04_00());
+    Apr::WriteAddressCommand command{};
+    std::memcpy(&command, recorder.memory.data() + offset, sizeof(command));
+    Require(command.address == reinterpret_cast<std::uint64_t>(&target) && command.value == 0x1122334455667788ull && command.flags == 0);
+    Require(sceAmprMeasureCommandSizeWriteAddress_04_00() == sizeof(Apr::WriteAddressCommand));
+    Require(sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00(0, 0, 0) == sizeof(Apr::WriteKernelEventQueueCommand));
+    Require(sceAmprCommandBufferGetType(&recorder.buffer) == static_cast<std::uint32_t>(Apr::BufferType::Apr));
+    Require(sceKernelAprSubmitCommandBuffer(&recorder.buffer, 0) == 0);
+    Require(target == 0x1122334455667788ull);
+    Apr::CommandBufferObject generic{};
+    Require(sceAmprCommandBufferConstructor(&generic) == 0);
+    Require(sceAmprCommandBufferGetType(&generic) == static_cast<std::uint32_t>(Apr::BufferType::Generic));
+}
+
 void TestKernelWriteCommands() {
     std::uint64_t start = 0;
     std::uint64_t end = 0;
@@ -1444,6 +1487,7 @@ int main() {
     TestFullBuffer();
     TestOffsetPastBuffer();
     TestSubmission();
+    TestWriteAddressCommand();
     TestKernelEventQueue();
     TestWaits();
     TestWaitSatisfiedAfterSubmission();
@@ -1460,6 +1504,7 @@ int main() {
     TestReadPastEndOfFileZeroFills();
     TestReadAtUnseekableOffsetThrows();
     TestResolveFailures();
+    TestResolveForEachVariants();
     TestMalformedCommandSizes();
     TestResolveSymbolicLink();
     TestGatherScatter();
