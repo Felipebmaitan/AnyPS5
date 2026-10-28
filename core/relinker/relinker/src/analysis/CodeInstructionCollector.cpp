@@ -482,7 +482,7 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
         }
     }
     std::size_t previousRoots = 0;
-    std::unordered_set<Domain::VirtualAddress> decodedInstructions;
+    std::vector<std::vector<bool>> decodedInstructions(codeHeaders.size());
     std::vector<std::unordered_set<Domain::VirtualAddress>> sectionReachable(codeHeaders.size());
     do {
         previousRoots = roots.size();
@@ -494,11 +494,15 @@ std::set<Domain::VirtualAddress> CodeInstructionCollector::Collect(const std::ve
             for (const auto root : roots) if (root >= header.MappedAddress && root - header.MappedAddress < header.FileSize) entries.push_back(root);
             if (entries.empty()) continue;
             const std::span<const std::uint8_t> text(bytes.data() + header.Offset, header.FileSize);
+            auto& decoded = decodedInstructions[i];
+            if (decoded.empty()) decoded.resize(header.FileSize);
             const auto graph = UnusedNidFilter::BuildControlFlowGraph(text, header.MappedAddress, entries.front(), entries, pointers, sceFunctions.empty(), sectionReachable[i], [&](std::uint64_t count) { report(6000 + 2500 * count / std::max<std::uint64_t>(scanBytes, 1)); }, inTable);
             for (const auto address : graph->ReachableVaddrs()) {
-                if (!decodedInstructions.insert(address).second) continue;
-                instructionList.push_back(address);
                 const auto offset = address - header.MappedAddress;
+                if (offset >= decoded.size()) throw Domain::RelinkerException("Code analysis: reachable address outside its section", address);
+                if (decoded[offset]) continue;
+                decoded[offset] = true;
+                instructionList.push_back(address);
                 const auto info = decoder.DecodeInstruction(text.data() + offset, text.size() - offset);
                 addAddressTakenRoot(address, text.data() + offset, info);
                 if (info.HasBranchTarget && !info.HasRipRelativeDisp) addRoot(address + info.Length + static_cast<std::uint64_t>(info.BranchDisp));
