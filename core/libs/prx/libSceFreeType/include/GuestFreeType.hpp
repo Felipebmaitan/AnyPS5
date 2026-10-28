@@ -115,15 +115,6 @@ struct GuestOutline {
     std::int32_t flags;
 };
 
-struct GuestOutlineFuncs {
-    int (APS5_VABI *move_to)(const GuestVector*, void*);
-    int (APS5_VABI *line_to)(const GuestVector*, void*);
-    int (APS5_VABI *conic_to)(const GuestVector*, const GuestVector*, void*);
-    int (APS5_VABI *cubic_to)(const GuestVector*, const GuestVector*, const GuestVector*, void*);
-    std::int32_t shift;
-    std::int64_t delta;
-};
-
 struct GuestGlyphRec {
     void* library;
     const void* clazz;
@@ -149,6 +140,15 @@ static_assert(offsetof(GuestGlyphRec, format) == 16 && offsetof(GuestGlyphRec, a
 static_assert(sizeof(GuestBitmapGlyphRec) == 88 && offsetof(GuestBitmapGlyphRec, root) == 0);
 static_assert(offsetof(GuestBitmapGlyphRec, left) == 40 && offsetof(GuestBitmapGlyphRec, top) == 44 && offsetof(GuestBitmapGlyphRec, bitmap) == 48);
 static_assert(sizeof(GuestOutlineGlyphRec) == 80 && offsetof(GuestOutlineGlyphRec, root) == 0 && offsetof(GuestOutlineGlyphRec, outline) == 40);
+
+struct GuestOutlineFuncs {
+    int (APS5_VABI *move_to)(const GuestVector*, void*);
+    int (APS5_VABI *line_to)(const GuestVector*, void*);
+    int (APS5_VABI *conic_to)(const GuestVector*, const GuestVector*, void*);
+    int (APS5_VABI *cubic_to)(const GuestVector*, const GuestVector*, const GuestVector*, void*);
+    std::int32_t shift;
+    std::int64_t delta;
+};
 
 struct GuestGlyphSlotRec {
     void* library;

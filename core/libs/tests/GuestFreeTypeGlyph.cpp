@@ -1,5 +1,5 @@
 #include "FreeTypeFontFixture.hpp"
-#include "prx/libSceFreeType/include/GuestFreeType.hpp"
+#include "prx/libSceFreeType/include/Api.hpp"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -17,18 +17,6 @@
 #include <type_traits>
 
 using namespace FreeType;
-
-extern "C" {
-int APS5_VABI FT_Init_FreeType_nid_postfix(void**);
-int APS5_VABI FT_Done_FreeType_nid_postfix(void*);
-int APS5_VABI FT_New_Memory_Face_nid_postfix(void*, const unsigned char*, std::int64_t, std::int64_t, GuestFaceRec**);
-int APS5_VABI FT_Done_Face_nid_postfix(GuestFaceRec*);
-int APS5_VABI FT_Set_Pixel_Sizes_nid_postfix(GuestFaceRec*, std::uint32_t, std::uint32_t);
-int APS5_VABI FT_Load_Glyph_nid_postfix(GuestFaceRec*, std::uint32_t, std::int32_t);
-int APS5_VABI FT_Get_Glyph_nid_postfix(GuestGlyphSlotRec*, GuestGlyphRec**);
-int APS5_VABI FT_Glyph_Copy_nid_postfix(GuestGlyphRec*, GuestGlyphRec**);
-void APS5_VABI FT_Done_Glyph_nid_postfix(GuestGlyphRec*);
-}
 
 static void Check(bool value, int line) {
     if (!value) {
@@ -75,7 +63,7 @@ static void Matches(const GuestGlyphRec* glyph, FT_Glyph native, void* library, 
 
 struct Fixture {
     std::vector<unsigned char> font = SquareGlyphFont('A', 700);
-    void* library = nullptr;
+    GuestLibrary* library = nullptr;
     GuestFaceRec* face = nullptr;
     FT_Library hostLibrary = nullptr;
     FT_Face host = nullptr;
