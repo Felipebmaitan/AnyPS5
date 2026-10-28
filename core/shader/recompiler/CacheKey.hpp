@@ -219,6 +219,7 @@ private:
         append(key, value.stencilRefExportEnable);
         append(key, value.stencilOperationValueExport);
         append(key, value.ditheredAlphaToCoverage);
+        append(key, value.ditheredAlphaSamples);
         append(key, value.quadPixelMask);
         append(key, value.quadSampleMask);
         append(key, value.iteratesSamples);
@@ -320,6 +321,7 @@ private:
         append(key, value.nonConstantImageOffsets);
         append(key, value.srgbDecodeFormats);
         append(key, value.narrowSubgroupClock);
+        append(key, value.fragmentBarycentricBuiltins);
         append(key, value.float64DenormPreserve);
         append(key, value.depthRangeRemap);
         append(key, value.registrationModules);
