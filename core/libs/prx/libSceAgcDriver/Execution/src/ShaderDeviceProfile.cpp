@@ -74,6 +74,7 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     const bool linearDerivatives = derivatives != nullptr && derivatives->computeDerivativeGroupLinear == VK_TRUE;
     checkFeature(spv::CapabilityComputeDerivativeGroupLinearKHR, linearDerivatives, "computeDerivativeGroupLinear");
     Require(!target.fragmentShaderBarycentricEnabled || barycentricEnabled, "shader device profile exposes disabled barycentrics");
+    Require(!target.fragmentBarycentricBuiltins || barycentricEnabled, "shader device profile exposes disabled barycentric built-ins");
     Require(!target.mesh || meshEnabled, "shader device profile exposes disabled mesh shaders");
     Require(!target.nonConstantImageOffsets || (maintenance8 != nullptr && maintenance8->maintenance8 == VK_TRUE), "shader device profile exposes disabled maintenance8");
     Require(!target.tessellation || core.tessellationShader == VK_TRUE, "shader device profile exposes disabled tessellation");

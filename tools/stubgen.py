@@ -118,32 +118,34 @@ def td_target(module, td_path, td_lib):
 
 
 def generate(module, nids, db, td_path=None, td_lib=None):
+    nids = tuple(nids)
     module = re.sub(r"\.prx$", "", module, flags=re.IGNORECASE)
     prefix = module_prefix(module)
     path, lib = td_target(module, td_path, td_lib)
+    known = {}
+    for nid in nids:
+        real = db.get(nid)
+        if real is not None and is_valid_ident(real) and compute_nid(real) == nid:
+            candidate = real + "_nid_postfix" if is_runtime_name(real) else real
+            known[nid] = (real, candidate)
+    reserved = {candidate for _, candidate in known.values()}
     used = set()
     unknown_counter = 0
     chunks = []
     td = []
     for nid in nids:
-        real = db.get(nid)
         func = None
         display = None
-        if real is not None:
-            if is_valid_ident(real):
-                if compute_nid(real) == nid:
-                    if is_runtime_name(real):
-                        candidate = real + "_nid_postfix"
-                    else:
-                        candidate = real
-                    if candidate not in used:
-                        func = candidate
-                        display = real
+        if nid in known:
+            real, candidate = known[nid]
+            if candidate not in used:
+                func = candidate
+                display = real
         if func is None:
             while True:
                 func = "%sUnknown%02d" % (prefix, unknown_counter)
                 unknown_counter += 1
-                if func not in used:
+                if func not in used and func not in reserved:
                     break
             display = None
         used.add(func)

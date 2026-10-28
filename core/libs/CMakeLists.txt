@@ -258,6 +258,8 @@ endif()
 
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
+include(prx/libSceLibreSsl/ProtocolSelection.cmake)
+
 if(BUILD_TESTING)
     add_test_executable(guest_posix_scalar_io_tests tests/GuestPosixScalarIo.cpp)
     target_include_directories(guest_posix_scalar_io_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -920,15 +922,8 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpCppWebApi>")
     endif()
 
-    add_test_executable(savedata_core_write_replacement_tests tests/SaveDataWriteReplacement.cpp)
-    target_include_directories(savedata_core_write_replacement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(savedata_core_write_replacement_tests PRIVATE libSceSaveData)
-    configure_windows_unwind(savedata_core_write_replacement_tests)
-    add_test(NAME savedata_core_write_replacement COMMAND savedata_core_write_replacement_tests)
-
     add_test_executable(savedata_native_write_replacement_tests tests/SaveDataWriteReplacement.cpp)
     target_include_directories(savedata_native_write_replacement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(savedata_native_write_replacement_tests PRIVATE SAVEDATA_NATIVE_BACKEND)
     target_link_libraries(savedata_native_write_replacement_tests PRIVATE libSceSaveData.native)
     configure_windows_unwind(savedata_native_write_replacement_tests)
     add_test(NAME savedata_native_write_replacement COMMAND savedata_native_write_replacement_tests)
@@ -960,13 +955,10 @@ if(BUILD_TESTING)
     endif()
 
     if(MINGW)
-        target_compile_options(savedata_core_write_replacement_tests PRIVATE -fasynchronous-unwind-tables)
         target_compile_options(savedata_native_write_replacement_tests PRIVATE -fasynchronous-unwind-tables)
         target_compile_options(savedata_replace_file_failure_tests PRIVATE -fasynchronous-unwind-tables)
     endif()
     if(WIN32)
-        set_tests_properties(savedata_core_write_replacement PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData>")
         set_tests_properties(savedata_native_write_replacement PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
     endif()
@@ -979,6 +971,17 @@ if(BUILD_TESTING)
     set_tests_properties(guest_kernel_sys_aio PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_kernel_sys_aio PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel_sys>")
+    endif()
+
+    add_test_executable(guest_kernel_sys_cpuset_tests tests/GuestKernelSysCpuset.cpp)
+    target_include_directories(guest_kernel_sys_cpuset_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_kernel_sys_cpuset_tests PRIVATE libkernel_sys libkernel libc)
+    configure_windows_unwind(guest_kernel_sys_cpuset_tests)
+    add_test(NAME guest_kernel_sys_cpuset COMMAND guest_kernel_sys_cpuset_tests)
+    set_tests_properties(guest_kernel_sys_cpuset PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_kernel_sys_cpuset PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel_sys>")
     endif()
 
@@ -1086,3 +1089,5 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceGnmDriverForNeoMode>")
     endif()
 endif()
+
+include(prx/libSceFreeType/CurveBounds.cmake)
