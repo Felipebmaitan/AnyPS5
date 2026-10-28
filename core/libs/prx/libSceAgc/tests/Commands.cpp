@@ -15,6 +15,9 @@
 #include "prx/libSceAgc/DcbFlow/include/Sync.hpp"
 #include "prx/libSceAgc/DcbFlow/include/Control.hpp"
 #include "prx/libSceAgc/DcbDraw/include/Instancing.hpp"
+#include "prx/libSceAgc/Acb/include/Dispatch.hpp"
+#include "prx/libSceAgc/Cb/include/Dispatch.hpp"
+#include "prx/libSceAgc/DcbFlow/include/Dispatch.hpp"
 #include "prx/libSceAgc/DcbDraw/include/IndexBuffer.hpp"
 #include "prx/libSceAgc/DcbDraw/include/DrawIndexed.hpp"
 #include "prx/libSceAgc/DcbDraw/include/DrawNonIndexed.hpp"
@@ -842,6 +845,32 @@ void testDefaultsTypes() {
     checkCompactTypes(sceAgcGetRegisterDefaults2Internal(0), 15, 0xf58fea31u, 0x00040400u, 0);
 }
 
+void testDispatchPackets() {
+    Storage graphics;
+    const auto* indirect = sceAgcDcbDispatchIndirect(&graphics.buffer, 0x40, 0x8);
+    check(indirect == graphics.words.data() && graphics.words[0] == 0xc0011600u && graphics.words[1] == 0x40u && graphics.words[2] == 0x49u, "graphics DISPATCH_INDIRECT packet mismatch");
+    Storage compute;
+    const auto* arguments = reinterpret_cast<const volatile void*>(0x123456789abcull);
+    sceAgcAcbDispatchIndirect(&compute.buffer, arguments, 0x2000u);
+    const std::array<std::uint32_t, 4> computeExpected{0xc0021600u, 0x56789abcu, 0x1234u, 0x2041u};
+    check(std::equal(computeExpected.begin(), computeExpected.end(), compute.words.begin()), "compute DISPATCH_INDIRECT packet mismatch");
+    Storage direct;
+    sceAgcCbDispatch(&direct.buffer, 7, 3, 1, 0x8000u);
+    const std::array<std::uint32_t, 5> directExpected{0xc0031500u, 7, 3, 1, 0x8041u};
+    check(std::equal(directExpected.begin(), directExpected.end(), direct.words.begin()), "DISPATCH_DIRECT packet mismatch");
+    Storage rejected;
+    rejected.words.fill(0xa5a5a5a5u);
+    const auto rejectedWords = rejected.words;
+    const auto* rejectedCursor = rejected.buffer.cursor_up;
+    expectFailure([&] { sceAgcCbDispatch(&rejected.buffer, 1, 1, 1, 0x100u); });
+    check(rejected.words == rejectedWords && rejected.buffer.cursor_up == rejectedCursor, "a refused packet changed the command buffer");
+    expectFailure([&] { sceAgcAcbDispatchIndirect(&rejected.buffer, reinterpret_cast<const volatile void*>(0x1002ull), 0); });
+    check(rejected.words == rejectedWords && rejected.buffer.cursor_up == rejectedCursor, "a refused packet changed the command buffer");
+    expectFailure([&] { sceAgcAcbDispatchIndirect(&rejected.buffer, nullptr, 0); });
+    check(rejected.words == rejectedWords && rejected.buffer.cursor_up == rejectedCursor, "a refused packet changed the command buffer");
+    check(sceAgcDcbDispatchIndirectGetSize() == 12 && sceAgcAcbDispatchIndirectGetSize() == 16 && sceAgcCbDispatchGetSize() == 20, "dispatch packet sizes");
+}
+
 void testEventWrite() {
     Storage storage;
     const auto* samplePacket = sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1000));
@@ -897,6 +926,7 @@ int main(int argc, char** argv) {
         testPackets();
         testEventWrite();
         testNop();
+        testDispatchPackets();
         testClearState();
         testIndexedIndirectDraws();
         testTagHeaders();
