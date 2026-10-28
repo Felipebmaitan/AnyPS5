@@ -2875,6 +2875,83 @@ void remappedImportTests(const Device& device) {
     HostImportFor(context, address, bytes);
 }
 
+bool windowedImportRefreshTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t window = 131072;
+    constexpr std::size_t unit = 65536;
+    if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit) {
+        std::cout << "skipped, windowed import refresh requires host imports aligned within 64 KiB; alignment=" << context.hostImportAlignment << '\n';
+        return false;
+    }
+    constexpr std::size_t bytes = 5 * window;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(unit, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the windowed import refresh block");
+    const auto first = (reinterpret_cast<std::uint64_t>(block) + window - 1) / window * window;
+    auto* a = reinterpret_cast<void*>(first);
+    auto* neighbour = reinterpret_cast<void*>(first + unit);
+    auto* b = reinterpret_cast<void*>(first + 2 * window);
+    auto* spare = reinterpret_cast<void*>(first + 3 * window);
+    std::vector<void*> registered;
+    SetHostImportWindow(window);
+    struct Cleanup {
+        const Context& context;
+        void* block;
+        std::vector<void*>& registered;
+        std::uint64_t first;
+        ~Cleanup() {
+            {
+                GuestAllocations::Mutation mutation;
+                for (auto* range : registered) mutation.Remove(range);
+            }
+            HostImportFor(context, first, unit);
+            SetHostImportWindow(0);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{context, block, registered, first};
+    const auto add = [&](void* range) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(range, unit, true, true, true);
+        registered.push_back(range);
+    };
+    const auto remove = [&](void* range) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(range);
+        std::erase(registered, range);
+    };
+    const auto serial = [&](void* range) { return HostImportSerial(context, reinterpret_cast<std::uint64_t>(range), unit, true); };
+    add(a);
+    add(b);
+    if (HostImportFor(context, first, unit) == nullptr || HostImportFor(context, reinterpret_cast<std::uint64_t>(b), unit) == nullptr) {
+        std::cout << "skipped, host import of the windowed import refresh ranges refused\n";
+        return false;
+    }
+    const auto firstA = serial(a);
+    const auto firstB = serial(b);
+    Require(firstA != 0 && firstB != 0 && firstA != firstB, "the windowed import refresh ranges were not imported apart");
+    add(spare);
+    Require(serial(a) == firstA && serial(b) == firstB, "a range added in another import window retired an import");
+    add(neighbour);
+    Require(serial(b) == firstB, "a range added in another import window retired an import");
+    Require(serial(a) == 0, "an import whose window gained a continuing range was kept");
+    Require(HostImportFor(context, first, unit) != nullptr, "the grown run was not imported again");
+    const auto secondA = serial(a);
+    Require(secondA != 0 && serial(neighbour) == secondA, "the grown run was not imported as one");
+    remove(b);
+    add(b);
+    Require(serial(a) == secondA, "a range mapped again in another import window retired an import");
+    Require(serial(b) == 0, "the import of a range mapped again was kept");
+    std::cout << "Windowed import refresh tests passed\n";
+    return true;
+}
+
 void hostImportRetirementTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t UnitBytes = 2 * 65536;
@@ -4266,8 +4343,10 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
             for (const auto& [key, before] : original.buffers) {
                 const auto after = actual.buffers.at(key);
-                const auto expected = key.first == (allocation == 0 ? 2u : 7u) ? draw->snapshots.front().buffer->Handle() : before.buffer;
-                Require(after.buffer == expected && after.offset == before.offset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                const bool replaced = key.first == (allocation == 0 ? 2u : 7u);
+                const auto expected = replaced ? draw->snapshots.front().buffer->Handle() : before.buffer;
+                const auto expectedOffset = replaced ? draw->snapshots.front().offset : before.offset;
+                Require(after.buffer == expected && after.offset == expectedOffset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
             }
             for (const auto& [key, before] : original.images) {
                 const auto after = actual.images.at(key);
@@ -11739,6 +11818,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--reimport-bench") return reimportBench(device);
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-cut-only") return hostImportCutTests(device);
 #endif
+        if (argc == 2 && std::string_view(argv[1]) == "--windowed-import-refresh-only") return windowedImportRefreshTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
             const auto alignment = device.GetContext().hostImportAlignment;
             if (alignment == 0 || alignment > 65536) {
