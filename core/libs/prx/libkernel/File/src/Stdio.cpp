@@ -953,7 +953,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
         const bool socket = GuestSockets::IsOpen(from);
         if (socket && from != to && to <= 2)
             throw std::runtime_error(std::string(__func__) + ": moving a guest socket onto standard descriptor " + std::to_string(to) + " is not supported");
-        if (!socket && from != to && IsKqueueDescriptor(from))
+        if (!socket && from != to && IsKqueueDescriptor_nid_no_patch(from))
             throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
         if (!socket && !DescriptorIsOpen_nid_no_patch(from)) return PosixFailure(GUEST_EBADF);
     }
@@ -1167,7 +1167,7 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     return ThreadCancel::Io([&]() -> std::int64_t {
         if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
         if (ExceedsTransferLimit(nbytes)) return PosixFailure(GUEST_EINVAL);
-        if (IsKqueueDescriptor(d)) return PosixFailure(GUEST_ESPIPE);
+        if (IsKqueueDescriptor_nid_no_patch(d)) return PosixFailure(GUEST_ESPIPE);
         return File::WithIoDescriptor(d, [&](int d) -> std::int64_t {
             if (const int error = PositionedArgumentError(d, false, buf == nullptr && nbytes != 0, offset)) return PosixFailure(error);
             if (FailPosixPositionedGuestSocket(d)) return -1;
@@ -1736,7 +1736,7 @@ int64_t APS5_VABI preadv_nid_postfix(int d, const KernelIovec* iov, int iovcnt, 
         if (File::IsDirectoryDescriptor(d)) return PosixFailure(GUEST_EISDIR);
         std::vector<KernelIovec> vectors;
         if (const int error = CopyIovecs(iov, iovcnt, vectors)) return PosixFailure(error & 0xffff);
-        if (IsKqueueDescriptor(d)) return PosixFailure(GUEST_ESPIPE);
+        if (IsKqueueDescriptor_nid_no_patch(d)) return PosixFailure(GUEST_ESPIPE);
         return File::WithIoDescriptor(d, [&](int d) -> std::int64_t {
             const auto result = sceKernelPreadv(d, vectors.data(), iovcnt, offset);
             return result < 0 ? PosixFailure(static_cast<int>(result) & 0xffff) : result;
