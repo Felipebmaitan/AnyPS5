@@ -426,6 +426,10 @@ static int SelectWithCopies(int nfds, void* readfds, void* writefds, void* excep
     return result;
 }
 
+int KernelSelect_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
+    return SelectWithCopies(nfds, readfds, writefds, exceptfds, timeout, true);
+}
+
 int KernelSelectLegacy_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
     return SelectWithCopies(nfds, readfds, writefds, exceptfds, timeout, false);
 }

@@ -69,8 +69,8 @@ void APS5_VABI JumpBufferSaveContext_nid_no_patch(unsigned char* buffer) {
     std::memcpy(buffer + ContextOffset, &context, sizeof(context));
 }
 
-void APS5_VABI GuestIoStackRestore_nid_no_patch(std::uintptr_t stack, std::uint32_t context) {
-    if (const auto restore = ioStackRestore.load()) restore(stack, context);
+void APS5_VABI GuestIoStackRestore_nid_no_patch(std::uintptr_t stack, std::uint32_t context, bool maskRestored) {
+    if (const auto restore = ioStackRestore.load()) restore(stack, context, maskRestored);
     else GuestContextSet_nid_no_patch(context);
 }
 
@@ -90,7 +90,7 @@ void APS5_VABI JumpBufferRestoreMask_nid_no_patch(const unsigned char* buffer) {
     if (saved != 0 && sigprocmask != nullptr) sigprocmask(SigSetmask, buffer + MaskOffset, nullptr);
     std::uint32_t context = 0;
     std::memcpy(&context, buffer + ContextOffset, sizeof(context));
-    GuestIoStackRestore_nid_no_patch(stack, context);
+    GuestIoStackRestore_nid_no_patch(stack, context, saved != 0 && sigprocmask != nullptr);
 }
 
 }

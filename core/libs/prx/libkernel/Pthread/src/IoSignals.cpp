@@ -28,6 +28,15 @@
 
 namespace ThreadCancel {
 
+struct IoCleanup::State {
+    State* previous;
+    std::uintptr_t stack;
+    std::uint32_t context;
+    Cleanup cleanup;
+    void* argument;
+    bool Abandoned(std::uintptr_t target, std::uint32_t targetContext) const { return context == targetContext && stack < target; }
+};
+
 struct IoRestart::State {
     struct Descriptor {
         int number;
@@ -105,6 +114,7 @@ struct SignalOwnership {
 SignalOwnership& Ownership() { return HostThreadLocal<SignalOwnership, SignalOwnership>(); }
 constinit thread_local IoRestart::State* restarts = nullptr;
 constinit thread_local unsigned depth = 0;
+constinit thread_local IoCleanup::State* cleanups = nullptr;
 
 class SignalManager {
 public:
@@ -206,6 +216,30 @@ SignalManager& Manager() {
     return *manager;
 }
 
+}
+
+IoCleanup::IoCleanup(Cleanup cleanup, void* argument) {
+    const SetupBlock blocked;
+    JumpBuffer::GuestIoJumpRegister_nid_no_patch(RetireIoStack);
+    state = new State{cleanups, reinterpret_cast<std::uintptr_t>(this), JumpBuffer::GuestContextCurrent_nid_no_patch(), cleanup, argument};
+    cleanups = state;
+}
+
+IoCleanup::~IoCleanup() noexcept(false) {
+    Cleanup cleanup = nullptr;
+    void* argument = nullptr;
+    {
+        const SetupBlock blocked;
+        auto** cursor = &cleanups;
+        while (*cursor && (*cursor != state || (*cursor)->stack != reinterpret_cast<std::uintptr_t>(this))) cursor = &(*cursor)->previous;
+        if (*cursor) {
+            cleanup = state->cleanup;
+            argument = state->argument;
+            *cursor = state->previous;
+            delete state;
+        }
+    }
+    if (cleanup) cleanup(argument, false);
 }
 
 IoRestart::IoRestart(bool allowed) {
@@ -355,7 +389,7 @@ bool TrackIoDescriptor(int descriptor) {
     return true;
 }
 
-void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
+void RetireIoStack(std::uintptr_t stack, std::uint32_t context, bool maskRestored) {
     std::uint64_t signals = 0;
     void (*callback)() = nullptr;
 #ifndef _WIN32
@@ -364,7 +398,7 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
     {
         const SetupBlock blocked;
         const bool exiting = stack == std::numeric_limits<std::uintptr_t>::max();
-        if (!current && !restarts) {
+        if (!current && !restarts && !cleanups) {
             if (!exiting) JumpBuffer::GuestContextSet_nid_no_patch(context);
             return;
         }
@@ -427,6 +461,22 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context) {
 #ifndef _WIN32
     if (mask) pthread_sigmask(SIG_SETMASK, &*mask, nullptr);
 #endif
+    for (;;) {
+        IoCleanup::Cleanup cleanup = nullptr;
+        void* argument = nullptr;
+        {
+            const SetupBlock blocked;
+            auto** cursor = &cleanups;
+            while (*cursor && stack != std::numeric_limits<std::uintptr_t>::max() && !(*cursor)->Abandoned(stack, context)) cursor = &(*cursor)->previous;
+            if (!*cursor) break;
+            auto* retired = *cursor;
+            *cursor = retired->previous;
+            cleanup = retired->cleanup;
+            argument = retired->argument;
+            delete retired;
+        }
+        cleanup(argument, maskRestored);
+    }
     for (int signal = 1; signal < 64; ++signal)
         if ((signals & (std::uint64_t{1} << signal)) != 0) std::raise(signal);
     if (callback) callback();

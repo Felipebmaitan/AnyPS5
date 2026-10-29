@@ -7,7 +7,7 @@
 namespace JumpBuffer {
 
 using Sigprocmask = int (APS5_VABI*)(int how, const void* set, void* previousSet);
-using StackRestore = void (*)(std::uintptr_t stack, std::uint32_t context);
+using StackRestore = void (*)(std::uintptr_t stack, std::uint32_t context, bool maskRestored);
 
 struct Context {
     std::uintptr_t stack;
@@ -29,7 +29,7 @@ std::uint32_t GuestContextIdentify_nid_no_patch(const Context& context, std::uin
 void APS5_VABI JumpBufferSaveContext_nid_no_patch(unsigned char* buffer);
 void APS5_VABI JumpBufferSaveMask_nid_no_patch(unsigned char* buffer);
 void APS5_VABI JumpBufferRestoreMask_nid_no_patch(const unsigned char* buffer);
-void APS5_VABI GuestIoStackRestore_nid_no_patch(std::uintptr_t stack, std::uint32_t context);
+void APS5_VABI GuestIoStackRestore_nid_no_patch(std::uintptr_t stack, std::uint32_t context, bool maskRestored);
 
 }
 

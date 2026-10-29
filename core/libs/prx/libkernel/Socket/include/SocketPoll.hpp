@@ -63,4 +63,5 @@ extern "C" void KernelSetSocketDuplicateHookForTest_nid_no_patch(void (*hook)())
 struct GuestPollDescriptor;
 extern "C" int KernelPollDescriptors_nid_no_patch(GuestPollDescriptor* descriptors, std::uint32_t count,
     std::optional<std::chrono::steady_clock::time_point> deadline, bool selected);
+extern "C" int KernelSelect_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout);
 extern "C" int KernelSelectLegacy_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout);

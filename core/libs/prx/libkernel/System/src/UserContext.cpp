@@ -249,7 +249,7 @@ enum class FpuSource { Context, Current, Initial };
     sigprocmask_nid_postfix(GuestSigSetmask, context->sigmask, nullptr);
     JumpBuffer::Context identity{};
     std::memcpy(&identity, machine.spare, sizeof(identity));
-    JumpBuffer::GuestIoStackRestore_nid_no_patch(machine.rsp, JumpBuffer::GuestContextIdentify_nid_no_patch(identity, machine.rsp));
+    JumpBuffer::GuestIoStackRestore_nid_no_patch(machine.rsp, JumpBuffer::GuestContextIdentify_nid_no_patch(identity, machine.rsp), true);
 
     Aps5ContextRestore_nid_no_patch(&frame);
 }

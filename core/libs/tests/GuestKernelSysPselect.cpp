@@ -9,6 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <source_location>
+#include <string>
+#include <stdexcept>
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
+#include "prx/libkernel/System/include/UserContext.hpp"
 
 namespace {
 
@@ -65,9 +70,115 @@ void RaiseBlocked(const SignalSet& blocked) {
     Require(raise_nid_postfix(SigUsr1) == 0 && caught == 0);
 }
 
+alignas(16) std::array<std::uint64_t, 12> jumpBuffer{};
+SignalSet expectedMask{};
+UserUcontext escapeContext{};
+bool restoredContext = false;
+std::string escapeMode;
+int cleanupCount = 0;
+int destructorCount = 0;
+PthreadKey escapeKey = -1;
+
+void APS5_VABI Escape(int) {
+    if (escapeMode == "exception") throw std::runtime_error("pselect handler exception");
+    if (escapeMode == "exit") pthread_exit_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{9}));
+    if (escapeMode == "context") {
+        restoredContext = true;
+        setcontext_nid_postfix(&escapeContext);
+        Require(false);
+    }
+    if (escapeMode == "longjmp") longjmp_nid_postfix(jumpBuffer.data(), 1);
+    siglongjmp_nid_postfix(jumpBuffer.data(), 1);
 }
 
-int main() {
+void APS5_VABI EscapeCleanup(void*) {
+    Require(Same(CurrentMask(), expectedMask));
+    Require(cleanupCount++ == 0 && destructorCount == 0);
+}
+
+void APS5_VABI EscapeDestructor(void*) {
+    Require(Same(CurrentMask(), expectedMask));
+    Require(cleanupCount == 1 && destructorCount++ == 0);
+}
+
+void QueueEscape(const SignalSet& blocked) {
+    Require(sigprocmask_nid_postfix(SigSetmask, &blocked, nullptr) == 0);
+    Require(raise_nid_postfix(SigUsr1) == 0);
+}
+
+void InvokeEscape() {
+    const Timespec wait{0, 50000000};
+    const SignalSet empty{};
+    pselect_nid_postfix(0, nullptr, nullptr, nullptr, &wait, &empty);
+    Require(false);
+}
+
+void* APS5_VABI EscapeWorker(void*) {
+    Require(scePthreadSetspecific(escapeKey, &escapeKey) == 0);
+    CleanupHandler cleanup{};
+    __pthread_cleanup_push_imp_nid_postfix(EscapeCleanup, nullptr, &cleanup);
+    InvokeEscape();
+    return nullptr;
+}
+
+int EscapeTest(const std::string& mode) {
+    escapeMode = mode;
+    Require(signal_nid_postfix(SigUsr1, Escape) != reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1)));
+    SignalSet blocked{};
+    blocked.bits[0] = 1u << (SigUsr1 - 1);
+    if (mode == "exit") {
+        expectedMask = blocked;
+        QueueEscape(blocked);
+        Require(scePthreadKeyCreate(&escapeKey, reinterpret_cast<pthread_key_destructor_func_t>(EscapeDestructor)) == 0);
+        Pthread worker = nullptr;
+        Require(scePthreadCreate(&worker, nullptr, EscapeWorker, nullptr, "pselect-exit") == 0);
+        void* result = nullptr;
+        Require(scePthreadJoin(worker, &result) == 0 && result == reinterpret_cast<void*>(std::uintptr_t{9}));
+        Require(cleanupCount == 1 && destructorCount == 1 && Same(CurrentMask(), expectedMask));
+        Require(scePthreadKeyDelete(escapeKey) == 0);
+        return 0;
+    }
+    if (mode == "exception") {
+        QueueEscape(blocked);
+        bool caughtException = false;
+        try { InvokeEscape(); } catch (const std::runtime_error&) { caughtException = true; }
+        Require(caughtException && Same(CurrentMask(), blocked));
+        return 0;
+    }
+    SignalSet saved{};
+    saved.bits[0] = 1u << 31;
+    Require(sigprocmask_nid_postfix(SigSetmask, &saved, nullptr) == 0);
+    if (mode == "context") {
+        Require(getcontext_nid_postfix(&escapeContext) == 0);
+        if (!restoredContext) {
+            expectedMask = saved;
+            blocked.bits[0] |= saved.bits[0];
+            QueueEscape(blocked);
+            InvokeEscape();
+        }
+        Require(Same(CurrentMask(), expectedMask));
+        return 0;
+    }
+    const int returned = mode == "longjmp" ? setjmp_nid_postfix(jumpBuffer.data())
+        : sigsetjmp_nid_postfix(jumpBuffer.data(), mode == "saved" ? 1 : 0);
+    if (returned == 0) {
+        blocked.bits[0] |= saved.bits[0];
+        expectedMask = mode == "saved" || mode == "longjmp" ? saved : blocked;
+        QueueEscape(blocked);
+        InvokeEscape();
+    }
+    Require(returned == 1 && Same(CurrentMask(), expectedMask));
+    const Timespec zero{};
+    const SignalSet empty{};
+    Require(pselect_nid_postfix(0, nullptr, nullptr, nullptr, &zero, &empty) == 0);
+    Require(Same(CurrentMask(), expectedMask));
+    return 0;
+}
+
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2) return EscapeTest(argv[1]);
     int descriptors[2]{-1, -1};
     Require(pipe_nid_postfix(descriptors) == 0);
     const int reader = descriptors[0];
@@ -103,6 +214,9 @@ int main() {
     {
         const Timespec invalid{0, 1000000000};
         Require(pselect_nid_postfix(0, nullptr, nullptr, nullptr, &invalid, &blocked) == -1 && Error() == Einval);
+        Require(Same(CurrentMask(), before));
+        const Timespec negative{0, -1};
+        Require(pselect_nid_postfix(0, nullptr, nullptr, nullptr, &negative, &blocked) == -1 && Error() == Einval);
         Require(Same(CurrentMask(), before));
         const Timespec zero{0, 0};
         Require(pselect_nid_postfix(-1, nullptr, nullptr, nullptr, &zero, nullptr) == -1 && Error() == Einval);

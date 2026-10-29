@@ -77,8 +77,16 @@ struct State {
     std::atomic<long> nativeId{0};
 #endif
 };
-enum class WaitApi { Poll, Select, Legacy };
+enum class WaitApi { Poll, Select, Pselect, Legacy };
 static WaitApi waitApi = WaitApi::Poll;
+static GuestSignalSet initialMask{};
+static bool pselectMask = true;
+static void CheckMask() {
+    if (waitApi != WaitApi::Pselect) return;
+    GuestSignalSet current{};
+    Require(sigprocmask_nid_postfix(1, nullptr, &current) == 0, "query pselect cleanup mask");
+    Require(std::equal(std::begin(current.bits), std::end(current.bits), std::begin(initialMask.bits)), "pselect did not restore mask before cleanup");
+}
 static int Multiplex(State& state) {
     if (waitApi == WaitApi::Poll) return poll_nid_postfix(state.descriptors.data(), static_cast<std::uint32_t>(state.descriptors.size()), state.timeout);
     std::array<std::uint64_t, 16> read{}, write{}, except{};
@@ -92,7 +100,11 @@ static int Multiplex(State& state) {
         if (entry.events & 2) except[entry.descriptor / 64] |= bit;
     }
     const std::array<std::int64_t, 2> limit{state.timeout / 1000, (state.timeout % 1000) * 1000};
-    const int result = waitApi == WaitApi::Legacy ? sceSpSelect(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : limit.data())
+    const std::array<std::int64_t, 2> spec{state.timeout / 1000, (state.timeout % 1000) * 1000000};
+    GuestSignalSet mask{};
+    mask.bits[0] = 1u << 29;
+    const int result = waitApi == WaitApi::Pselect ? pselect_nid_postfix(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : spec.data(), pselectMask ? &mask : nullptr)
+        : waitApi == WaitApi::Legacy ? sceSpSelect(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : limit.data())
         : select_nid_postfix(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : limit.data());
     if (result >= 0) {
         for (auto& entry : state.descriptors) {
@@ -117,6 +129,7 @@ static void Hook(int stage) {
 }
 static void APS5_VABI Cleanup(void* opaque) {
     auto& state = *static_cast<State*>(opaque);
+    CheckMask();
     Require(state.cleanups.fetch_add(1) == 0, "cleanup repeated");
     Require(state.destructors.load() == 0, "TSD before cleanup");
 }
@@ -138,6 +151,7 @@ static void* APS5_VABI Poller(void* opaque) {
     if (state.pending) Require(Observe([&] { return state.release.load(); }), "release pending poll");
     if (state.jumpOnSignal && setjmp_nid_postfix(state.jump.data()) != 0) state.result = -3;
     else state.result = Multiplex(state);
+    CheckMask();
     state.error = *__error_nid_postfix();
     state.returned.store(true);
     if (waitApi == WaitApi::Legacy) scePthreadTestcancel();
@@ -945,7 +959,7 @@ static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "timeout" || scenario == "zero") Require(state.result == 0, "timeout result");
     if (scenario == "timeout") Require(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(100), "timeout returned early");
     if (race && result != GUEST_CANCELED) {
-        if (scenario == "close_cancel" && waitApi == WaitApi::Select) Require(state.result == -1 && state.error == 9, "select race lost retirement");
+        if (scenario == "close_cancel" && (waitApi == WaitApi::Select || waitApi == WaitApi::Pselect)) Require(state.result == -1 && state.error == 9, "select race lost retirement");
         else Require(state.result == 1 && state.descriptors.front().revents == (scenario == "race" ? 1 : 0x20), "race lost result");
     }
     if (result == GUEST_CANCELED && !state.disabled)
@@ -954,7 +968,7 @@ static void Run(const std::string& transport, const std::string& scenario) {
         if (waitApi == WaitApi::Poll) Require(state.result == 1 && state.descriptors.back().revents == 0x20, "invalid descriptor");
         else Require(state.result == -1 && state.error == 9 && state.descriptors.back().revents == -1, "select invalid descriptor");
     }
-    if (waitApi == WaitApi::Select && (scenario == "close" || scenario == "reuse"))
+    if ((waitApi == WaitApi::Select || waitApi == WaitApi::Pselect) && (scenario == "close" || scenario == "reuse"))
         Require((state.result == -1 && state.error == 9 && state.descriptors.front().revents == -1) ||
             (net && state.result == 1 && state.descriptors.front().revents == 1), "select retirement or borrowed shutdown");
     else if (scenario == "close" && net)
@@ -990,7 +1004,9 @@ static std::size_t Resources() {
 
 int main(int argc, char** argv) {
     Require(argc == 3 || argc == 4, "transport and scenario required");
-    if (argc == 4) waitApi = std::string(argv[3]) == "select" ? WaitApi::Select : WaitApi::Legacy;
+    if (argc == 4) waitApi = std::string(argv[3]) == "select" ? WaitApi::Select : (std::string(argv[3]) == "pselect" || std::string(argv[3]) == "pselect_nomask") ? WaitApi::Pselect : WaitApi::Legacy;
+    pselectMask = argc != 4 || std::string(argv[3]) != "pselect_nomask";
+    Require(sigprocmask_nid_postfix(1, nullptr, &initialMask) == 0, "initial mask");
     std::mutex mutex;
     std::condition_variable changed;
     bool finished = false;
