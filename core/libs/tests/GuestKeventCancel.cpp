@@ -2,10 +2,13 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/Api.hpp"
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -16,12 +19,15 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #elif defined(__linux__)
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -354,6 +360,59 @@ static void Run(const std::string& transport, const std::string& scenario) {
     Require(scePthreadKeyDelete(state.key) == 0, "delete key");
 }
 
+static void Capacity(const std::string& scenario) {
+    State state;
+    observed = &state;
+    state.queue = kqueue_nid_postfix();
+    Require(state.queue >= 0, "capacity queue");
+    KernelEvent warm{};
+    const KernelTimespec zero{};
+    Require(kevent_nid_postfix(state.queue, nullptr, 0, &warm, 1, &zero) == 0, "initialize shared I/O state");
+    if (scenario == "ready") { Add(state.queue, 41, EVFILT_USER, EV_ADD | EV_ONESHOT); Trigger(state.queue); }
+    state.pending = true;
+    if (scenario == "timeout") { state.infinite = false; state.timeout = {0, 20000000}; }
+    KernelSetKeventWaitHookForTest_nid_no_patch(Hook);
+    Require(scePthreadKeyCreate(&state.key, reinterpret_cast<pthread_key_destructor_func_t>(Destroy)) == 0, "capacity key");
+    Pthread thread = nullptr;
+    Require(scePthreadCreate(&thread, nullptr, Waiter, &state, "kevent-capacity") == 0, "capacity waiter");
+    Require(Observe([&] { return state.entered.load(); }), "capacity waiter initialized");
+    const auto wakers = GuestSocketWakerCreationsForTest_nid_no_patch();
+#ifdef __linux__
+    rlimit previous{};
+    Require(::getrlimit(RLIMIT_NOFILE, &previous) == 0, "descriptor limit");
+    auto limited = previous;
+    limited.rlim_cur = std::min<rlim_t>(previous.rlim_cur, 64);
+    Require(::setrlimit(RLIMIT_NOFILE, &limited) == 0, "bound descriptor limit");
+    std::vector<int> occupied;
+    for (;;) {
+        const int descriptor = ::open("/dev/null", O_RDONLY);
+        if (descriptor < 0) break;
+        occupied.push_back(descriptor);
+    }
+    Require(errno == EMFILE, "exhaust process descriptors");
+#endif
+    state.released.store(true);
+    if (scenario == "cancel") {
+        Require(Observe([&] { return state.waiting.load(); }), "capacity condition wait");
+        Require(pthread_cancel_nid_postfix(thread) == 0, "cancel under descriptor pressure");
+    }
+    const bool prompt = Observe([&] { return thread->_finished.load(); });
+#ifdef __linux__
+    for (const int descriptor : occupied) ::close(descriptor);
+    Require(::setrlimit(RLIMIT_NOFILE, &previous) == 0, "restore descriptor limit");
+#endif
+    if (!prompt) close_nid_postfix(state.queue);
+    Require(Observe([&] { return thread->_finished.load(); }), "capacity failure cleanup");
+    void* result = nullptr;
+    Require(scePthreadJoin(thread, &result) == 0 && prompt, "capacity waiter completed");
+    Require(result == (scenario == "cancel" ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "capacity cancellation result");
+    if (scenario != "cancel") Require(state.result == (scenario == "ready" ? 1 : 0), "capacity kevent result");
+    Require(GuestSocketWakerCreationsForTest_nid_no_patch() == wakers, "condition-only kevent created a native wake socket");
+    Require(state.cleanups.load() == 1 && state.destructors.load() == 1, "capacity cleanup and TSD");
+    KernelSetKeventWaitHookForTest_nid_no_patch(nullptr);
+    Require(close_nid_postfix(state.queue) == 0 && scePthreadKeyDelete(state.key) == 0, "capacity resources");
+}
+
 static std::size_t Resources() {
 #ifdef _WIN32
     DWORD count = 0;
@@ -379,7 +438,10 @@ int main(int argc, char** argv) {
     if (resources) Run(argv[1], "cancel");
     const auto before = resources ? Resources() : 0;
     const int rounds = resources ? 16 : std::string(argv[2]) == "race" ? 8 : 1;
-    for (int i = 0; i < rounds; ++i) Run(argv[1], resources ? "cancel" : argv[2]);
+    for (int i = 0; i < rounds; ++i) {
+        if (std::string(argv[1]) == "capacity") Capacity(argv[2]);
+        else Run(argv[1], resources ? "cancel" : argv[2]);
+    }
     if (resources) Require(Resources() <= before + 2, "canceled kevent leaked resources");
     { std::lock_guard lock(mutex); done = true; }
     changed.notify_one(); watchdog.join();

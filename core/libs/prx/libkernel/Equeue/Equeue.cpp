@@ -487,18 +487,14 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 }
 
 int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint64_t deadline, bool interruptible) {
-    struct WakeState {
-        KernelEqueuePrivate* queue;
-        std::uintptr_t waker;
-    } wake{this, interruptible ? GuestSockets::CurrentWaker() : 0};
     std::optional<ThreadCancel::IoWait> cancellation;
     if (interruptible) {
         cancellation.emplace([](void* opaque) noexcept {
-            auto& state = *static_cast<WakeState*>(opaque);
-            GuestSockets::WakeIo(state.waker);
-            std::lock_guard lock(state.queue->m_mutex);
-            state.queue->m_cond.NotifyAll();
-        }, &wake);
+            auto& queue = *static_cast<KernelEqueuePrivate*>(opaque);
+            std::lock_guard lock(queue.m_mutex);
+            for (const auto waker : queue.m_pollers) GuestSockets::WakeIo(waker);
+            queue.m_cond.NotifyAll();
+        }, this);
     }
     std::unique_lock lock(m_mutex);
     if (m_closed) {
