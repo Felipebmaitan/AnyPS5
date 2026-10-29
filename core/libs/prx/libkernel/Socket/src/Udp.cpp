@@ -611,6 +611,11 @@ void GuestSockets::Wake(std::uintptr_t waker) {
         throw std::runtime_error("equeue waker: send failed, guest errno " + std::to_string(NativeError()));
 }
 
+void GuestSockets::WakeIo(std::uintptr_t waker) noexcept {
+    const char signal = 0;
+    ::send(static_cast<NativeSocket>(waker), &signal, 1, 0);
+}
+
 bool GuestSockets::WaitAny(const std::vector<Interest>& interests, std::uint64_t deadlineNanos) {
     const NativeSocket waker = ThreadWaker().value;
     std::vector<std::shared_ptr<Socket>> held;

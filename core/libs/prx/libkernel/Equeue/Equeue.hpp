@@ -99,7 +99,7 @@ public:
     TriggeredSnapshot SnapshotTriggered();
     std::vector<std::shared_ptr<KernelEqueuePrivate>> WatchedQueues();
     int WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
-    int WaitForEventsUntil(KernelEvent* ev, int num, std::uint64_t deadlineNanos);
+    int WaitForEventsUntil(KernelEvent* ev, int num, std::uint64_t deadlineNanos, bool interruptible = false);
     void RemoveDescriptorEvents(uintptr_t ident);
     void WakeReadWaiters(uintptr_t ident);
     void Close();
@@ -114,7 +114,7 @@ private:
     bool PollEvents();
     void MeasureFiles(std::unique_lock<std::mutex>& lock);
     void WakePollers();
-    void WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos);
+    void WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos, bool interruptible);
     void GatherInterests(WaitSet& wait, std::uintptr_t waker, bool nested);
     static void GatherWatched(WaitSet& wait, const std::shared_ptr<KernelEqueuePrivate>& queue, std::uintptr_t waker);
     static void ReleaseWatched(WaitSet& wait, std::uintptr_t waker);
@@ -137,6 +137,7 @@ void EqueueDescriptorClosed(int descriptor);
 void KqueueDescriptorClosed(int descriptor);
 void EqueueDescriptorReadShut(int descriptor);
 void KqueueDescriptorReadShut(int descriptor);
+extern "C" void KernelSetKeventWaitHookForTest_nid_no_patch(void (*hook)(int));
 extern "C" bool IsKqueueDescriptor_nid_no_patch(int descriptor);
 extern "C" void RegisterDescriptorCloseObserver_nid_no_patch(void (*observer)(int descriptor));
 std::optional<bool> KqueueReadable(int descriptor);

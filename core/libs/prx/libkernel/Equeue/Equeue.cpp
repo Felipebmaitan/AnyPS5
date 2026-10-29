@@ -1,10 +1,12 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "Equeue.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/IoDescriptors.hpp"
 #include "prx/libkernel/File/include/HostStreams.hpp"
 
 #include <algorithm>
@@ -13,6 +15,12 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+
+static std::atomic<void (*)(int)> keventWaitHook{nullptr};
+
+extern "C" void KernelSetKeventWaitHookForTest_nid_no_patch(void (*hook)(int)) {
+    keventWaitHook.store(hook);
+}
 
 static constexpr std::uint64_t FileRepollNs = 1000000;
 
@@ -151,6 +159,17 @@ bool KernelEqueuePrivate::PollEvents() {
     bool polled = false;
     for (auto& ev : m_events) {
         if (ev.enabled && ev.filter.pollFunc != nullptr) {
+            if (m_reportOncePerWait) { if (const auto hook = keventWaitHook.load()) hook(4); }
+            std::optional<GuestDescriptorAccess> admission;
+            if (m_reportOncePerWait && !ev.filter.watched && !ev.filter.repoll &&
+                (ev.event.filter == EVFILT_READ || ev.event.filter == EVFILT_WRITE)) {
+                admission.emplace(static_cast<int>(ev.event.ident), GuestDescriptorAccess::Mode::Read, std::defer_lock);
+                if (!admission->TryLock()) {
+                    ev.triggered = false;
+                    polled = true;
+                    continue;
+                }
+            }
             const bool was = ev.triggered;
             ev.triggered = ev.filter.pollFunc(&ev);
             if (!was && ev.triggered) ++m_activations;
@@ -236,8 +255,9 @@ void KernelEqueuePrivate::GatherWatched(WaitSet& wait, const std::shared_ptr<Ker
     if (queue->m_closed) {
         return;
     }
-    queue->m_pollers.push_back(waker);
     wait.queues.push_back(queue);
+    try { queue->m_pollers.push_back(waker); }
+    catch (...) { wait.queues.pop_back(); throw; }
     queue->GatherInterests(wait, waker, true);
 }
 
@@ -252,24 +272,31 @@ void KernelEqueuePrivate::ReleaseWatched(WaitSet& wait, std::uintptr_t waker) {
     wait.queues.clear();
 }
 
-void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos) {
-    const auto waker = GuestSockets::CurrentWaker();
+void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock, std::uint64_t deadlineNanos, bool interruptible) {
+    auto waker = GuestSockets::CurrentWaker();
     WaitSet wait;
+    struct Registration {
+        KernelEqueuePrivate& queue;
+        std::unique_lock<std::mutex>& lock;
+        WaitSet& wait;
+        std::uintptr_t waker;
+        bool active = false;
+        ~Registration() {
+            if (!lock.owns_lock()) lock.lock();
+            if (active) queue.m_pollers.erase(std::find(queue.m_pollers.begin(), queue.m_pollers.end(), waker));
+            ReleaseWatched(wait, waker);
+        }
+    } registration{*this, lock, wait, waker};
     GatherInterests(wait, waker, false);
     if (wait.repoll) {
         const std::uint64_t soon = TimedWait::NowNanos() + FileRepollNs;
-        if (deadlineNanos == 0 || deadlineNanos > soon) {
-            deadlineNanos = soon;
-        }
+        if (deadlineNanos == 0 || deadlineNanos > soon) deadlineNanos = soon;
     }
     m_pollers.push_back(waker);
+    registration.active = true;
     if (!wait.queues.empty()) {
         PollEvents();
-        if (std::any_of(m_events.begin(), m_events.end(), [](const KernelEqueueEvent& event) { return event.enabled && event.triggered; })) {
-            m_pollers.erase(std::find(m_pollers.begin(), m_pollers.end(), waker));
-            ReleaseWatched(wait, waker);
-            return;
-        }
+        if (std::any_of(m_events.begin(), m_events.end(), [](const KernelEqueueEvent& event) { return event.enabled && event.triggered; })) return;
         if (wait.nearestTimerNs != std::numeric_limits<uint64_t>::max()) {
             const uint64_t nowMonotonic = MonotonicNs();
             const uint64_t remainingNs = wait.nearestTimerNs > nowMonotonic ? wait.nearestTimerNs - nowMonotonic : 0;
@@ -277,20 +304,33 @@ void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock,
             deadlineNanos = deadlineNanos == 0 ? timerDeadline : std::min(deadlineNanos, timerDeadline);
         }
     }
+    std::unique_ptr<File::IoDescriptors> admitted;
+    if (interruptible) {
+        std::vector<int> descriptors;
+        for (const auto& interest : wait.interests) descriptors.push_back(interest.descriptor);
+        admitted = std::make_unique<File::IoDescriptors>(std::move(descriptors));
+    }
     lock.unlock();
-    bool waited = false;
-    try {
-        waited = GuestSockets::WaitAny(wait.interests, deadlineNanos);
-    } catch (...) {
-        ReleaseWatched(wait, waker);
-        throw;
+    bool waited = true;
+    const auto interrupt = [](void* opaque) noexcept { GuestSockets::WakeIo(*static_cast<const std::uintptr_t*>(opaque)); };
+    if (interruptible) { if (const auto hook = keventWaitHook.load()) hook(3); }
+    if (!admitted || (admitted->Acquire(interrupt, &waker) &&
+        std::all_of(wait.interests.begin(), wait.interests.end(), [&](const auto& interest) {
+            return admitted->Available(interest.descriptor) && !admitted->Retired(interest.descriptor);
+        }))) {
+        if (interruptible && !wait.interests.empty()) { if (const auto hook = keventWaitHook.load()) hook(1); }
+        if (!interruptible || !ThreadCancel::IoRequestInterrupted()) waited = GuestSockets::WaitAny(wait.interests, deadlineNanos);
+    } else if (admitted->Pending()) {
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        if (deadlineNanos != 0) {
+            const auto now = TimedWait::NowNanos();
+            deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(std::min<std::uint64_t>(deadlineNanos > now ? deadlineNanos - now : 0, 1000000));
+        }
+        admitted->Wait(deadline);
     }
-    ReleaseWatched(wait, waker);
+    admitted.reset();
     lock.lock();
-    m_pollers.erase(std::find(m_pollers.begin(), m_pollers.end(), waker));
-    if (!waited) {
-        m_cond.WaitUntil(lock, deadlineNanos);
-    }
+    if (!waited && (!interruptible || !ThreadCancel::IoInterrupted())) m_cond.WaitUntil(lock, deadlineNanos);
 }
 
 int KernelEqueuePrivate::CollectTriggered(KernelEvent* ev, int num) {
@@ -446,16 +486,31 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
     return WaitForEventsUntil(ev, num, micros == 0 ? 0 : TimedWait::DeadlineNanos(micros));
 }
 
-int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint64_t deadline) {
+int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint64_t deadline, bool interruptible) {
+    struct WakeState {
+        KernelEqueuePrivate* queue;
+        std::uintptr_t waker;
+    } wake{this, interruptible ? GuestSockets::CurrentWaker() : 0};
+    std::optional<ThreadCancel::IoWait> cancellation;
+    if (interruptible) {
+        cancellation.emplace([](void* opaque) noexcept {
+            auto& state = *static_cast<WakeState*>(opaque);
+            GuestSockets::WakeIo(state.waker);
+            std::lock_guard lock(state.queue->m_mutex);
+            state.queue->m_cond.NotifyAll();
+        }, &wake);
+    }
     std::unique_lock lock(m_mutex);
     if (m_closed) {
         return SCE_KERNEL_ERROR_EBADF;
     }
     for (;;) {
+        if (interruptible && ThreadCancel::IoInterrupted()) return SCE_KERNEL_ERROR_EINTR;
         MeasureFiles(lock);
         if (m_closed) {
             return SCE_KERNEL_ERROR_EBADF;
         }
+        if (interruptible && ThreadCancel::IoInterrupted()) return SCE_KERNEL_ERROR_EINTR;
         TriggerExpiredTimers(MonotonicNs());
         const bool polling = PollEvents();
         const int ret = CollectTriggered(ev, num);
@@ -465,12 +520,16 @@ int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint6
         if (m_closed) {
             return SCE_KERNEL_ERROR_EBADF;
         }
+        if (interruptible) {
+            if (const auto hook = keventWaitHook.load()) hook(0);
+            if (ThreadCancel::IoInterrupted()) return SCE_KERNEL_ERROR_EINTR;
+        }
         if (deadline == 0) {
             uint32_t timerWait = 0;
             const bool hasTimer = NextTimerWaitMicros(MonotonicNs(), &timerWait);
             const std::uint64_t wake = hasTimer ? TimedWait::NowNanos() + static_cast<std::uint64_t>(timerWait) * 1000ULL : 0;
             if (polling) {
-                WaitForDescriptors(lock, wake);
+                WaitForDescriptors(lock, wake, interruptible);
             } else if (hasTimer) {
                 m_cond.WaitUntil(lock, wake);
             } else {
@@ -481,12 +540,13 @@ int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint6
             const bool hasTimer = NextTimerWaitMicros(MonotonicNs(), &timerWait);
             const std::uint64_t now = TimedWait::NowNanos();
             if (now >= deadline) {
+                if (interruptible) { if (const auto hook = keventWaitHook.load()) hook(2); }
                 return 0;
             }
             const std::uint64_t timerDeadline = now + static_cast<std::uint64_t>(timerWait) * 1000ULL;
             const std::uint64_t wake = hasTimer ? std::min(deadline, timerDeadline) : deadline;
             if (polling) {
-                WaitForDescriptors(lock, wake);
+                WaitForDescriptors(lock, wake, interruptible);
             } else {
                 m_cond.WaitUntil(lock, wake);
             }

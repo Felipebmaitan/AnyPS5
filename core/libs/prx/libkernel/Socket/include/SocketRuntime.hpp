@@ -33,6 +33,7 @@ struct Interest {
 };
 std::uintptr_t CurrentWaker();
 void Wake(std::uintptr_t waker);
+void WakeIo(std::uintptr_t waker) noexcept;
 bool WaitAny(const std::vector<Interest>& interests, std::uint64_t deadlineNanos);
 bool PipeReadState(int descriptor, std::int64_t* data, bool* eof);
 bool PipeWriteState(int descriptor, std::int64_t* data, bool* eof, bool* writable);

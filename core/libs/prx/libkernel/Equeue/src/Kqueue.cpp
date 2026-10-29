@@ -12,6 +12,7 @@
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -506,7 +507,11 @@ int Register(const KernelEqueueRef& queue, int kqueueDescriptor, KernelEvent& ch
     if (change.filter != EVFILT_READ && change.filter != EVFILT_WRITE && change.filter != EVFILT_VNODE && change.filter != EVFILT_TIMER && change.filter != EVFILT_USER) {
         NotImplemented_nid_no_patch(("kevent: filter " + std::to_string(change.filter)).c_str());
     }
+    std::optional<File::IoDescriptor> admission;
     if (change.filter == EVFILT_READ || change.filter == EVFILT_WRITE || change.filter == EVFILT_VNODE) {
+        if (change.ident > static_cast<std::uintptr_t>(INT_MAX)) return GUEST_EBADF;
+        admission.emplace(static_cast<int>(change.ident));
+        if (admission->Value() < 0) return *__error_nid_postfix();
         if (const int error = DescriptorFilterError(kqueueDescriptor, change.ident)) {
             return error;
         }
@@ -620,7 +625,7 @@ int APS5_VABI kqueue_nid_postfix() {
     }
 }
 
-int APS5_VABI kevent_nid_postfix(int descriptor, const KernelEvent* changelist, int nchanges, KernelEvent* eventlist, int nevents, const KernelTimespec* timeout) {
+static int Kevent(int descriptor, const KernelEvent* changelist, int nchanges, KernelEvent* eventlist, int nevents, const KernelTimespec* timeout) {
     const auto queue = FindKqueue(descriptor);
     if (!queue) {
         return PosixFailure(GUEST_EBADF);
@@ -691,7 +696,7 @@ int APS5_VABI kevent_nid_postfix(int descriptor, const KernelEvent* changelist, 
         heap.reset(new KernelEvent[static_cast<std::size_t>(capacity)]);
         target = heap.get();
     }
-    const int count = poll ? queue->GetTriggeredEvents(target, capacity) : queue->WaitForEventsUntil(target, capacity, deadline.value_or(0));
+    const int count = poll ? queue->GetTriggeredEvents(target, capacity) : queue->WaitForEventsUntil(target, capacity, deadline.value_or(0), true);
     if (count < 0) {
         return PosixFailure(GuestErrno(count));
     }
@@ -699,6 +704,16 @@ int APS5_VABI kevent_nid_postfix(int descriptor, const KernelEvent* changelist, 
         return PosixFailure(GUEST_EFAULT);
     }
     return count;
+}
+
+int APS5_VABI kevent_nid_postfix(int descriptor, const KernelEvent* changelist, int nchanges, KernelEvent* eventlist, int nevents, const KernelTimespec* timeout) {
+    const auto call = [&] { return Kevent(descriptor, changelist, nchanges, eventlist, nevents, timeout); };
+    if (nevents == 0) return call();
+    if (nchanges == 0) return ThreadCancel::Io(call, false);
+    ThreadCancel::Check();
+    ThreadCancel::IoRestart restart(false);
+    ThreadCancel::IoPoint point(restart);
+    return call();
 }
 
 }
