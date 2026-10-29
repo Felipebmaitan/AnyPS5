@@ -32,7 +32,7 @@ public:
     }
     template <class TResult>
     TResult Complete(TResult result) const {
-        if (posix && result > 0 && _fd >= 0 && !SyncWrites(_fd)) return static_cast<TResult>(-1);
+        if (posix && result > 0 && _fd >= 0) SyncWrites(_fd);
         return result;
     }
 
