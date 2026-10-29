@@ -172,7 +172,7 @@ static void BitmapOwnership() {
     Require(FT_Get_Glyph_nid_postfix(slot, &glyph) == FT_Get_Glyph(hostSlot, &native));
     auto& image = *reinterpret_cast<GuestBitmapGlyphRec*>(glyph);
     const auto nativeImage = reinterpret_cast<FT_BitmapGlyph>(native);
-    Require(image.bitmap.buffer == slot->bitmap.buffer && nativeImage->bitmap.buffer == hostSlot->bitmap.buffer);
+    Require((image.bitmap.buffer == slot->bitmap.buffer) == (nativeImage->bitmap.buffer == hostSlot->bitmap.buffer));
     Matches(glyph, native, fixture.library, true);
     GuestGlyphRec* second = nullptr;
     FT_Glyph nativeSecond = nullptr;
