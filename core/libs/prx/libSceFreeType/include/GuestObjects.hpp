@@ -47,9 +47,9 @@ struct GuestFace {
 
 void RegisterBitmap_nid_no_patch(GuestFace& face);
 
-GuestFace* FaceOf(const GuestFaceRec* face);
-GuestFace* FaceOf(const GuestGlyphSlotRec* slot);
-void SyncFace(GuestFace& face);
+extern "C" GuestFace* FaceOf_nid_no_patch(const GuestFaceRec* face);
+extern "C" GuestFace* FaceOfSlot_nid_no_patch(const GuestGlyphSlotRec* slot);
+extern "C" void SyncFace_nid_no_patch(GuestFace& face);
 void SyncSize(GuestFace& face);
 void SyncSizePointer_nid_no_patch(GuestFace& face);
 void SyncSizeRecord_nid_no_patch(GuestFace& face, GuestSizeRec& rec, FT_Size host);

@@ -5,15 +5,15 @@
 
 namespace FreeType {
 
-GuestFace* FaceOf(const GuestFaceRec* face) {
+GuestFace* FaceOf_nid_no_patch(const GuestFaceRec* face) {
     return face ? static_cast<GuestFace*>(face->internal) : nullptr;
 }
 
-GuestFace* FaceOf(const GuestGlyphSlotRec* slot) {
+GuestFace* FaceOfSlot_nid_no_patch(const GuestGlyphSlotRec* slot) {
     return slot ? static_cast<GuestFace*>(slot->internal) : nullptr;
 }
 
-void SyncFace(GuestFace& face) {
+void SyncFace_nid_no_patch(GuestFace& face) {
     RegisterBitmap_nid_no_patch(face);
     const FT_Face host = face.host;
     auto& rec = face.rec;
