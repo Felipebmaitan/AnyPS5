@@ -388,14 +388,27 @@ static std::FILE* OpenDirectoryHandle(const std::filesystem::path& path, const s
 static FileStream* OpenDirectoryStream(const std::filesystem::path& path) {
     const auto release = [](void* pointer) { ::operator delete(pointer); };
     std::unique_ptr<void, decltype(release)> storage(::operator new(sizeof(FileStream)), release);
-    auto* native = OpenDirectoryHandle(path);
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> native(OpenDirectoryHandle(path), std::fclose);
     if (!native) return nullptr;
-    auto* stream = new (storage.get()) FileStream(native, true);
+    const GuestDescriptorAccess publication(::_fileno(native.get()), GuestDescriptorAccess::Mode::Publish);
+    auto* stream = new (storage.get()) FileStream(native.get(), true);
+    native.release();
     storage.release();
     stream->MarkDirectory();
     return stream;
 }
 #endif
+
+static void PublishReopenedStream(FileStream* stream) {
+    try {
+        const GuestDescriptorAccess publication(fileno_nid_postfix(stream), GuestDescriptorAccess::Mode::Publish);
+    } catch (...) {
+        if (!stream->IsHostStandard()) std::fclose(stream->GetHandle());
+        stream->Detach();
+        if (stream->IsDynamic()) delete stream;
+        throw;
+    }
+}
 
 FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream) {
     if (!stream || !mode) { errno = 22; return nullptr; }
@@ -422,10 +435,12 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
                 return nullptr;
             }
             stream->MarkDirectory();
+            PublishReopenedStream(stream);
             return stream;
         }
 #endif
         if (stream->Reopen(path, parsed->native.c_str(), OpenNative)) {
+            PublishReopenedStream(stream);
 #ifdef _WIN32
             if (parsed->append && !AppendOnlyDescriptor(_fileno(stream->GetHandle()))) {
                 const int error = errno;
@@ -464,6 +479,7 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
 #endif
         if (!device) return nullptr;
         auto stream = std::make_unique<FileStream>(device.get(), true);
+        const GuestDescriptorAccess publication(fileno_nid_postfix(stream.get()), GuestDescriptorAccess::Mode::Publish);
         device.release();
         stream->MarkRandomDevice();
         return stream.release();
@@ -486,6 +502,7 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     if (parsed->append) static_cast<void>(std::fseek(handle.get(), 0, SEEK_END));
     if (parsed->writes) RecordWrittenPath_nid_no_patch(fpath);
     auto stream = std::make_unique<FileStream>(handle.get(), true);
+    const GuestDescriptorAccess publication(fileno_nid_postfix(stream.get()), GuestDescriptorAccess::Mode::Publish);
     handle.release();
     return stream.release();
 }

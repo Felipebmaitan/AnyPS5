@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Equeue/include/EdgeWatch.hpp"
 #include "prx/libc/include/General.hpp"
@@ -603,11 +604,17 @@ int APS5_VABI kqueue_nid_postfix() {
         if (errno == ENFILE) return PosixFailure(GUEST_ENFILE);
         throw std::runtime_error(std::string(__func__) + ": reserving a descriptor failed, errno=" + std::to_string(errno));
     }
-    auto queue = std::make_shared<KernelEqueuePrivate>(static_cast<KernelEqueue>(descriptor), true);
-    queue->SetName("kqueue");
-    std::lock_guard lock(g_kqueueMutex);
-    g_kqueues[descriptor] = std::move(queue);
-    return descriptor;
+    try {
+        const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Publish);
+        auto queue = std::make_shared<KernelEqueuePrivate>(static_cast<KernelEqueue>(descriptor), true);
+        queue->SetName("kqueue");
+        std::lock_guard lock(g_kqueueMutex);
+        g_kqueues[descriptor] = std::move(queue);
+        return descriptor;
+    } catch (...) {
+        ReleaseDescriptor(descriptor);
+        throw;
+    }
 }
 
 int APS5_VABI kevent_nid_postfix(int descriptor, const KernelEvent* changelist, int nchanges, KernelEvent* eventlist, int nevents, const KernelTimespec* timeout) {

@@ -1060,15 +1060,38 @@ extern "C" int APS5_VABI shm_open_nid_postfix(const char* path, int flags, int m
         std::string copy;
         if (const int error = CopyGuestPath_nid_no_patch(path, copy)) return Fail(error);
         path = copy.c_str();
+        const int descriptor = OpenNamedFile(path, flags, mode);
+        if (descriptor >= 0) {
+            try {
+                const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Publish);
+            } catch (...) {
 #ifdef _WIN32
-        return OpenNamedFile(path, flags, mode);
+                File::ForgetSharedMemoryDescriptor_nid_no_patch(descriptor);
+                ::_close(descriptor);
 #else
-        return OpenNamedFile(path, flags, mode);
+                ::close(descriptor);
 #endif
+                throw;
+            }
+        }
+        return descriptor;
     }
     if (accessMode == SCE_KERNEL_O_RDONLY) return Fail(GuestInvalid);
     const int descriptor = CreateAnonymousFile();
-    if (descriptor >= 0) return descriptor;
+    if (descriptor >= 0) {
+        try {
+            const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Publish);
+            return descriptor;
+        } catch (...) {
+#ifdef _WIN32
+            File::ForgetSharedMemoryDescriptor_nid_no_patch(descriptor);
+            ::_close(descriptor);
+#else
+            ::close(descriptor);
+#endif
+            throw;
+        }
+    }
     const int error = errno;
     if (const int guest = GuestError(error)) return Fail(guest);
     throw std::runtime_error("shm_open: creating the host anonymous file failed, errno=" + std::to_string(error));

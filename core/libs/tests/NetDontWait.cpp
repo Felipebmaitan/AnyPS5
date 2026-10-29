@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <thread>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -135,6 +136,14 @@ void CheckReceive(std::string_view api) {
     for (int iteration = 0; iteration < 32; ++iteration) {
         const char byte = 'x';
         Require(sceNetSend(connection.sender, &byte, 1, 0) == 1, "send race payload");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        char pending = 0;
+        while (sceNetRecv(connection.receiver, &pending, 1, DontWait | 2) != 1) {
+            Require(*sceNetErrnoLoc() == 35, "peek race payload");
+            Require(std::chrono::steady_clock::now() < deadline, "observe race payload arrival");
+            std::this_thread::yield();
+        }
+        Require(pending == byte, "race payload changed before readers");
         std::barrier start(readers + 1);
         std::vector<std::future<std::pair<std::int64_t, int>>> receiving;
         for (int index = 0; index < readers; ++index)

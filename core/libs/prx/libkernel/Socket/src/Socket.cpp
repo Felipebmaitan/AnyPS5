@@ -38,6 +38,7 @@ struct GuestTimeval {
 };
 
 std::atomic<KernelSocketPoll::Poller> g_socketPoller{nullptr};
+std::atomic<KernelSocketPoll::Forgetter> g_socketForgetter{nullptr};
 std::atomic<KernelSocketPoll::Closer> g_socketCloser{nullptr};
 std::atomic<KernelSocketPoll::OptionSetter> g_socketOptionSetter{nullptr};
 std::atomic<KernelSocketPoll::OptionGetter> g_socketOptionGetter{nullptr};
@@ -152,6 +153,14 @@ int APS5_VABI inet_pton_nid_postfix(int af, const char* src, void* dst) {
 
 void KernelSetSocketPoller_nid_no_patch(KernelSocketPoll::Poller poller) {
     g_socketPoller.store(poller);
+}
+
+void KernelSetSocketForgetter_nid_no_patch(KernelSocketPoll::Forgetter forgetter) {
+    g_socketForgetter.store(forgetter);
+}
+
+void KernelForgetSocket_nid_no_patch(int descriptor) {
+    if (const auto forgetter = g_socketForgetter.load()) forgetter(descriptor);
 }
 
 void KernelSetSocketCloser_nid_no_patch(KernelSocketPoll::Closer closer) {

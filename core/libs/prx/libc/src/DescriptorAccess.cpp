@@ -7,7 +7,17 @@
 #include <vector>
 #include <chrono>
 
+namespace {
+std::atomic<void (*)(int)> publicationWaitHook{nullptr};
+}
+
+void DescriptorAccessSetPublicationWaitHookForTest_nid_no_patch(void (*hook)(int)) {
+    publicationWaitHook.store(hook);
+}
+
 struct GuestDescriptorAccess::State {
+    int descriptor;
+    explicit State(int descriptor) : descriptor(descriptor) {}
     std::mutex mutex;
     std::condition_variable changed;
     std::mutex wakeMutex;
@@ -51,7 +61,7 @@ std::shared_ptr<GuestDescriptorAccess::State> GuestDescriptorAccess::Get(int des
     std::lock_guard lock(mutex);
     std::erase_if(entries, [](const auto& entry) { return entry.second.expired(); });
     if (auto state = entries[descriptor].lock()) return state;
-    auto state = std::make_shared<State>();
+    auto state = std::make_shared<State>(descriptor);
     entries[descriptor] = state;
     return state;
 }
@@ -64,38 +74,41 @@ void DescriptorAccessInitialize_nid_no_patch(void* access, int descriptor) {
 void DescriptorAccessLock_nid_no_patch(void* access) {
     auto& self = *static_cast<GuestDescriptorAccess*>(access);
     if (!self.state) { self.held = true; return; }
+    const bool closing = self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Publish;
     std::unique_lock lock(self.state->mutex);
     if (self.mode == GuestDescriptorAccess::Mode::Read) {
         self.state->changed.wait(lock, [&] { return self.state->CanRead(); });
         ++self.state->readers;
     } else {
         ++self.state->changesWaiting;
-        if (self.mode == GuestDescriptorAccess::Mode::Close) ++self.state->closesWaiting;
+        if (closing) ++self.state->closesWaiting;
         if (self.mode == GuestDescriptorAccess::Mode::Replace) ++self.state->replacementsWaiting;
         try {
+            if (self.mode == GuestDescriptorAccess::Mode::Publish && !self.state->CanChange())
+                if (const auto hook = publicationWaitHook.load()) hook(self.state->descriptor);
             if (self.mode == GuestDescriptorAccess::Mode::Retire) {
                 self.state->changed.wait(lock, [&] {
                     return self.state->writer == std::thread::id{} || self.state->writer == std::this_thread::get_id();
                 });
-            } else if (self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Replace) {
+            } else if (closing || self.mode == GuestDescriptorAccess::Mode::Replace) {
                 while (!self.state->CanChange()) {
-                    self.state->Interrupt(self.mode == GuestDescriptorAccess::Mode::Close);
+                    self.state->Interrupt(closing);
                     self.state->changed.wait_for(lock, std::chrono::milliseconds(1));
                 }
             } else self.state->changed.wait(lock, [&] { return self.state->CanChange(); });
         } catch (...) {
             --self.state->changesWaiting;
-            if (self.mode == GuestDescriptorAccess::Mode::Close) --self.state->closesWaiting;
+            if (closing) --self.state->closesWaiting;
             if (self.mode == GuestDescriptorAccess::Mode::Replace) --self.state->replacementsWaiting;
             self.state->Notify();
             throw;
         }
         --self.state->changesWaiting;
-        if (self.mode == GuestDescriptorAccess::Mode::Close) --self.state->closesWaiting;
+        if (closing) --self.state->closesWaiting;
         if (self.mode == GuestDescriptorAccess::Mode::Replace) --self.state->replacementsWaiting;
         self.state->writer = std::this_thread::get_id();
         ++self.state->depth;
-        self.state->replacement = self.state->replacement || self.mode == GuestDescriptorAccess::Mode::Change || self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Replace;
+        self.state->replacement = self.state->replacement || self.mode == GuestDescriptorAccess::Mode::Change || closing || self.mode == GuestDescriptorAccess::Mode::Replace;
     }
     self.held = true;
 }
@@ -111,12 +124,13 @@ bool DescriptorAccessTryLock_nid_no_patch(void* access) {
         const bool canChange = self.mode == GuestDescriptorAccess::Mode::Retire ?
             self.state->writer == std::thread::id{} || self.state->writer == std::this_thread::get_id() : self.state->CanChange();
         if (!canChange) {
-            if (self.mode == GuestDescriptorAccess::Mode::Replace) self.state->Interrupt(false);
+            if (self.mode == GuestDescriptorAccess::Mode::Replace || self.mode == GuestDescriptorAccess::Mode::Publish)
+                self.state->Interrupt(self.mode == GuestDescriptorAccess::Mode::Publish);
             return false;
         }
         self.state->writer = std::this_thread::get_id();
         ++self.state->depth;
-        self.state->replacement = self.state->replacement || self.mode == GuestDescriptorAccess::Mode::Change || self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Replace;
+        self.state->replacement = self.state->replacement || self.mode == GuestDescriptorAccess::Mode::Change || (self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Publish) || self.mode == GuestDescriptorAccess::Mode::Replace;
     }
     self.held = true;
     return true;

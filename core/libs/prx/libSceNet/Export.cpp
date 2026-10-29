@@ -821,6 +821,28 @@ bool CloseSocketForKernel(int descriptor, int* error) {
     return true;
 }
 
+void ForgetSocketForKernel(int descriptor) {
+    std::shared_ptr<NativeSocketHandle> native;
+    {
+        std::lock_guard lk(g_mutex);
+        const auto found = g_socks.find(descriptor);
+        if (found == g_socks.end()) return;
+        native = std::move(found->second.native);
+        g_socks.erase(found);
+        for (auto& epoll : g_epoll_socks) epoll.second.erase(descriptor);
+    }
+    if (native) {
+#ifdef _WIN32
+        ::shutdown(native->value, SD_BOTH);
+#else
+        ::shutdown(native->value, SHUT_RDWR);
+#endif
+    }
+    g_cv.NotifyAll();
+}
+
+const bool g_socketForgetterRegistered = (KernelSetSocketForgetter_nid_no_patch(&ForgetSocketForKernel), true);
+
 const bool g_socketCloserRegistered = (KernelSetSocketCloser_nid_no_patch(&CloseSocketForKernel), true);
 
 bool SetSocketOptionForKernel(int descriptor, int level, int option, const void* value, std::uint32_t length, int* error) {
@@ -964,22 +986,27 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     }
     const int fd = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(handle->value));
     if (fd < 0) return fail(-fd);
-    GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Change, std::defer_lock);
-    if (!publication.TryLock()) {
-        if (const auto hook = socketCloseHook.load()) hook(fd, 3);
-        publication.Lock();
+    try {
+        GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Publish, std::defer_lock);
+        if (!publication.TryLock()) {
+            if (const auto hook = socketCloseHook.load()) hook(fd, 3);
+            publication.Lock();
+        }
+        std::lock_guard lk(g_mutex);
+        Sock s;
+        s.family = family;
+        s.type = type;
+        s.protocol = protocol;
+        if (protocol == 0 && type == NET_SOCK_STREAM) s.protocol = IPPROTO_TCP;
+        if (protocol == 0 && type == NET_SOCK_DGRAM) s.protocol = IPPROTO_UDP;
+        s.native = std::move(handle);
+        if (name != nullptr) s.name = std::string(name).substr(0, 31);
+        g_socks.emplace(fd, std::move(s));
+        return fd;
+    } catch (...) {
+        KernelDiscardSocketNumber_nid_no_patch(fd);
+        throw;
     }
-    std::lock_guard lk(g_mutex);
-    Sock s;
-    s.family = family;
-    s.type = type;
-    s.protocol = protocol;
-    if (protocol == 0 && type == NET_SOCK_STREAM) s.protocol = IPPROTO_TCP;
-    if (protocol == 0 && type == NET_SOCK_DGRAM) s.protocol = IPPROTO_UDP;
-    s.native = std::move(handle);
-    if (name != nullptr) s.name = std::string(name).substr(0, 31);
-    g_socks[fd] = s;
-    return fd;
 }
 
 void NetSetSocketCloseHookForTest_nid_no_patch(void (*hook)(int, int)) {
@@ -1125,10 +1152,15 @@ int APS5_VABI sceNetAccept(int s, void* addr, uint32_t* addrlen) {
 #endif
     const int descriptor = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(connection.native->value));
     if (descriptor < 0) return fail(-descriptor);
-    const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Change);
-    {
-        std::lock_guard lk(g_mutex);
-        g_socks.emplace(descriptor, connection);
+    try {
+        const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Publish);
+        {
+            std::lock_guard lk(g_mutex);
+            g_socks.emplace(descriptor, connection);
+        }
+    } catch (...) {
+        KernelDiscardSocketNumber_nid_no_patch(descriptor);
+        throw;
     }
     if (listener.native->nonblock) {
         const int enabled = 1;

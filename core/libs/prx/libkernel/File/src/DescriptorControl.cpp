@@ -609,6 +609,7 @@ int Ioctl(int fd, std::uint64_t request, void* argument) {
 }
 
 void RememberDescriptor(int fd, int openFlags) {
+    const GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Publish);
     std::lock_guard lock(g_mutex);
     g_entries[fd] = Entry{(openFlags & OpenCloseOnExec) != 0, std::make_shared<int>(openFlags & OpenStatusFlags)};
 #ifdef _WIN32
@@ -617,12 +618,14 @@ void RememberDescriptor(int fd, int openFlags) {
 }
 
 void RememberPipe(int fd) {
+    const GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Publish);
     RememberDescriptor(fd, 0);
     std::lock_guard lock(g_mutex);
     g_entries[fd].pipe = true;
 }
 
 void ShareDescriptor(int from, int to) {
+    const GuestDescriptorAccess publication(to, GuestDescriptorAccess::Mode::Publish);
     File::ShareArchivedFile(from, to);
     std::lock_guard lock(g_mutex);
     const auto& source = Materialize(from);

@@ -761,8 +761,20 @@ extern "C" int APS5_VABI pipe_nid_postfix(int* descriptors) {
     const int result = ::pipe(native);
 #endif
     if (result != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
-    File::RememberPipe(native[0]);
-    File::RememberPipe(native[1]);
+    try {
+        File::RememberPipe(native[0]);
+        File::RememberPipe(native[1]);
+    } catch (...) {
+        for (const int descriptor : native) {
+            File::ForgetClosedDescriptor(descriptor);
+#ifdef _WIN32
+            ::_close(descriptor);
+#else
+            ::close(descriptor);
+#endif
+        }
+        throw;
+    }
     std::memcpy(descriptors, native, sizeof(native));
     return 0;
 }
@@ -808,9 +820,15 @@ int File::DuplicateFrom(int fd, int start) {
 #else
     const int duplicate = ::fcntl(fd, F_DUPFD, start);
     if (duplicate < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
-    File::DuplicateDirectoryDescriptor(fd, duplicate);
-    if (File::IsRandomDevice(fd)) File::RememberRandomDevice(duplicate);
-    File::ShareDescriptor(fd, duplicate);
+    try {
+        File::DuplicateDirectoryDescriptor(fd, duplicate);
+        if (File::IsRandomDevice(fd)) File::RememberRandomDevice(duplicate);
+        File::ShareDescriptor(fd, duplicate);
+    } catch (...) {
+        File::ForgetClosedDescriptor(duplicate);
+        ::close(duplicate);
+        throw;
+    }
     return duplicate;
 #endif
 }
@@ -1035,10 +1053,20 @@ int APS5_VABI dup_nid_postfix(int d) {
     const int duplicate = ::dup(d);
 #endif
     if (duplicate < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
-    File::DuplicateDirectoryDescriptor(d, duplicate);
-    if (File::IsRandomDevice(d)) File::RememberRandomDevice(duplicate);
-    File::ShareDescriptor(d, duplicate);
-    DuplicateJitSharedMemory(d, duplicate);
+    try {
+        File::DuplicateDirectoryDescriptor(d, duplicate);
+        if (File::IsRandomDevice(d)) File::RememberRandomDevice(duplicate);
+        File::ShareDescriptor(d, duplicate);
+        DuplicateJitSharedMemory(d, duplicate);
+    } catch (...) {
+        File::ForgetClosedDescriptor(duplicate);
+#ifdef _WIN32
+        ::_close(duplicate);
+#else
+        ::close(duplicate);
+#endif
+        throw;
+    }
     return duplicate;
 }
 
@@ -1085,6 +1113,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (duplicated == -2) duplicated = WithoutParameterHandler([from, to] { return ::_dup2(from, to); });
     KeepStandardHandle_nid_no_patch(to, standard);
     if (duplicated != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    KernelForgetSocket_nid_no_patch(to);
     GuestSockets::Forget(to);
     File::ForgetDirectoryDescriptor(to);
     File::DuplicateDirectoryDescriptor(from, to);
@@ -1109,6 +1138,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     File::ForgetDirectoryDescriptor(to);
     File::DuplicateDirectoryDescriptor(from, to);
     EqueueDescriptorClosed(to);
+    KernelForgetSocket_nid_no_patch(to);
     GuestSockets::Forget(to);
     File::ForgetRandomDevice(to);
     if (sourceIsRandom) File::RememberRandomDevice(to);

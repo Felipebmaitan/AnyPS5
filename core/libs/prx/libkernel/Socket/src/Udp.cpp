@@ -424,8 +424,8 @@ int Install(std::shared_ptr<Socket> socket) {
     socket->transfer = TransferForNativeOwner;
     const int number = ReserveNumber(socket->value);
     if (number < 0) return -1;
-    const GuestDescriptorAccess publication(number, GuestDescriptorAccess::Mode::Change);
     try {
+        const GuestDescriptorAccess publication(number, GuestDescriptorAccess::Mode::Publish);
         std::lock_guard lock(socketsMutex);
         sockets.insert_or_assign(number, std::move(socket));
     } catch (const std::bad_alloc&) {
@@ -709,6 +709,10 @@ extern "C" int KernelReserveSocketNumber_nid_no_patch(std::uintptr_t native) {
     return number < 0 ? -*__error_nid_postfix() : number;
 }
 
+extern "C" void KernelDiscardSocketNumber_nid_no_patch(int number) {
+    ReleaseNumber(number);
+}
+
 extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number) {
     const GuestDescriptorAccess descriptorLock(number, GuestDescriptorAccess::Mode::Change);
     ReleaseNumber(number);
@@ -864,16 +868,17 @@ bool GuestSockets::PipeReady(int descriptor, short events, short& revents) {
 namespace {
 int DuplicateSocket_nid_no_patch(int descriptor, int minimum) {
     if (minimum < 0) return Fail(22);
-    std::lock_guard lock(socketsMutex);
-    const auto found = sockets.find(descriptor);
-    if (found == sockets.end()) return Fail(9);
+    const GuestDescriptorAccess source(descriptor, GuestDescriptorAccess::Mode::Read);
+    const auto socket = Find(descriptor);
+    if (!socket) return Fail(9);
     const int duplicate = CopyNumber(descriptor, minimum);
     if (duplicate < 0) return -1;
     try {
-        sockets.insert_or_assign(duplicate, found->second);
+        const GuestDescriptorAccess publication(duplicate, GuestDescriptorAccess::Mode::Publish);
+        std::lock_guard lock(socketsMutex);
+        sockets.insert_or_assign(duplicate, socket);
         closeOnExecDescriptors.erase(duplicate);
     } catch (const std::bad_alloc&) {
-        sockets.erase(duplicate);
         ReleaseNumber(duplicate);
         return Fail(12);
     }
@@ -906,6 +911,7 @@ int GuestSockets::DuplicateTo(int descriptor, int target) {
             }
         }
     }
+    KernelForgetSocket_nid_no_patch(target);
     if (replaced) EqueueDescriptorClosed(target);
     {
         std::lock_guard lock(socketsMutex);

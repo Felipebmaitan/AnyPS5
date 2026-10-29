@@ -217,6 +217,16 @@ static int SceIoErrorFromErrno(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
+static void RememberOpenedDescriptor(int descriptor, int flags) {
+    try {
+        File::RememberDescriptor(descriptor, flags);
+    } catch (...) {
+        File::ForgetClosedDescriptor(descriptor);
+        NativeClose(descriptor);
+        throw;
+    }
+}
+
 static int OpenNative(const std::filesystem::path& native, int flags, std::uint16_t mode) {
     if (AppArchiveHasDirectory_nid_no_patch(native)) {
         std::error_code error;
@@ -227,13 +237,13 @@ static int OpenNative(const std::filesystem::path& native, int flags, std::uint1
                 (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)) != 0) return SceErrorFromErrno(EISDIR);
             const int fd = File::OpenDirectoryDescriptor(native);
             if (fd < 0) return SceErrorFromErrno(errno);
-            File::RememberDescriptor(fd, flags);
+            RememberOpenedDescriptor(fd, flags);
             return fd;
         }
     }
     if (const auto archived = File::OpenArchivedFile(native, flags)) {
         if (*archived < 0) return SceErrorFromErrno(-*archived);
-        File::RememberDescriptor(*archived, flags);
+        RememberOpenedDescriptor(*archived, flags);
         return *archived;
     }
 #ifdef _WIN32
@@ -297,7 +307,7 @@ static int OpenNative(const std::filesystem::path& native, int flags, std::uint1
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
-    File::RememberDescriptor(fd, flags);
+    RememberOpenedDescriptor(fd, flags);
     return fd;
 }
 
@@ -353,7 +363,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY) throw std::runtime_error(std::string(__func__) + ": writing to " + path + " is not implemented");
         const int fd = File::OpenRandomDevice();
         if (fd < 0) return SceErrorFromErrno(errno);
-        File::RememberDescriptor(fd, flags);
+        RememberOpenedDescriptor(fd, flags);
         return fd;
     }
     std::filesystem::path native;

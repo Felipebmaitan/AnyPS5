@@ -17,6 +17,7 @@ struct Entry {
 };
 
 using Poller = int (*)(Entry* entries, int count, int timeoutMilliseconds);
+using Forgetter = void (*)(int descriptor);
 using Closer = bool (*)(int descriptor, int* error);
 using OptionSetter = bool (*)(int descriptor, int level, int option, const void* value, std::uint32_t length, int* error);
 using OptionGetter = bool (*)(int descriptor, int level, int option, void* value, std::uint32_t* length, int* error);
@@ -29,6 +30,9 @@ using NativeLookup = bool (*)(int descriptor, std::shared_ptr<void>* owner, std:
 }
 
 extern "C" void KernelSetSocketPoller_nid_no_patch(KernelSocketPoll::Poller poller);
+extern "C" void KernelSetSocketForgetter_nid_no_patch(KernelSocketPoll::Forgetter forgetter);
+extern "C" void KernelForgetSocket_nid_no_patch(int descriptor);
+extern "C" void KernelDiscardSocketNumber_nid_no_patch(int number);
 extern "C" void KernelSetSocketCloser_nid_no_patch(KernelSocketPoll::Closer closer);
 extern "C" bool KernelCloseSocket_nid_no_patch(int descriptor, int* error);
 extern "C" void KernelSetSocketOptionSetter_nid_no_patch(KernelSocketPoll::OptionSetter setter);

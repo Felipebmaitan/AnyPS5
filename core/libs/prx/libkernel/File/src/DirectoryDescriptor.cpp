@@ -1,3 +1,4 @@
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libc/include/GuestFileNumber.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -265,6 +266,7 @@ int OpenDirectoryDescriptor(const std::filesystem::path& path) {
     const int fd = OpenPlaceholder(path);
     if (fd < 0) return -1;
     try {
+        const GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Publish);
         std::lock_guard lock(g_mutex);
         g_directories[fd] = state;
         g_directoryCount.store(g_directories.size(), std::memory_order_relaxed);

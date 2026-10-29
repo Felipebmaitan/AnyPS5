@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 
@@ -195,23 +196,49 @@ int APS5_VABI sceKernelJitCreateSharedMemory(const char* name, std::size_t len, 
     int descriptor = -1;
     std::shared_ptr<JitObject> object;
     if (const int result = CreateBacking(len, &descriptor, &object)) return result;
-    std::lock_guard lock(g_jitLock);
-    g_jitDescriptors.insert_or_assign(descriptor, JitDescriptor{std::move(object), maxProt});
-    *fdOut = descriptor;
-    return 0;
+    try {
+        const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Publish);
+        std::lock_guard lock(g_jitLock);
+        g_jitDescriptors.insert_or_assign(descriptor, JitDescriptor{std::move(object), maxProt});
+        *fdOut = descriptor;
+        return 0;
+    } catch (...) {
+#ifdef _WIN32
+        ::_close(descriptor);
+#else
+        ::close(descriptor);
+#endif
+        throw;
+    }
 }
 
 int APS5_VABI sceKernelJitCreateAliasOfSharedMemory(int fd, int maxProt, int* fdOut) {
     if (fdOut == nullptr || (maxProt & ~CpuProtection) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    std::lock_guard lock(g_jitLock);
-    const auto source = g_jitDescriptors.find(fd);
-    if (source == g_jitDescriptors.end()) return SCE_KERNEL_ERROR_EBADF;
-    if ((Granted(maxProt) & ~Granted(source->second.maxProtection)) != 0) return SCE_KERNEL_ERROR_EACCES;
+    const GuestDescriptorAccess sourceAccess(fd, GuestDescriptorAccess::Mode::Read);
+    std::shared_ptr<JitObject> object;
+    {
+        std::lock_guard lock(g_jitLock);
+        const auto source = g_jitDescriptors.find(fd);
+        if (source == g_jitDescriptors.end()) return SCE_KERNEL_ERROR_EBADF;
+        if ((Granted(maxProt) & ~Granted(source->second.maxProtection)) != 0) return SCE_KERNEL_ERROR_EACCES;
+        object = source->second.object;
+    }
     const int alias = DuplicateDescriptor(fd);
     if (alias < 0) return HostFailure("duplicate JIT shared memory descriptor", errno);
-    g_jitDescriptors.insert_or_assign(alias, JitDescriptor{source->second.object, maxProt});
-    *fdOut = alias;
-    return 0;
+    try {
+        const GuestDescriptorAccess publication(alias, GuestDescriptorAccess::Mode::Publish);
+        std::lock_guard lock(g_jitLock);
+        g_jitDescriptors.insert_or_assign(alias, JitDescriptor{std::move(object), maxProt});
+        *fdOut = alias;
+        return 0;
+    } catch (...) {
+#ifdef _WIN32
+        ::_close(alias);
+#else
+        ::close(alias);
+#endif
+        throw;
+    }
 }
 
 int APS5_VABI sceKernelJitMapSharedMemory(int fd, int prot, void** startOut) {
