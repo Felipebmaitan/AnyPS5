@@ -173,6 +173,7 @@ struct PthreadPrivate {
     std::mutex cancelLock;
     ThreadCancel::IoWait* cancelIo = nullptr;
     TimedWait::Condition* cancelWait = nullptr;
+    bool cancelWaitExiting = false;
 
     explicit PthreadPrivate(const PthreadAttrPrivate* attr = nullptr);
     ~PthreadPrivate();
