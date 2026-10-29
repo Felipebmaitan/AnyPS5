@@ -2114,213 +2114,230 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
     numbers.reserve(count);
     for (std::uint32_t index = 0; index < count; ++index) numbers.push_back(descriptors[index].descriptor);
     File::IoDescriptors admitted(std::move(numbers));
-    const auto interrupted = [&] {
-        int invalid = 0;
-        for (std::uint32_t index = 0; index < count; ++index) {
-            auto& entry = descriptors[index];
-            entry.revents = admitted.Retired(entry.descriptor) ? GuestPollInvalid : 0;
-            if (entry.revents) ++invalid;
-        }
-        return invalid != 0 ? invalid : Fail(4);
-    };
-    const auto acquisition = admitted.Acquire(interrupt, &wakeSocket, deadline);
-    if (acquisition == File::IoDescriptors::Acquisition::Interrupted) return interrupted();
-    if (acquisition == File::IoDescriptors::Acquisition::TimedOut) {
-        for (std::uint32_t index = 0; index < count; ++index) descriptors[index].revents = 0;
-        return 0;
-    }
-    ThreadCancel::IoWait cancellation(interrupt, &wakeSocket);
-    if (const auto hook = pollWaitHook.load()) hook(0);
-    std::vector<std::shared_ptr<void>> held;
-    std::vector<NativePollDescriptor> native;
-    std::vector<std::uint32_t> owners;
-    std::vector<std::uint32_t> pipes;
-    std::vector<std::uint32_t> kqueues;
-    int ready = 0;
-    for (std::uint32_t i = 0; i < count; ++i) {
-        if (ThreadCancel::IoInterrupted()) return interrupted();
-        auto& entry = descriptors[i];
-        entry.revents = 0;
-        if (entry.descriptor < 0) continue;
-        if ((entry.events & ~GuestPollAccepted) != 0)
-            throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        std::shared_ptr<void> owner;
-        std::uintptr_t value = 0;
-        if (auto socket = Find(entry.descriptor)) {
-            value = static_cast<std::uintptr_t>(socket->value);
-            owner = std::move(socket);
-        } else if (!KernelFindSocketNative_nid_no_patch(entry.descriptor, &owner, &value)) {
-            if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
+    const auto attempt = [&]() -> std::optional<int> {
+        wakeSocket.store(Invalid);
+        if (!admitted.Acquire(interrupt, &wakeSocket)) return Fail(4);
+        const bool partial = admitted.Pending();
+        ThreadCancel::IoWait cancellation(interrupt, &wakeSocket);
+        if (const auto hook = pollWaitHook.load()) hook(0);
+        std::vector<std::shared_ptr<void>> held;
+        std::vector<NativePollDescriptor> native;
+        std::vector<std::uint32_t> owners;
+        std::vector<std::uint32_t> pipes;
+        std::vector<std::uint32_t> kqueues;
+        int ready = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            auto& entry = descriptors[i];
+            entry.revents = 0;
+            if (entry.descriptor < 0) continue;
+            if ((entry.events & ~GuestPollAccepted) != 0)
+                throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
+            if (admitted.Retired(entry.descriptor)) {
                 entry.revents = GuestPollInvalid;
                 ++ready;
                 continue;
             }
-            if (IsKqueueDescriptor_nid_no_patch(entry.descriptor)) {
-                kqueues.push_back(i);
+            if (!admitted.Available(entry.descriptor)) continue;
+            std::shared_ptr<void> owner;
+            std::uintptr_t value = 0;
+            if (auto socket = Find(entry.descriptor)) {
+                value = static_cast<std::uintptr_t>(socket->value);
+                owner = std::move(socket);
+            } else if (!KernelFindSocketNative_nid_no_patch(entry.descriptor, &owner, &value)) {
+                if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
+                    entry.revents = GuestPollInvalid;
+                    ++ready;
+                    continue;
+                }
+                if (IsKqueueDescriptor_nid_no_patch(entry.descriptor)) {
+                    kqueues.push_back(i);
+                    continue;
+                }
+                if (File::IsRandomDevice(entry.descriptor)) {
+                    const short readable = static_cast<short>(entry.events & GuestPollReadable);
+                    entry.revents = readable != 0 ? readable : entry.events;
+                    if (entry.revents) ++ready;
+                    continue;
+                }
+                if (File::IsVnode(entry.descriptor)) {
+                    entry.revents = static_cast<short>(entry.events & GuestPollVnodeReady);
+                    if (entry.revents) ++ready;
+                    continue;
+                }
+                if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+                if (entry.descriptor <= 2) {
+                    entry.revents = static_cast<short>(entry.descriptor == 0 ? 0 : entry.events & GuestPollWritable);
+                    if (entry.revents) ++ready;
+                    continue;
+                }
+    #ifdef _WIN32
+                short revents = 0;
+                if (!PipeReadiness(entry.descriptor, entry.events, revents))
+    #else
+                if (!IsPipe(entry.descriptor, entry.events))
+    #endif
+                    throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is neither a socket, a pipe, a file, a directory nor a kqueue");
+                pipes.push_back(i);
                 continue;
             }
-            if (File::IsRandomDevice(entry.descriptor)) {
-                const short readable = static_cast<short>(entry.events & GuestPollReadable);
-                entry.revents = readable != 0 ? readable : entry.events;
-                if (entry.revents) ++ready;
-                continue;
-            }
-            if (File::IsVnode(entry.descriptor)) {
-                entry.revents = static_cast<short>(entry.events & GuestPollVnodeReady);
-                if (entry.revents) ++ready;
-                continue;
-            }
-            if (ThreadCancel::IoInterrupted()) return interrupted();
-            if (entry.descriptor <= 2) {
-                entry.revents = static_cast<short>(entry.descriptor == 0 ? 0 : entry.events & GuestPollWritable);
-                if (entry.revents) ++ready;
-                continue;
-            }
-#ifdef _WIN32
-            short revents = 0;
-            if (!PipeReadiness(entry.descriptor, entry.events, revents))
-#else
-            if (!IsPipe(entry.descriptor, entry.events))
-#endif
-                throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is neither a socket, a pipe, a file, a directory nor a kqueue");
-            pipes.push_back(i);
-            continue;
+            NativePollDescriptor request{};
+            request.fd = static_cast<decltype(request.fd)>(value);
+            for (const auto& flag : RequestFlags)
+                if (entry.events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
+            native.push_back(request);
+            owners.push_back(i);
+            held.push_back(std::move(owner));
         }
-        NativePollDescriptor request{};
-        request.fd = static_cast<decltype(request.fd)>(value);
-        for (const auto& flag : RequestFlags)
-            if (entry.events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
-        native.push_back(request);
-        owners.push_back(i);
-        held.push_back(std::move(owner));
-    }
-#ifndef _WIN32
-    const std::size_t socketCount = native.size();
-    for (const auto index : pipes) {
-        NativePollDescriptor request{};
-        request.fd = descriptors[index].descriptor;
-        for (const auto& flag : RequestFlags)
-            if (descriptors[index].events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
-        native.push_back(request);
-        owners.push_back(index);
-    }
-#endif
-    const auto nativeCount = native.size();
-    const auto collect = [&](std::size_t i, bool pipe) {
-        auto& entry = descriptors[owners[i]];
-#if defined(_WIN32) || defined(__APPLE__)
-        if (!pipe) native[i].revents = ClosedStreamEvents(entry.descriptor, native[i].revents, native[i].events);
-#endif
-        short revents = native[i].revents;
-        if (!pipe && (entry.events & GuestPollPriority) && (revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) {
-            revents = static_cast<short>(revents | NativePollPriority | POLLRDBAND);
-        }
-        for (const auto& flag : RequestFlags)
-            if ((entry.events & flag.guest) && (revents & flag.native))
-                entry.revents = static_cast<short>(entry.revents | flag.guest);
-        for (const auto& flag : StatusFlags)
-            if (revents & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
-        if (pipe && (entry.revents & GuestPollError)) entry.revents = static_cast<short>((entry.revents & ~GuestPollError) | GuestPollHangUp);
-        if (pipe && (entry.revents & GuestPollHangUp))
-            entry.revents = static_cast<short>((entry.revents & ~GuestPollWritable) | (entry.events & GuestPollReadable));
-#ifndef _WIN32
-        if (entry.revents & GuestPollHangUp) entry.revents = static_cast<short>(entry.revents & ~GuestPollWritable);
-#endif
-        if (entry.revents) ++ready;
-    };
-#ifdef __APPLE__
-    bool waitsForUrgent = false;
-    for (std::size_t i = 0; i < socketCount && !waitsForUrgent; ++i) {
-        waitsForUrgent = (descriptors[owners[i]].events & GuestPollPriority) != 0;
-    }
-#else
-    constexpr bool waitsForUrgent = false;
-#endif
-#ifdef _WIN32
-    const bool sliced = !pipes.empty() || !kqueues.empty();
-#else
-    const bool sliced = !kqueues.empty() || waitsForUrgent;
-#endif
-    const auto anyUrgentPending = [&]() -> bool {
-#ifdef __APPLE__
-        for (std::size_t i = 0; i < socketCount; ++i) {
-            const auto& entry = descriptors[owners[i]];
-            if ((entry.events & GuestPollPriority) != 0 && (native[i].revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) return true;
-        }
-#endif
-        return false;
-    };
-    bool probed = false;
-    for (;;) {
-        if (ThreadCancel::IoInterrupted()) return interrupted();
-        int checkedReady = 0;
-        const bool urgent = anyUrgentPending();
-#ifdef _WIN32
+    #ifndef _WIN32
+        const std::size_t socketCount = native.size();
         for (const auto index : pipes) {
-            auto& entry = descriptors[index];
-            PipeReadiness(entry.descriptor, entry.events, entry.revents);
-            if (entry.revents) ++checkedReady;
+            NativePollDescriptor request{};
+            request.fd = descriptors[index].descriptor;
+            for (const auto& flag : RequestFlags)
+                if (descriptors[index].events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
+            native.push_back(request);
+            owners.push_back(index);
         }
-#endif
-        for (const auto index : kqueues) {
-            auto& entry = descriptors[index];
-            const auto readable = KqueueReadable(entry.descriptor);
-            entry.revents = !readable ? GuestPollInvalid : *readable ? static_cast<short>(entry.events & GuestPollReadable) : short{0};
-            if (entry.revents) ++checkedReady;
+    #endif
+        const auto nativeCount = native.size();
+        const auto collect = [&](std::size_t i, bool pipe) {
+            auto& entry = descriptors[owners[i]];
+            if (admitted.Retired(entry.descriptor)) { entry.revents = GuestPollInvalid; return; }
+    #if defined(_WIN32) || defined(__APPLE__)
+            if (!pipe) native[i].revents = ClosedStreamEvents(entry.descriptor, native[i].revents, native[i].events);
+    #endif
+            short revents = native[i].revents;
+            if (!pipe && (entry.events & GuestPollPriority) && (revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) {
+                revents = static_cast<short>(revents | NativePollPriority | POLLRDBAND);
+            }
+            for (const auto& flag : RequestFlags)
+                if ((entry.events & flag.guest) && (revents & flag.native))
+                    entry.revents = static_cast<short>(entry.revents | flag.guest);
+            for (const auto& flag : StatusFlags)
+                if (revents & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
+            if (pipe && (entry.revents & GuestPollError)) entry.revents = static_cast<short>((entry.revents & ~GuestPollError) | GuestPollHangUp);
+            if (pipe && (entry.revents & GuestPollHangUp))
+                entry.revents = static_cast<short>((entry.revents & ~GuestPollWritable) | (entry.events & GuestPollReadable));
+    #ifndef _WIN32
+            if (entry.revents & GuestPollHangUp) entry.revents = static_cast<short>(entry.revents & ~GuestPollWritable);
+    #endif
+            if (entry.revents) ++ready;
+        };
+    #ifdef __APPLE__
+        bool waitsForUrgent = false;
+        for (std::size_t i = 0; i < socketCount && !waitsForUrgent; ++i) {
+            waitsForUrgent = (descriptors[owners[i]].events & GuestPollPriority) != 0;
         }
-        int slice = 0;
-        if (probed && !ready && !checkedReady && !urgent) {
-            if (!deadline) slice = sliced ? 1 : -1;
-            else {
+    #else
+        constexpr bool waitsForUrgent = false;
+    #endif
+    #ifdef _WIN32
+        const bool sliced = !pipes.empty() || !kqueues.empty();
+    #else
+        const bool sliced = !kqueues.empty() || waitsForUrgent;
+    #endif
+        const auto anyUrgentPending = [&]() -> bool {
+    #ifdef __APPLE__
+            for (std::size_t i = 0; i < socketCount; ++i) {
+                const auto& entry = descriptors[owners[i]];
+                if ((entry.events & GuestPollPriority) != 0 && (native[i].revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) return true;
+            }
+    #endif
+            return false;
+        };
+        const auto retired = [&] {
+            bool found = false;
+            for (std::uint32_t i = 0; i < count; ++i)
+                if (admitted.Retired(descriptors[i].descriptor)) {
+                    descriptors[i].revents = GuestPollInvalid;
+                    found = true;
+                }
+            return found;
+        };
+        bool probed = false;
+        for (;;) {
+            if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            const bool invalid = retired();
+            int checkedReady = 0;
+            const bool urgent = anyUrgentPending();
+    #ifdef _WIN32
+            for (const auto index : pipes) {
+                auto& entry = descriptors[index];
+                if (!admitted.Retired(entry.descriptor)) PipeReadiness(entry.descriptor, entry.events, entry.revents);
+                if (entry.revents) ++checkedReady;
+            }
+    #endif
+            for (const auto index : kqueues) {
+                auto& entry = descriptors[index];
+                if (admitted.Retired(entry.descriptor)) { ++checkedReady; continue; }
+                const auto readable = KqueueReadable(entry.descriptor);
+                entry.revents = !readable ? GuestPollInvalid : *readable ? static_cast<short>(entry.events & GuestPollReadable) : short{0};
+                if (entry.revents) ++checkedReady;
+            }
+            int slice = 0;
+            if (probed && !partial && !invalid && !ready && !checkedReady && !urgent) {
+                if (!deadline) slice = sliced ? 1 : -1;
+                else {
+                    const auto left = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
+                    slice = static_cast<int>(std::clamp<long long>(left, 0, sliced ? 1 : INT_MAX));
+                }
+            }
+            if (slice != 0 && wakeSocket.load() == Invalid) {
+                try {
+                    struct PollWakerTag {};
+                    auto& waker = HostThreadLocal<Waker, PollWakerTag>();
+                    char discarded[64];
+                    while (::recv(waker.value, discarded, sizeof(discarded), 0) > 0) {}
+                    wakeSocket.store(waker.value);
+                    NativePollDescriptor wakeRequest{};
+                    wakeRequest.fd = waker.value;
+                    wakeRequest.events = POLLIN;
+                    native.push_back(wakeRequest);
+                } catch (const WakerFailure& failure) {
+                    return Fail(failure.error);
+                }
+            }
+            for (auto& request : native) request.revents = 0;
+            if (slice != 0)
+                if (const auto hook = pollWaitHook.load()) hook(1);
+            if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            if (slice != 0 && deadline) {
                 const auto left = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
                 slice = static_cast<int>(std::clamp<long long>(left, 0, sliced ? 1 : INT_MAX));
             }
-        }
-        if (slice != 0 && wakeSocket.load() == Invalid) {
-            try {
-                struct PollWakerTag {};
-                auto& waker = HostThreadLocal<Waker, PollWakerTag>();
-                char discarded[64];
-                while (::recv(waker.value, discarded, sizeof(discarded), 0) > 0) {}
-                wakeSocket.store(waker.value);
-                NativePollDescriptor wakeRequest{};
-                wakeRequest.fd = waker.value;
-                wakeRequest.events = POLLIN;
-                native.push_back(wakeRequest);
-            } catch (const WakerFailure& failure) {
-                return Fail(failure.error);
+            if (retired()) slice = 0;
+    #ifdef _WIN32
+            if (!native.empty() && WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice) < 0) return Fail(NativeError());
+    #else
+            if (::poll(native.data(), static_cast<nfds_t>(native.size()), slice) < 0) return Fail(NativeError());
+    #endif
+            probed = true;
+            if (deadline && std::chrono::steady_clock::now() >= *deadline)
+                if (const auto hook = pollWaitHook.load()) hook(2);
+            if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            int socketReady = 0;
+            for (std::size_t index = 0; index < nativeCount; ++index)
+                if (native[index].revents) ++socketReady;
+            const bool expired = deadline && std::chrono::steady_clock::now() >= *deadline;
+            if (retired() || ready || checkedReady || urgent || socketReady || expired) {
+                ready += checkedReady;
+    #ifdef _WIN32
+                for (std::size_t i = 0; i < nativeCount; ++i) collect(i, false);
+    #else
+                for (std::size_t i = 0; i < nativeCount; ++i) collect(i, i >= socketCount);
+    #endif
+                int result = 0;
+                for (std::uint32_t i = 0; i < count; ++i)
+                    if (descriptors[i].revents) ++result;
+                return result;
             }
+            if (partial) return std::nullopt;
         }
-        for (auto& request : native) request.revents = 0;
-        if (slice != 0)
-            if (const auto hook = pollWaitHook.load()) hook(1);
-        if (ThreadCancel::IoInterrupted()) return interrupted();
-        if (slice != 0 && deadline) {
-            const auto left = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
-            slice = static_cast<int>(std::clamp<long long>(left, 0, sliced ? 1 : INT_MAX));
-        }
-#ifdef _WIN32
-        if (!native.empty() && WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice) < 0) return Fail(NativeError());
-#else
-        if (::poll(native.data(), static_cast<nfds_t>(native.size()), slice) < 0) return Fail(NativeError());
-#endif
-        probed = true;
-        if (deadline && std::chrono::steady_clock::now() >= *deadline)
-            if (const auto hook = pollWaitHook.load()) hook(2);
-        if (ThreadCancel::IoInterrupted()) return interrupted();
-        int socketReady = 0;
-        for (std::size_t index = 0; index < nativeCount; ++index)
-            if (native[index].revents) ++socketReady;
-        const bool expired = deadline && std::chrono::steady_clock::now() >= *deadline;
-        if (ready || checkedReady || urgent || socketReady || expired) {
-            ready += checkedReady;
-#ifdef _WIN32
-            for (std::size_t i = 0; i < nativeCount; ++i) collect(i, false);
-#else
-            for (std::size_t i = 0; i < nativeCount; ++i) collect(i, i >= socketCount);
-#endif
-            return ready;
-        }
+    };
+    for (;;) {
+        if (const auto result = attempt()) return *result;
+        admitted.Wait(deadline);
     }
 }
 

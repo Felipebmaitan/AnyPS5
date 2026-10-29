@@ -344,6 +344,7 @@ private:
 };
 
 HostMutex g_mutex;
+std::atomic<void (*)(int, int)> socketCloseHook{nullptr};
 HostCondition g_cv;
 std::map<int, Sock> g_socks;
 std::set<int> g_epolls;
@@ -976,9 +977,16 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     return fd;
 }
 
+void NetSetSocketCloseHookForTest_nid_no_patch(void (*hook)(int, int)) {
+    socketCloseHook.store(hook);
+}
+
 int APS5_VABI sceNetSocketClose(int s) {
-    const GuestDescriptorAccess identity(s, GuestDescriptorAccess::Mode::Read, std::defer_lock);
-    const auto version = identity.Snapshot();
+    GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Retire, std::defer_lock);
+    const auto version = descriptorLock.Snapshot();
+    if (const auto hook = socketCloseHook.load()) hook(s, 0);
+    descriptorLock.Lock();
+    if (!version.Matches()) return fail(NET_EBADF);
     std::shared_ptr<NativeSocketHandle> native;
     bool found = false;
     {
@@ -992,11 +1000,11 @@ int APS5_VABI sceNetSocketClose(int s) {
         }
     }
     if (!found) {
-        const GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Close);
-        if (!version.Unchanged()) return fail(NET_EBADF);
+        descriptorLock.Drain(true);
         if (!GuestSocketIsOpen_nid_no_patch(s)) return fail(NET_EBADF);
         return close_nid_postfix(s) == 0 ? 0 : fail(*__error_nid_postfix());
     }
+    descriptorLock.MarkChanged();
     if (native) {
 #ifdef _WIN32
         ::shutdown(native->value, SD_BOTH);
@@ -1004,8 +1012,9 @@ int APS5_VABI sceNetSocketClose(int s) {
         ::shutdown(native->value, SHUT_RDWR);
 #endif
     }
-    const GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Replace);
-    if (version.Unchanged()) KernelReleaseSocketNumber_nid_no_patch(s);
+    if (const auto hook = socketCloseHook.load()) hook(s, 1);
+    descriptorLock.Drain(false);
+    KernelReleaseSocketNumber_nid_no_patch(s);
     g_cv.NotifyAll();
     return 0;
 }

@@ -19,6 +19,9 @@ bool DescriptorAccessReadOrWait_nid_no_patch(void* access);
 bool DescriptorAccessReadOrWaitUntil_nid_no_patch(void* access, std::int64_t deadlineNanos);
 void DescriptorAccessWake_nid_no_patch(void* access) noexcept;
 bool DescriptorVersionUnchanged_nid_no_patch(const void* version);
+bool DescriptorVersionMatches_nid_no_patch(const void* version);
+void DescriptorAccessDrain_nid_no_patch(void* access, bool closing);
+void DescriptorAccessMarkChanged_nid_no_patch(void* access);
 void DescriptorAccessSnapshot_nid_no_patch(const void* access, void* version);
 void DescriptorOperationInitialize_nid_no_patch(void* operation, void* access);
 void DescriptorOperationDestroy_nid_no_patch(void* operation);
@@ -33,15 +36,17 @@ public:
     class Version {
     public:
         bool Unchanged() const { return DescriptorVersionUnchanged_nid_no_patch(this); }
+        bool Matches() const { return DescriptorVersionMatches_nid_no_patch(this); }
     private:
         friend class GuestDescriptorAccess;
         friend bool DescriptorVersionUnchanged_nid_no_patch(const void* version);
+        friend bool DescriptorVersionMatches_nid_no_patch(const void* version);
         friend void DescriptorAccessSnapshot_nid_no_patch(const void* access, void* version);
         Version() = default;
         std::shared_ptr<State> state;
         std::uint64_t value = 0;
     };
-    enum class Mode { Read, Change, Update, Close, Replace };
+    enum class Mode { Read, Change, Update, Close, Replace, Retire };
     class Operation {
     public:
         explicit Operation(GuestDescriptorAccess& access, bool retireOnReplace = false)
@@ -90,6 +95,8 @@ public:
     GuestDescriptorAccess(const GuestDescriptorAccess&) = delete;
     GuestDescriptorAccess& operator=(const GuestDescriptorAccess&) = delete;
     void Lock() { DescriptorAccessLock_nid_no_patch(this); }
+    void Drain(bool closing) { DescriptorAccessDrain_nid_no_patch(this, closing); }
+    void MarkChanged() { DescriptorAccessMarkChanged_nid_no_patch(this); }
     bool TryLock() { return DescriptorAccessTryLock_nid_no_patch(this); }
     void Unlock() { DescriptorAccessUnlock_nid_no_patch(this); }
     bool ReadOrWait() { return DescriptorAccessReadOrWait_nid_no_patch(this); }
@@ -116,6 +123,8 @@ public:
 private:
     friend void DescriptorAccessInitialize_nid_no_patch(void* access, int descriptor);
     friend void DescriptorAccessLock_nid_no_patch(void* access);
+    friend void DescriptorAccessDrain_nid_no_patch(void* access, bool closing);
+    friend void DescriptorAccessMarkChanged_nid_no_patch(void* access);
     friend bool DescriptorAccessTryLock_nid_no_patch(void* access);
     friend void DescriptorAccessUnlock_nid_no_patch(void* access);
     friend bool DescriptorAccessReadOrWait_nid_no_patch(void* access);

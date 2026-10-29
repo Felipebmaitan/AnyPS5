@@ -41,6 +41,7 @@ void EndWait();
 bool IoEnabled();
 bool IoActive();
 bool IoInterrupted();
+bool IoRequestInterrupted();
 bool IoRestartError();
 class IoRestart {
 public:

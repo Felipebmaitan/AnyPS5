@@ -1,4 +1,5 @@
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
@@ -134,6 +135,11 @@ static void Pair(State& state, bool net) {
     state.descriptors.push_back({input, 1, -1});
 }
 
+static std::atomic<int> admissionProbes{0};
+static void AdmissionHook(int stage) {
+    if (stage == 0) admissionProbes.fetch_add(1);
+}
+
 static void AdmissionTimeout() {
     int original[2], replacement[2];
     Require(pipe_nid_postfix(original) == 0 && pipe_nid_postfix(replacement) == 0, "create admission pipes");
@@ -163,36 +169,114 @@ static void AdmissionTimeout() {
         Require(prompt && result == 0 && request.revents == 0, "poll admission ignored its timeout");
         Require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout), "admission timeout returned early");
     }
+    int independent[2];
+    Require(pipe_nid_postfix(independent) == 0, "independent admission pipe");
+    Require(write_nid_postfix(independent[1], "r", 1) == 1, "seed independent pipe");
+    for (const int timeout : {0, 50, -1}) {
+        std::array<GuestPollDescriptor, 3> requests{{{original[0], 1, -1}, {independent[0], 1, -1}, {100000, 1, -1}}};
+        std::atomic<bool> returned{false};
+        int result = -2;
+        std::thread polling([&] {
+            result = poll_nid_postfix(requests.data(), requests.size(), timeout);
+            returned.store(true);
+        });
+        const bool prompt = Observe([&] { return returned.load(); });
+        if (!prompt) admitted.Unlock();
+        polling.join();
+        if (!prompt) replacing.join();
+        Require(prompt && result == 2 && requests[0].revents == 0 && requests[1].revents == 1 && requests[2].revents == 0x20, "contended admission hid independent readiness");
+    }
+    char drained = 0;
+    Require(read_nid_postfix(independent[0], &drained, 1) == 1, "drain independent pipe");
+    std::array<GuestPollDescriptor, 2> delayed{{{original[0], 1, -1}, {independent[0], 1, -1}}};
+    KernelSetPollWaitHookForTest_nid_no_patch(AdmissionHook);
+    int delayedResult = -2;
+    std::thread delayedPoll([&] { delayedResult = poll_nid_postfix(delayed.data(), delayed.size(), -1); });
+    Require(Observe([&] { return admissionProbes.load() >= 2; }), "observe partial admission reprobe");
+    Require(write_nid_postfix(independent[1], "d", 1) == 1, "publish delayed readiness");
+    delayedPoll.join();
+    KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
+    Require(delayedResult == 1 && delayed[0].revents == 0 && delayed[1].revents == 1, "contended admission hid delayed readiness");
+    Require(close_nid_postfix(independent[0]) == 0 && close_nid_postfix(independent[1]) == 0, "close independent pipe");
     admitted.Unlock();
     replacing.join();
     for (const int descriptor : {original[0], original[1], replacement[0], replacement[1]})
         Require(close_nid_postfix(descriptor) == 0, "close admission pipes");
 }
 
-static void BorrowedCloseReuse() {
+struct CloseSchedule {
+    int descriptor;
+    int stage;
+    std::atomic<int> entered{0};
+    std::atomic<bool> paused{false};
+    std::atomic<bool> release{false};
+};
+static CloseSchedule* closeSchedule = nullptr;
+static void CloseHook(int descriptor, int stage) {
+    auto& schedule = *closeSchedule;
+    if (descriptor != schedule.descriptor) return;
+    const int entry = stage == 0 ? schedule.entered.fetch_add(1) : schedule.entered.load() - 1;
+    if (stage == schedule.stage && entry == 0) {
+        schedule.paused.store(true);
+        Require(Observe([&] { return schedule.release.load(); }), "release socket close");
+    }
+}
+
+static void BorrowedCloseReuse(const std::string& scenario) {
     State state;
     Pair(state, true);
     const int descriptor = state.descriptors.front().descriptor;
-    int replacement[2];
-    Require(pipe_nid_postfix(replacement) == 0, "create borrowed close replacement");
-    GuestDescriptorAccess held(descriptor, GuestDescriptorAccess::Mode::Update);
-    std::thread closing([&] { Require(sceNetSocketClose(descriptor) == 0, "close borrowed socket while replacing"); });
-    const bool removed = Observe([&] {
-        std::shared_ptr<void> owner;
-        std::uintptr_t native = 0;
-        return !KernelFindSocketNative_nid_no_patch(descriptor, &owner, &native);
-    });
-    if (!removed) held.Unlock();
-    if (!removed) closing.join();
-    Require(removed, "observe borrowed socket retirement");
-    Require(dup2_nid_postfix(replacement[0], descriptor) == descriptor, "replace retired borrowed number");
-    held.Unlock();
-    closing.join();
-    Require(write_nid_postfix(replacement[1], "n", 1) == 1, "seed borrowed replacement");
-    char byte = 0;
-    Require(read_nid_postfix(descriptor, &byte, 1) == 1 && byte == 'n', "borrowed close closed a newer descriptor");
-    for (const int number : {descriptor, state.output, replacement[0], replacement[1]})
-        Require(close_nid_postfix(number) == 0, "close borrowed replacement resources");
+    CloseSchedule schedule{descriptor, scenario == "close_twice" ? 1 : 0};
+    closeSchedule = &schedule;
+    NetSetSocketCloseHookForTest_nid_no_patch(CloseHook);
+    int firstResult = -2;
+    std::thread closing([&] { firstResult = sceNetSocketClose(descriptor); });
+    Require(Observe([&] { return schedule.paused.load(); }), "observe socket close phase");
+    if (scenario == "close_reuse") {
+        int replacement[2];
+        Require(pipe_nid_postfix(replacement) == 0, "create replacement pipe");
+        Require(dup2_nid_postfix(replacement[0], descriptor) == descriptor, "replace before stale close lookup");
+        schedule.release.store(true);
+        closing.join();
+        Require(firstResult < 0, "close must reject replaced identity");
+        Require(write_nid_postfix(replacement[1], "n", 1) == 1, "seed replacement");
+        char byte = 0;
+        Require(read_nid_postfix(descriptor, &byte, 1) == 1 && byte == 'n', "stale close closed replacement");
+        Require(close_nid_postfix(descriptor) == 0 && close_nid_postfix(replacement[0]) == 0 && close_nid_postfix(replacement[1]) == 0, "close replacement resources");
+    } else if (scenario == "close_stale") {
+        std::vector<int> occupied;
+        do {
+            const int copy = dup_nid_postfix(state.output);
+            Require(copy >= 0, "fill lower descriptor holes");
+            occupied.push_back(copy);
+        } while (occupied.back() < descriptor);
+        Require(sceNetSocketClose(descriptor) == 0, "close before stale lookup");
+        const int reused = sceNetSocket("reused", 2, 1, 0);
+        Require(reused == descriptor, "reuse released socket number");
+        std::shared_ptr<void> before, after;
+        std::uintptr_t nativeBefore = 0, nativeAfter = 0;
+        Require(KernelFindSocketNative_nid_no_patch(reused, &before, &nativeBefore), "find reused owner");
+        schedule.release.store(true);
+        closing.join();
+        Require(firstResult < 0, "stale close must fail");
+        Require(KernelFindSocketNative_nid_no_patch(reused, &after, &nativeAfter) && before == after && nativeBefore == nativeAfter, "stale close removed reused socket");
+        Require(sceNetSocketClose(reused) == 0, "close reused owner");
+        for (const int copy : occupied) Require(close_nid_postfix(copy) == 0, "close hole filler");
+    } else {
+        GuestDescriptorAccess probe(descriptor, GuestDescriptorAccess::Mode::Read, std::defer_lock);
+        Require(!probe.TryLock(), "close must reserve descriptor before removing owner");
+        int secondResult = -2;
+        std::thread second([&] { secondResult = sceNetSocketClose(descriptor); });
+        Require(Observe([&] { return schedule.entered.load() == 2; }), "observe competing close snapshot");
+        schedule.release.store(true);
+        closing.join();
+        second.join();
+        Require(firstResult == 0 && secondResult < 0, "concurrent close results");
+        Require(!DescriptorIsOpen_nid_no_patch(descriptor), "concurrent close leaked reserved number");
+
+    }
+    NetSetSocketCloseHookForTest_nid_no_patch(nullptr);
+    Require(close_nid_postfix(state.output) == 0, "close peer");
 }
 
 #ifndef _WIN32
@@ -233,7 +317,7 @@ static void DescriptorCapacity() {
 
 static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "admission_timeout") { AdmissionTimeout(); return; }
-    if (scenario == "close_reuse") { BorrowedCloseReuse(); return; }
+    if (scenario == "close_reuse" || scenario == "close_twice" || scenario == "close_stale") { BorrowedCloseReuse(scenario); return; }
 #ifndef _WIN32
     if (scenario == "capacity") { DescriptorCapacity(); return; }
 #endif

@@ -225,6 +225,7 @@ int APS5_VABI sceNetTerm(void);
 int APS5_VABI sceNetPoolCreate(const char* name, int size, int flags);
 int APS5_VABI sceNetPoolDestroy(int memid);
 int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol);
+void NetSetSocketCloseHookForTest_nid_no_patch(void (*hook)(int, int));
 int APS5_VABI sceNetSocketClose(int s);
 int APS5_VABI sceNetSocketAbort(int s, int flags);
 int APS5_VABI sceNetBind_nid_postfix(int s, const void* addr, uint32_t addrlen);

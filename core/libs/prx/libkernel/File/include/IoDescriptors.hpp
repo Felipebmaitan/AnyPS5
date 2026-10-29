@@ -14,6 +14,7 @@ class IoDescriptors {
         GuestDescriptorAccess access;
         GuestDescriptorAccess::Version version;
         bool held = false;
+        bool retired = false;
         std::optional<GuestDescriptorAccess::Operation> operation;
         std::optional<ThreadCancel::IoWait> wake;
         explicit Entry(int descriptor)
@@ -24,6 +25,7 @@ class IoDescriptors {
     void Release() {
         for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry) {
             (*entry)->wake.reset();
+            if ((*entry)->operation && (*entry)->operation->Interrupted()) (*entry)->retired = true;
             (*entry)->operation.reset();
             if ((*entry)->held) {
                 (*entry)->access.Unlock();
@@ -33,7 +35,6 @@ class IoDescriptors {
     }
 
 public:
-    enum class Acquisition { Ready, Interrupted, TimedOut };
     explicit IoDescriptors(std::vector<int> descriptors) {
         std::sort(descriptors.begin(), descriptors.end());
         descriptors.erase(std::unique(descriptors.begin(), descriptors.end()), descriptors.end());
@@ -48,38 +49,49 @@ public:
         const auto found = std::find_if(entries.begin(), entries.end(), [descriptor](const auto& entry) {
             return entry->descriptor == descriptor;
         });
-        return found != entries.end() && (((*found)->operation && (*found)->operation->Interrupted()) || !(*found)->version.Unchanged());
+        return found != entries.end() && ((*found)->retired || ((*found)->operation && (*found)->operation->Interrupted()) || !(*found)->version.Unchanged());
     }
 
-    Acquisition Acquire(ThreadCancel::IoWait::Interrupt interrupt, void* argument,
-        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
-        for (;;) {
-            if (ThreadCancel::IoInterrupted()) return Acquisition::Interrupted;
-            Entry* blocked = nullptr;
-            for (auto& entry : entries) {
-                if (!entry->version.Unchanged()) { Release(); return Acquisition::Interrupted; }
-                if (!entry->access.TryLock()) { blocked = entry.get(); break; }
-                entry->held = true;
-                if (!entry->version.Unchanged()) { Release(); return Acquisition::Interrupted; }
-            }
-            if (!blocked) break;
-            Release();
-            ThreadCancel::IoWait wait([](void* opaque) noexcept {
-                static_cast<GuestDescriptorAccess*>(opaque)->Wake();
-            }, &blocked->access);
-            while (!ThreadCancel::IoInterrupted()) {
-                if (deadline && std::chrono::steady_clock::now() >= *deadline) return Acquisition::TimedOut;
-                if (deadline ? blocked->access.ReadOrWaitUntil(*deadline) : blocked->access.ReadOrWait()) {
-                    blocked->access.Unlock();
-                    break;
-                }
-            }
-        }
+    bool Available(int descriptor) const {
+        const auto found = std::find_if(entries.begin(), entries.end(), [descriptor](const auto& entry) {
+            return entry->descriptor == descriptor;
+        });
+        return found != entries.end() && (*found)->held;
+    }
+
+    bool Pending() const {
+        for (const auto& entry : entries)
+            if (!entry->held && !Retired(entry->descriptor)) return true;
+        return false;
+    }
+
+    bool Acquire(ThreadCancel::IoWait::Interrupt interrupt, void* argument) {
+        Release();
         for (auto& entry : entries) {
+            if (ThreadCancel::IoRequestInterrupted()) return false;
+            if (Retired(entry->descriptor) || !entry->access.TryLock()) continue;
+            entry->held = true;
+            if (Retired(entry->descriptor)) continue;
             entry->operation.emplace(entry->access, true);
             entry->wake.emplace(interrupt, argument);
         }
-        return ThreadCancel::IoInterrupted() ? Acquisition::Interrupted : Acquisition::Ready;
+        return !ThreadCancel::IoRequestInterrupted();
+    }
+
+    void Wait(std::optional<std::chrono::steady_clock::time_point> deadline) {
+        Entry* blocked = nullptr;
+        for (auto& entry : entries) {
+            if (!entry->held && !Retired(entry->descriptor)) { blocked = entry.get(); break; }
+        }
+        Release();
+        if (!blocked) return;
+        ThreadCancel::IoWait wait([](void* opaque) noexcept {
+            static_cast<GuestDescriptorAccess*>(opaque)->Wake();
+        }, &blocked->access);
+        if (ThreadCancel::IoRequestInterrupted()) return;
+        auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+        if (deadline) until = std::min(until, *deadline);
+        if (blocked->access.ReadOrWaitUntil(until)) blocked->access.Unlock();
     }
 };
 

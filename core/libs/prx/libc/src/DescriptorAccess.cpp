@@ -73,7 +73,11 @@ void DescriptorAccessLock_nid_no_patch(void* access) {
         if (self.mode == GuestDescriptorAccess::Mode::Close) ++self.state->closesWaiting;
         if (self.mode == GuestDescriptorAccess::Mode::Replace) ++self.state->replacementsWaiting;
         try {
-            if (self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Replace) {
+            if (self.mode == GuestDescriptorAccess::Mode::Retire) {
+                self.state->changed.wait(lock, [&] {
+                    return self.state->writer == std::thread::id{} || self.state->writer == std::this_thread::get_id();
+                });
+            } else if (self.mode == GuestDescriptorAccess::Mode::Close || self.mode == GuestDescriptorAccess::Mode::Replace) {
                 while (!self.state->CanChange()) {
                     self.state->Interrupt(self.mode == GuestDescriptorAccess::Mode::Close);
                     self.state->changed.wait_for(lock, std::chrono::milliseconds(1));
@@ -104,7 +108,9 @@ bool DescriptorAccessTryLock_nid_no_patch(void* access) {
         if (!self.state->CanRead()) return false;
         ++self.state->readers;
     } else {
-        if (!self.state->CanChange()) {
+        const bool canChange = self.mode == GuestDescriptorAccess::Mode::Retire ?
+            self.state->writer == std::thread::id{} || self.state->writer == std::this_thread::get_id() : self.state->CanChange();
+        if (!canChange) {
             if (self.mode == GuestDescriptorAccess::Mode::Replace) self.state->Interrupt(false);
             return false;
         }
@@ -114,6 +120,23 @@ bool DescriptorAccessTryLock_nid_no_patch(void* access) {
     }
     self.held = true;
     return true;
+}
+
+void DescriptorAccessDrain_nid_no_patch(void* access, bool closing) {
+    auto& self = *static_cast<GuestDescriptorAccess*>(access);
+    if (!self.state) return;
+    std::unique_lock lock(self.state->mutex);
+    while (self.state->readers != 0) {
+        self.state->Interrupt(closing);
+        self.state->changed.wait_for(lock, std::chrono::milliseconds(1));
+    }
+}
+
+void DescriptorAccessMarkChanged_nid_no_patch(void* access) {
+    auto& self = *static_cast<GuestDescriptorAccess*>(access);
+    if (!self.state) return;
+    std::lock_guard lock(self.state->mutex);
+    self.state->replacement = true;
 }
 
 void DescriptorAccessUnlock_nid_no_patch(void* access) {
@@ -173,6 +196,13 @@ bool DescriptorVersionUnchanged_nid_no_patch(const void* version) {
     if (!self.state) return false;
     std::lock_guard lock(self.state->mutex);
     return self.value != std::numeric_limits<std::uint64_t>::max() && self.state->generation == self.value && self.state->closesWaiting == 0;
+}
+
+bool DescriptorVersionMatches_nid_no_patch(const void* version) {
+    const auto& self = *static_cast<const GuestDescriptorAccess::Version*>(version);
+    if (!self.state) return false;
+    std::lock_guard lock(self.state->mutex);
+    return self.value != std::numeric_limits<std::uint64_t>::max() && self.state->generation == self.value;
 }
 
 void DescriptorAccessSnapshot_nid_no_patch(const void* access, void* version) {
