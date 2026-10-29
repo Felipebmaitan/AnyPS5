@@ -5,6 +5,7 @@
 #include <mutex>
 #include <cstdint>
 #include <atomic>
+#include <chrono>
 
 extern "C" {
 void FileStreamSetCloseHookForTest_nid_no_patch(void (*hook)(int, int));
@@ -15,6 +16,7 @@ void DescriptorAccessLock_nid_no_patch(void* access);
 bool DescriptorAccessTryLock_nid_no_patch(void* access);
 void DescriptorAccessUnlock_nid_no_patch(void* access);
 bool DescriptorAccessReadOrWait_nid_no_patch(void* access);
+bool DescriptorAccessReadOrWaitUntil_nid_no_patch(void* access, std::int64_t deadlineNanos);
 void DescriptorAccessWake_nid_no_patch(void* access) noexcept;
 bool DescriptorVersionUnchanged_nid_no_patch(const void* version);
 void DescriptorAccessSnapshot_nid_no_patch(const void* access, void* version);
@@ -91,6 +93,10 @@ public:
     bool TryLock() { return DescriptorAccessTryLock_nid_no_patch(this); }
     void Unlock() { DescriptorAccessUnlock_nid_no_patch(this); }
     bool ReadOrWait() { return DescriptorAccessReadOrWait_nid_no_patch(this); }
+    bool ReadOrWaitUntil(std::chrono::steady_clock::time_point deadline) {
+        return DescriptorAccessReadOrWaitUntil_nid_no_patch(this,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count());
+    }
     void Wake() noexcept { DescriptorAccessWake_nid_no_patch(this); }
     Version Snapshot() const {
         Version result;
@@ -113,6 +119,7 @@ private:
     friend bool DescriptorAccessTryLock_nid_no_patch(void* access);
     friend void DescriptorAccessUnlock_nid_no_patch(void* access);
     friend bool DescriptorAccessReadOrWait_nid_no_patch(void* access);
+    friend bool DescriptorAccessReadOrWaitUntil_nid_no_patch(void* access, std::int64_t deadlineNanos);
     friend void DescriptorAccessWake_nid_no_patch(void* access) noexcept;
     friend void DescriptorAccessSnapshot_nid_no_patch(const void* access, void* version);
     friend void DescriptorOperationInitialize_nid_no_patch(void* operation, void* access);
@@ -120,7 +127,7 @@ private:
     std::shared_ptr<State> state;
     Mode mode;
     bool held = false;
-    std::atomic<bool> wakePending{false};
+    bool wakePending = false;
 };
 
 #endif

@@ -5,6 +5,7 @@
 #include "prx/libc/include/Api.hpp"
 #include "prx/libSceNet/include/Net.hpp"
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <vector>
 #include <filesystem>
+#include <fstream>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,6 +25,10 @@
 #else
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #endif
 
 static void Require(bool value, const char* message) {
@@ -59,6 +65,11 @@ struct State {
     bool jumpOnSignal = false;
     alignas(16) std::array<std::uint64_t, 12> jump{};
     std::atomic<int> signals{0};
+    bool cancelOnTimeout = false;
+    std::atomic<bool> expired{false};
+#ifdef __linux__
+    std::atomic<long> nativeId{0};
+#endif
 };
 static State* observed = nullptr;
 static void APS5_VABI SignalHandler(int, void*) {
@@ -67,6 +78,10 @@ static void APS5_VABI SignalHandler(int, void*) {
 }
 static void Hook(int stage) {
     if (stage == 1) observed->waiting.store(true);
+    if (stage == 2 && observed->cancelOnTimeout) {
+        observed->expired.store(true);
+        Require(Observe([&] { return observed->release.load(); }), "release timeout cancellation");
+    }
 }
 static void APS5_VABI Cleanup(void* opaque) {
     auto& state = *static_cast<State*>(opaque);
@@ -84,6 +99,9 @@ static void* APS5_VABI Poller(void* opaque) {
     Require(scePthreadSetspecific(state.key, &state) == 0, "set TSD");
     CleanupHandler cleanup{};
     __pthread_cleanup_push_imp_nid_postfix(Cleanup, &state, &cleanup);
+#ifdef __linux__
+    state.nativeId.store(::syscall(SYS_gettid));
+#endif
     state.entered.store(true);
     if (state.pending) Require(Observe([&] { return state.release.load(); }), "release pending poll");
     if (state.jumpOnSignal && setjmp_nid_postfix(state.jump.data()) != 0) state.result = -3;
@@ -116,7 +134,109 @@ static void Pair(State& state, bool net) {
     state.descriptors.push_back({input, 1, -1});
 }
 
+static void AdmissionTimeout() {
+    int original[2], replacement[2];
+    Require(pipe_nid_postfix(original) == 0 && pipe_nid_postfix(replacement) == 0, "create admission pipes");
+    GuestDescriptorAccess admitted(original[0], GuestDescriptorAccess::Mode::Read);
+    GuestDescriptorAccess probe(original[0], GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    std::thread replacing([&] {
+        Require(dup2_nid_postfix(replacement[0], original[0]) == original[0], "replace after admission drains");
+    });
+    Require(Observe([&] {
+        if (!probe.TryLock()) return true;
+        probe.Unlock();
+        return false;
+    }), "observe queued replacement");
+    for (const int timeout : {0, 50}) {
+        GuestPollDescriptor request{original[0], 1, -1};
+        std::atomic<bool> returned{false};
+        int result = -2;
+        const auto start = std::chrono::steady_clock::now();
+        std::thread polling([&] {
+            result = poll_nid_postfix(&request, 1, timeout);
+            returned.store(true);
+        });
+        const bool prompt = Observe([&] { return returned.load(); });
+        if (!prompt) admitted.Unlock();
+        polling.join();
+        if (!prompt) replacing.join();
+        Require(prompt && result == 0 && request.revents == 0, "poll admission ignored its timeout");
+        Require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout), "admission timeout returned early");
+    }
+    admitted.Unlock();
+    replacing.join();
+    for (const int descriptor : {original[0], original[1], replacement[0], replacement[1]})
+        Require(close_nid_postfix(descriptor) == 0, "close admission pipes");
+}
+
+static void BorrowedCloseReuse() {
+    State state;
+    Pair(state, true);
+    const int descriptor = state.descriptors.front().descriptor;
+    int replacement[2];
+    Require(pipe_nid_postfix(replacement) == 0, "create borrowed close replacement");
+    GuestDescriptorAccess held(descriptor, GuestDescriptorAccess::Mode::Update);
+    std::thread closing([&] { Require(sceNetSocketClose(descriptor) == 0, "close borrowed socket while replacing"); });
+    const bool removed = Observe([&] {
+        std::shared_ptr<void> owner;
+        std::uintptr_t native = 0;
+        return !KernelFindSocketNative_nid_no_patch(descriptor, &owner, &native);
+    });
+    if (!removed) held.Unlock();
+    if (!removed) closing.join();
+    Require(removed, "observe borrowed socket retirement");
+    Require(dup2_nid_postfix(replacement[0], descriptor) == descriptor, "replace retired borrowed number");
+    held.Unlock();
+    closing.join();
+    Require(write_nid_postfix(replacement[1], "n", 1) == 1, "seed borrowed replacement");
+    char byte = 0;
+    Require(read_nid_postfix(descriptor, &byte, 1) == 1 && byte == 'n', "borrowed close closed a newer descriptor");
+    for (const int number : {descriptor, state.output, replacement[0], replacement[1]})
+        Require(close_nid_postfix(number) == 0, "close borrowed replacement resources");
+}
+
+#ifndef _WIN32
+static void DescriptorCapacity() {
+    auto* file = std::tmpfile();
+    Require(file != nullptr, "capacity file");
+    int pipe[2];
+    Require(pipe_nid_postfix(pipe) == 0 && write_nid_postfix(pipe[1], "r", 1) == 1, "capacity ready pipe");
+    rlimit previous{};
+    Require(::getrlimit(RLIMIT_NOFILE, &previous) == 0, "get descriptor capacity");
+    auto limited = previous;
+    limited.rlim_cur = std::min<rlim_t>(previous.rlim_cur, 64);
+    Require(::setrlimit(RLIMIT_NOFILE, &limited) == 0, "bound descriptor capacity");
+    std::vector<int> occupied;
+    for (;;) {
+        const int descriptor = ::open("/dev/null", O_RDONLY);
+        if (descriptor < 0) break;
+        occupied.push_back(descriptor);
+    }
+    std::thread polling([&] {
+        Require(poll_nid_postfix(nullptr, 0, 0) == 0, "empty zero poll requires a native descriptor");
+        GuestPollDescriptor negative{-1, 1, -1};
+        Require(poll_nid_postfix(&negative, 1, 0) == 0 && negative.revents == 0, "negative-only poll requires a native descriptor");
+        GuestPollDescriptor invalid{100000, 1, -1};
+        Require(poll_nid_postfix(&invalid, 1, -1) == 1 && invalid.revents == 0x20, "invalid poll requires a native descriptor");
+        GuestPollDescriptor ready{::fileno(file), 1, -1};
+        Require(poll_nid_postfix(&ready, 1, -1) == 1 && ready.revents == 1, "ready file poll requires a native descriptor");
+        ready = {pipe[0], 1, -1};
+        Require(poll_nid_postfix(&ready, 1, -1) == 1 && ready.revents == 1, "ready native poll requires a native descriptor");
+        Require(poll_nid_postfix(nullptr, 0, -1) == -1 && *__error_nid_postfix() == 24, "blocking wake allocation must report EMFILE");
+    });
+    polling.join();
+    Require(::setrlimit(RLIMIT_NOFILE, &previous) == 0, "restore descriptor capacity");
+    for (const int descriptor : occupied) Require(::close(descriptor) == 0, "close capacity descriptor");
+    Require(std::fclose(file) == 0 && close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close capacity resources");
+}
+#endif
+
 static void Run(const std::string& transport, const std::string& scenario) {
+    if (scenario == "admission_timeout") { AdmissionTimeout(); return; }
+    if (scenario == "close_reuse") { BorrowedCloseReuse(); return; }
+#ifndef _WIN32
+    if (scenario == "capacity") { DescriptorCapacity(); return; }
+#endif
     State state;
     const bool empty = transport == "empty";
     const bool net = transport == "net";
@@ -156,6 +276,8 @@ static void Run(const std::string& transport, const std::string& scenario) {
     state.pending = scenario == "pending";
     const bool signal = scenario == "signal" || scenario == "signal_jump";
     state.jumpOnSignal = scenario == "signal_jump";
+    state.cancelOnTimeout = scenario == "timeout_cancel";
+    if (state.cancelOnTimeout) state.timeout = 50;
     if (scenario == "timeout" || (empty && state.disabled)) state.timeout = 100;
     if (scenario == "zero" || scenario == "invalid") state.timeout = 0;
     if (scenario == "invalid") state.descriptors.push_back({100000, 1, -1});
@@ -178,8 +300,17 @@ static void Run(const std::string& transport, const std::string& scenario) {
     Require(Observe([&] { return state.entered.load(); }), "poller entry");
     const bool immediate = scenario == "zero" || scenario == "invalid";
     if (!state.pending && !immediate) Require(Observe([&] { return state.waiting.load(); }), "poll not admitted to wait");
+#ifdef __linux__
+    if (scenario == "cancel" || signal || scenario == "nonblocking") Require(Observe([&] {
+        std::ifstream input("/proc/self/task/" + std::to_string(state.nativeId.load()) + "/syscall");
+        long call = -1;
+        input >> call;
+        return input && call == SYS_poll;
+    }), "observe a genuinely blocked native poll");
+#endif
+    if (state.cancelOnTimeout) Require(Observe([&] { return state.expired.load(); }), "observe timeout before cancellation");
     const bool race = scenario == "race" || scenario == "close_cancel";
-    const bool canceled = scenario == "cancel" || scenario == "pending" || scenario == "disabled" || scenario == "nonblocking";
+    const bool canceled = scenario == "cancel" || scenario == "pending" || scenario == "disabled" || scenario == "nonblocking" || state.cancelOnTimeout;
     if (signal) Require(sceKernelRaiseException(thread, 30) == 0, "interrupt poll with signal");
     else if (race) {
         std::atomic<bool> go{false};
@@ -195,6 +326,11 @@ static void Run(const std::string& transport, const std::string& scenario) {
         go.store(true);
         requester.join();
         completion.join();
+    } else if (state.cancelOnTimeout) {
+        std::thread requester([&] { Require(pthread_cancel_nid_postfix(thread) == 0, "cancel expired poll"); });
+        Require(Observe([&] { return thread->cancelPending.load(); }), "observe pending timeout cancellation");
+        state.release.store(true);
+        requester.join();
     } else if (canceled) {
         Require(pthread_cancel_nid_postfix(thread) == 0, "cancel poller");
         state.release.store(true);

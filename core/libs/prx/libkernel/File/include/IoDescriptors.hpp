@@ -33,6 +33,7 @@ class IoDescriptors {
     }
 
 public:
+    enum class Acquisition { Ready, Interrupted, TimedOut };
     explicit IoDescriptors(std::vector<int> descriptors) {
         std::sort(descriptors.begin(), descriptors.end());
         descriptors.erase(std::unique(descriptors.begin(), descriptors.end()), descriptors.end());
@@ -50,15 +51,16 @@ public:
         return found != entries.end() && (((*found)->operation && (*found)->operation->Interrupted()) || !(*found)->version.Unchanged());
     }
 
-    bool Acquire(ThreadCancel::IoWait::Interrupt interrupt, void* argument) {
+    Acquisition Acquire(ThreadCancel::IoWait::Interrupt interrupt, void* argument,
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
         for (;;) {
-            if (ThreadCancel::IoInterrupted()) return false;
+            if (ThreadCancel::IoInterrupted()) return Acquisition::Interrupted;
             Entry* blocked = nullptr;
             for (auto& entry : entries) {
-                if (!entry->version.Unchanged()) { Release(); return false; }
+                if (!entry->version.Unchanged()) { Release(); return Acquisition::Interrupted; }
                 if (!entry->access.TryLock()) { blocked = entry.get(); break; }
                 entry->held = true;
-                if (!entry->version.Unchanged()) { Release(); return false; }
+                if (!entry->version.Unchanged()) { Release(); return Acquisition::Interrupted; }
             }
             if (!blocked) break;
             Release();
@@ -66,7 +68,8 @@ public:
                 static_cast<GuestDescriptorAccess*>(opaque)->Wake();
             }, &blocked->access);
             while (!ThreadCancel::IoInterrupted()) {
-                if (blocked->access.ReadOrWait()) {
+                if (deadline && std::chrono::steady_clock::now() >= *deadline) return Acquisition::TimedOut;
+                if (deadline ? blocked->access.ReadOrWaitUntil(*deadline) : blocked->access.ReadOrWait()) {
                     blocked->access.Unlock();
                     break;
                 }
@@ -76,7 +79,7 @@ public:
             entry->operation.emplace(entry->access, true);
             entry->wake.emplace(interrupt, argument);
         }
-        return !ThreadCancel::IoInterrupted();
+        return ThreadCancel::IoInterrupted() ? Acquisition::Interrupted : Acquisition::Ready;
     }
 };
 

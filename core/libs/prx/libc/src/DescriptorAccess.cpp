@@ -10,7 +10,9 @@
 struct GuestDescriptorAccess::State {
     std::mutex mutex;
     std::condition_variable changed;
-    std::atomic<std::uint64_t> revision{0};
+    std::mutex wakeMutex;
+    std::condition_variable wakeChanged;
+    std::uint64_t revision = 0;
     unsigned readers = 0;
     unsigned changesWaiting = 0;
     std::thread::id writer;
@@ -22,8 +24,11 @@ struct GuestDescriptorAccess::State {
     std::vector<Operation*> operations;
 
     void Notify() noexcept {
-        revision.fetch_add(1);
-        revision.notify_all();
+        {
+            std::lock_guard lock(wakeMutex);
+            ++revision;
+        }
+        wakeChanged.notify_all();
         changed.notify_all();
     }
 
@@ -128,24 +133,39 @@ void DescriptorAccessUnlock_nid_no_patch(void* access) {
 }
 
 bool DescriptorAccessReadOrWait_nid_no_patch(void* access) {
+    return DescriptorAccessReadOrWaitUntil_nid_no_patch(access, 0);
+}
+
+bool DescriptorAccessReadOrWaitUntil_nid_no_patch(void* access, std::int64_t deadlineNanos) {
     auto& self = *static_cast<GuestDescriptorAccess*>(access);
     if (!self.state) { self.held = true; return true; }
-    const auto revision = self.state->revision.load();
     std::unique_lock lock(self.state->mutex);
     if (self.state->CanRead()) {
         ++self.state->readers;
         self.held = true;
         return true;
     }
+    std::unique_lock wakeLock(self.state->wakeMutex);
+    const auto revision = self.state->revision;
     lock.unlock();
-    if (!self.wakePending.exchange(false)) self.state->revision.wait(revision);
+    const auto woken = [&] { return self.wakePending || self.state->revision != revision; };
+    if (deadlineNanos == 0) self.state->wakeChanged.wait(wakeLock, woken);
+    else self.state->wakeChanged.wait_until(wakeLock,
+        std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadlineNanos)), woken);
+    self.wakePending = false;
     return false;
 }
 
 void DescriptorAccessWake_nid_no_patch(void* access) noexcept {
     auto& self = *static_cast<GuestDescriptorAccess*>(access);
-    self.wakePending.store(true);
-    if (self.state) self.state->Notify();
+    if (!self.state) return;
+    {
+        std::lock_guard lock(self.state->wakeMutex);
+        self.wakePending = true;
+        ++self.state->revision;
+    }
+    self.state->wakeChanged.notify_all();
+    self.state->changed.notify_all();
 }
 
 bool DescriptorVersionUnchanged_nid_no_patch(const void* version) {

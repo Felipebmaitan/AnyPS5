@@ -977,6 +977,8 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
 }
 
 int APS5_VABI sceNetSocketClose(int s) {
+    const GuestDescriptorAccess identity(s, GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    const auto version = identity.Snapshot();
     std::shared_ptr<NativeSocketHandle> native;
     bool found = false;
     {
@@ -990,6 +992,8 @@ int APS5_VABI sceNetSocketClose(int s) {
         }
     }
     if (!found) {
+        const GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Close);
+        if (!version.Unchanged()) return fail(NET_EBADF);
         if (!GuestSocketIsOpen_nid_no_patch(s)) return fail(NET_EBADF);
         return close_nid_postfix(s) == 0 ? 0 : fail(*__error_nid_postfix());
     }
@@ -1001,7 +1005,7 @@ int APS5_VABI sceNetSocketClose(int s) {
 #endif
     }
     const GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Replace);
-    KernelReleaseSocketNumber_nid_no_patch(s);
+    if (version.Unchanged()) KernelReleaseSocketNumber_nid_no_patch(s);
     g_cv.NotifyAll();
     return 0;
 }
