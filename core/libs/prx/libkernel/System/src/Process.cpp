@@ -995,7 +995,7 @@ int APS5_VABI sysarch(int operation, void* parameters) {
     }
     const bool i386 = operation == i386GetFsBase || operation == i386GetGsBase;
     if (!i386 && operation != getFsBase && operation != getGsBase && operation != setGsBase)
-        NotImplemented_nid_no_patch(__func__);
+        NotImplemented_nid_no_patch(("sysarch: operation " + std::to_string(operation)).c_str());
 #if (defined(__linux__) || defined(_WIN32)) && defined(__x86_64__)
     if (parameters == nullptr) {
         *__error_nid_postfix() = guestFault;
@@ -1020,7 +1020,7 @@ int APS5_VABI sysarch(int operation, void* parameters) {
     }
     const bool fs = operation == getFsBase || operation == i386GetFsBase;
 #ifdef _WIN32
-    if (fs) NotImplemented_nid_no_patch(__func__);
+    if (fs) NotImplemented_nid_no_patch(("sysarch: operation " + std::to_string(operation)).c_str());
     base = GuestGsGet_nid_no_patch();
 #else
     if (::syscall(SYS_arch_prctl, fs ? ARCH_GET_FS : ARCH_GET_GS, &base) != 0)
@@ -1041,7 +1041,7 @@ int APS5_VABI sysarch(int operation, void* parameters) {
     return 0;
 #else
     static_cast<void>(parameters);
-    NotImplemented_nid_no_patch(__func__);
+    NotImplemented_nid_no_patch(("sysarch: operation " + std::to_string(operation)).c_str());
     return 0;
 #endif
 }
