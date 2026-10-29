@@ -4,6 +4,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <array>
 #include <cstdint>
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
 
 namespace {
 
@@ -34,12 +35,12 @@ int Fault() {
 
 int ScanAfterCaughtSignal(int nfds, void* readfds, void* writefds, void* exceptfds, const Timeval* wait) {
     const bool validWait = wait == nullptr || (wait->seconds >= 0 && wait->microseconds >= 0 && wait->microseconds < 1000000);
-    if (nfds < 0 || nfds > DescriptorLimit || !validWait) return select_nid_postfix(nfds, readfds, writefds, exceptfds, wait);
+    if (nfds < 0 || nfds > DescriptorLimit || !validWait) return KernelSelectLegacy_nid_no_patch(nfds, readfds, writefds, exceptfds, wait);
     const std::size_t bytes = static_cast<std::size_t>((nfds + 63) / 64) * sizeof(std::uint64_t);
     SavedSet read{}, write{}, except{};
     if (!Save(read, readfds, bytes) || !Save(write, writefds, bytes) || !Save(except, exceptfds, bytes)) return Fault();
     const Timeval zero{};
-    const int result = select_nid_postfix(nfds, readfds, writefds, exceptfds, &zero);
+    const int result = KernelSelectLegacy_nid_no_patch(nfds, readfds, writefds, exceptfds, &zero);
     if (result != 0 || (wait != nullptr && wait->seconds == 0 && wait->microseconds == 0)) return result;
     if (!Restore(readfds, read, bytes) || !Restore(writefds, write, bytes) || !Restore(exceptfds, except, bytes)) return Fault();
     *__error_nid_postfix() = Eintr;
@@ -59,13 +60,13 @@ int APS5_VABI pselect_nid_postfix(int nfds, void* readfds, void* writefds, void*
         limit = {spec[0], spec[1] / 1000};
         wait = &limit;
     }
-    if (sigmask == nullptr) return select_nid_postfix(nfds, readfds, writefds, exceptfds, wait);
+    if (sigmask == nullptr) return KernelSelectLegacy_nid_no_patch(nfds, readfds, writefds, exceptfds, wait);
     GuestSignalSet mask{};
     if (!GuestCopyIn_nid_no_patch(&mask, sigmask, sizeof(mask))) return Fault();
     GuestSignalSet previous{};
     const bool caught = SetSignalMaskCatching_nid_no_patch(&mask, &previous) != 0;
     const int result = caught ? ScanAfterCaughtSignal(nfds, readfds, writefds, exceptfds, wait)
-                              : select_nid_postfix(nfds, readfds, writefds, exceptfds, wait);
+                              : KernelSelectLegacy_nid_no_patch(nfds, readfds, writefds, exceptfds, wait);
     const int error = *__error_nid_postfix();
     sigprocmask_nid_postfix(SetMask, &previous, nullptr);
     *__error_nid_postfix() = error;

@@ -12,6 +12,7 @@
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 
 #include <algorithm>
 #include <array>
@@ -355,7 +356,43 @@ static int SelectDescriptors(int nfds, void* readfds, void* writefds, void* exce
     }
 }
 
-int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
+static int SelectAdmitted(int nfds, void* readfds, void* writefds, void* exceptfds, const GuestTimeval* limit) {
+    if (limit && (limit->seconds < 0 || limit->microseconds < 0 || limit->microseconds >= 1000000)) {
+        *__error_nid_postfix() = GuestEinval;
+        return -1;
+    }
+    const auto deadline = limit ? std::optional{KernelSocketSelect::DeadlineAfter(std::chrono::steady_clock::now(), limit->seconds, limit->microseconds)}
+        : std::optional<std::chrono::steady_clock::time_point>{};
+    std::vector<GuestPollDescriptor> requested;
+    for (int descriptor = 0; descriptor < nfds; ++descriptor) {
+        short events = 0;
+        if (DescriptorSet(readfds, descriptor)) events |= KernelSocketPoll::Readable;
+        if (DescriptorSet(writefds, descriptor)) events |= KernelSocketPoll::Writable;
+        if (DescriptorSet(exceptfds, descriptor)) events |= KernelSocketPoll::Urgent;
+        if (events) requested.push_back({descriptor, events, 0});
+    }
+    const int result = KernelPollDescriptors_nid_no_patch(requested.data(), static_cast<std::uint32_t>(requested.size()), deadline, true);
+    if (result < 0) return result;
+    for (const auto& entry : requested) {
+        if ((entry.revents & KernelSocketPoll::Unknown) == 0) continue;
+        *__error_nid_postfix() = GuestEbadf;
+        return -1;
+    }
+    int ready = 0;
+    for (const auto& entry : requested) {
+        const short events = KernelSocketPoll::SelectEvents(entry.events, entry.revents);
+        if (events & KernelSocketPoll::Readable) ++ready;
+        else ClearDescriptor(readfds, entry.descriptor);
+        if (events & KernelSocketPoll::Writable) ++ready;
+        else ClearDescriptor(writefds, entry.descriptor);
+        if (events & KernelSocketPoll::Urgent) ++ready;
+        else ClearDescriptor(exceptfds, entry.descriptor);
+    }
+    ClearDescriptorsFrom(nfds, readfds, writefds, exceptfds);
+    return ready;
+}
+
+static int SelectWithCopies(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout, bool admitted) {
     GuestTimeval limit{};
     if (timeout != nullptr && !GuestCopyIn_nid_no_patch(&limit, timeout, sizeof(limit))) {
         *__error_nid_postfix() = GuestEfault;
@@ -377,7 +414,8 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         }
         local[index] = sets[index].data();
     }
-    const int result = SelectDescriptors(nfds, local[0], local[1], local[2], timeout != nullptr ? &limit : nullptr);
+    const int result = admitted ? SelectAdmitted(nfds, local[0], local[1], local[2], timeout != nullptr ? &limit : nullptr)
+        : SelectDescriptors(nfds, local[0], local[1], local[2], timeout != nullptr ? &limit : nullptr);
     if (result < 0) return result;
     for (int index = 0; index < 3; ++index) {
         if (local[index] != nullptr && !GuestCopyOut_nid_no_patch(guest[index], local[index], bytes)) {
@@ -386,6 +424,14 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         }
     }
     return result;
+}
+
+int KernelSelectLegacy_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
+    return SelectWithCopies(nfds, readfds, writefds, exceptfds, timeout, false);
+}
+
+int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
+    return ThreadCancel::Io([&] { return SelectWithCopies(nfds, readfds, writefds, exceptfds, timeout, true); }, false);
 }
 
 }

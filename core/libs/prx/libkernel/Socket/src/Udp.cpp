@@ -2118,11 +2118,9 @@ int APS5_VABI sendfile_nid_postfix(int file, int descriptor, std::int64_t offset
         if (const int error = SendIovecs(*socket, headers->trailers, headers->trailerCount, sent)) return finish(error);
     return finish(0);
 }
-static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count, int timeout) {
-    if (timeout < -1) return Fail(22);
+int KernelPollDescriptors_nid_no_patch(GuestPollDescriptor* descriptors, std::uint32_t count,
+    std::optional<std::chrono::steady_clock::time_point> deadline, bool selected) {
     if (count && !descriptors) return Fail(14);
-    const auto deadline = timeout < 0 ? std::optional<std::chrono::steady_clock::time_point>{} :
-        std::optional{std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout)};
     std::atomic<NativeSocket> wakeSocket{Invalid};
     const auto interrupt = [](void* opaque) noexcept {
         const auto socket = static_cast<std::atomic<NativeSocket>*>(opaque)->load();
@@ -2149,6 +2147,9 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         std::vector<std::uint32_t> owners;
         std::vector<std::uint32_t> pipes;
         std::vector<std::uint32_t> kqueues;
+#ifndef _WIN32
+        std::vector<std::uint32_t> hosts;
+#endif
         int ready = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
@@ -2208,10 +2209,13 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
     #ifdef _WIN32
                 short revents = 0;
                 if (!PipeReadiness(entry.descriptor, entry.events, revents))
-    #else
-                if (!IsPipe(entry.descriptor, entry.events))
-    #endif
                     throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is neither a socket, a pipe, a file, a directory nor a kqueue");
+    #else
+                if (!IsPipe(entry.descriptor, selected ? static_cast<short>(entry.events & ~GuestPollWritable) : entry.events)) {
+                    if (selected) { hosts.push_back(i); continue; }
+                    throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is neither a socket, a pipe, a file, a directory nor a kqueue");
+                }
+    #endif
                 pipes.push_back(i);
                 continue;
             }
@@ -2223,8 +2227,17 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
             owners.push_back(i);
             held.push_back(std::move(owner));
         }
-    #ifndef _WIN32
         const std::size_t socketCount = native.size();
+    #ifndef _WIN32
+        for (const auto index : hosts) {
+            NativePollDescriptor request{};
+            request.fd = descriptors[index].descriptor;
+            for (const auto& flag : RequestFlags)
+                if (descriptors[index].events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
+            native.push_back(request);
+            owners.push_back(index);
+        }
+        const std::size_t pipeStart = native.size();
         for (const auto index : pipes) {
             NativePollDescriptor request{};
             request.fd = descriptors[index].descriptor;
@@ -2239,10 +2252,10 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
             auto& entry = descriptors[owners[i]];
             if (admitted.Retired(entry.descriptor)) { entry.revents = GuestPollInvalid; return; }
     #if defined(_WIN32) || defined(__APPLE__)
-            if (!pipe) native[i].revents = ClosedStreamEvents(entry.descriptor, native[i].revents, native[i].events);
+            if (i < socketCount) native[i].revents = ClosedStreamEvents(entry.descriptor, native[i].revents, native[i].events);
     #endif
             short revents = native[i].revents;
-            if (!pipe && (entry.events & GuestPollPriority) && (revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) {
+            if (i < socketCount && (entry.events & GuestPollPriority) && (revents & NativePollPriority) == 0 && UrgentPending(native[i].fd)) {
                 revents = static_cast<short>(revents | NativePollPriority | POLLRDBAND);
             }
             for (const auto& flag : RequestFlags)
@@ -2250,11 +2263,11 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                     entry.revents = static_cast<short>(entry.revents | flag.guest);
             for (const auto& flag : StatusFlags)
                 if (revents & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
-            if (pipe && (entry.revents & GuestPollError)) entry.revents = static_cast<short>((entry.revents & ~GuestPollError) | GuestPollHangUp);
-            if (pipe && (entry.revents & GuestPollHangUp))
+            if (!selected && pipe && (entry.revents & GuestPollError)) entry.revents = static_cast<short>((entry.revents & ~GuestPollError) | GuestPollHangUp);
+            if (!selected && pipe && (entry.revents & GuestPollHangUp))
                 entry.revents = static_cast<short>((entry.revents & ~GuestPollWritable) | (entry.events & GuestPollReadable));
     #ifndef _WIN32
-            if (entry.revents & GuestPollHangUp) entry.revents = static_cast<short>(entry.revents & ~GuestPollWritable);
+            if (!selected && (entry.revents & GuestPollHangUp)) entry.revents = static_cast<short>(entry.revents & ~GuestPollWritable);
     #endif
             if (entry.revents) ++ready;
         };
@@ -2362,12 +2375,12 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
     #ifdef _WIN32
                 for (std::size_t i = 0; i < nativeCount; ++i) collect(i, false);
     #else
-                for (std::size_t i = 0; i < nativeCount; ++i) collect(i, i >= socketCount);
+                for (std::size_t i = 0; i < nativeCount; ++i) collect(i, i >= pipeStart);
     #endif
                 int result = 0;
                 for (std::uint32_t i = 0; i < count; ++i)
-                    if (descriptors[i].revents) ++result;
-                return result;
+                    if (selected ? KernelSocketPoll::SelectEvents(descriptors[i].events, descriptors[i].revents) != 0 : descriptors[i].revents != 0) ++result;
+                if (!selected || result || expired) return result;
             }
             if (partial) return std::nullopt;
         }
@@ -2385,7 +2398,9 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         std::vector<GuestPollDescriptor> local(count);
         const auto bytes = local.size() * sizeof(GuestPollDescriptor);
         if (count && !GuestCopyIn_nid_no_patch(local.data(), descriptors, bytes)) return Fail(14);
-        const int result = PollDescriptors(local.data(), count, timeout);
+        const auto deadline = timeout < 0 ? std::optional<std::chrono::steady_clock::time_point>{} :
+            std::optional{std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout)};
+        const int result = KernelPollDescriptors_nid_no_patch(local.data(), count, deadline, false);
         if (result >= 0 && count && !GuestCopyOut_nid_no_patch(descriptors, local.data(), bytes)) return Fail(14);
         return result;
     }, false);

@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <chrono>
+#include <optional>
 #include <memory>
 
 namespace KernelSocketPoll {
@@ -9,6 +11,14 @@ constexpr short Writable = 0x4;
 constexpr short Error = 0x8;
 constexpr short HangUp = 0x10;
 constexpr short Unknown = 0x20;
+
+inline short SelectEvents(short events, short returned) {
+    short ready = static_cast<short>(returned & Unknown);
+    if ((events & Readable) && (returned & (Readable | HangUp | Error))) ready |= Readable;
+    if ((events & Writable) && (returned & (Writable | Error))) ready |= Writable;
+    if ((events & Urgent) && (returned & Urgent)) ready |= Urgent;
+    return ready;
+}
 
 struct Entry {
     int descriptor;
@@ -49,3 +59,8 @@ extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number);
 extern "C" void KernelSetPollWaitHookForTest_nid_no_patch(void (*hook)(int));
 
 extern "C" void KernelSetSocketDuplicateHookForTest_nid_no_patch(void (*hook)());
+
+struct GuestPollDescriptor;
+extern "C" int KernelPollDescriptors_nid_no_patch(GuestPollDescriptor* descriptors, std::uint32_t count,
+    std::optional<std::chrono::steady_clock::time_point> deadline, bool selected);
+extern "C" int KernelSelectLegacy_nid_no_patch(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout);

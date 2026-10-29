@@ -2,6 +2,7 @@
 #include "prx/libSceNet/libSceNet.hpp"
 #include "prx/libkernel/libkernel.hpp"
 #include <cstdint>
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
@@ -200,7 +201,7 @@ int APS5_VABI sceSpPthreadSetprio(Pthread thread, int prio) {
 }
 
 int APS5_VABI sceSpSelect(int nfds, void* readfds, void* writefds, void* exceptfds, const void* timeout) {
-    return select_nid_postfix(nfds, readfds, writefds, exceptfds, timeout);
+    return KernelSelectLegacy_nid_no_patch(nfds, readfds, writefds, exceptfds, timeout);
 }
 
 }

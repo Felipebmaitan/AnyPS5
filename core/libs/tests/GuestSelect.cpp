@@ -9,6 +9,10 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 struct GuestTimeval {
     std::int64_t seconds;
@@ -131,7 +135,39 @@ static void BadPointersFault() {
     Require(readOnly[0] == 0x2);
 }
 
+static void NativeReadiness() {
+#ifndef _WIN32
+    const int device = ::open("/dev/null", O_RDONLY);
+    Require(device >= 0 && device < GuestDescriptorLimit);
+    GuestDescriptorSet read{}, write{}, except{};
+    const GuestTimeval zero{};
+    Require(SelectAll(device, read, write, except, zero) == 2);
+    Require(read.Has(device) && write.Has(device) && !except.Has(device));
+    Require(::close(device) == 0);
+    int pipe[2];
+    Require(pipe_nid_postfix(pipe) == 0);
+    write = {};
+    write.Add(pipe[0]);
+    Require(select_nid_postfix(pipe[0] + 1, nullptr, write.words.data(), nullptr, &zero) == 0);
+    Require(close_nid_postfix(pipe[0]) == 0);
+    write = {};
+    write.Add(pipe[1]);
+    Require(select_nid_postfix(pipe[1] + 1, nullptr, write.words.data(), nullptr, &zero) == 1 && write.Has(pipe[1]));
+    Require(close_nid_postfix(pipe[1]) == 0);
+#endif
+    int closed[2];
+    Require(pipe_nid_postfix(closed) == 0 && close_nid_postfix(closed[1]) == 0);
+    GuestDescriptorSet urgent{};
+    urgent.Add(closed[0]);
+    const GuestTimeval limit{0, 20000};
+    const auto start = std::chrono::steady_clock::now();
+    Require(select_nid_postfix(closed[0] + 1, nullptr, nullptr, urgent.words.data(), &limit) == 0);
+    Require(!urgent.Has(closed[0]) && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(20));
+    Require(close_nid_postfix(closed[0]) == 0);
+}
+
 int main() {
+    NativeReadiness();
     BadPointersFault();
     for (const int descriptor : {0, 1, 2}) StandardDescriptorFile(descriptor);
     Kqueues();

@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "AppArchiveFixture.hpp"
+#include "prx/libSceSpSysCallWrapper/libSceSpSysCallWrapper.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
@@ -74,6 +75,32 @@ struct State {
     std::atomic<long> nativeId{0};
 #endif
 };
+enum class WaitApi { Poll, Select, Legacy };
+static WaitApi waitApi = WaitApi::Poll;
+static int Multiplex(State& state) {
+    if (waitApi == WaitApi::Poll) return poll_nid_postfix(state.descriptors.data(), static_cast<std::uint32_t>(state.descriptors.size()), state.timeout);
+    std::array<std::uint64_t, 16> read{}, write{}, except{};
+    int count = 0;
+    for (const auto& entry : state.descriptors) {
+        Require(entry.descriptor >= 0 && entry.descriptor < 1024, "select fixture descriptor range");
+        count = std::max(count, entry.descriptor + 1);
+        const auto bit = std::uint64_t{1} << (entry.descriptor % 64);
+        if (entry.events & 1) read[entry.descriptor / 64] |= bit;
+        if (entry.events & 4) write[entry.descriptor / 64] |= bit;
+        if (entry.events & 2) except[entry.descriptor / 64] |= bit;
+    }
+    const std::array<std::int64_t, 2> limit{state.timeout / 1000, (state.timeout % 1000) * 1000};
+    const int result = waitApi == WaitApi::Legacy ? sceSpSelect(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : limit.data())
+        : select_nid_postfix(count, read.data(), write.data(), except.data(), state.timeout < 0 ? nullptr : limit.data());
+    if (result >= 0) {
+        for (auto& entry : state.descriptors) {
+            const auto bit = std::uint64_t{1} << (entry.descriptor % 64);
+            entry.revents = static_cast<short>(((read[entry.descriptor / 64] & bit) ? 1 : 0) |
+                ((write[entry.descriptor / 64] & bit) ? 4 : 0) | ((except[entry.descriptor / 64] & bit) ? 2 : 0));
+        }
+    }
+    return result;
+}
 static State* observed = nullptr;
 static void APS5_VABI SignalHandler(int, void*) {
     observed->signals.fetch_add(1);
@@ -108,9 +135,10 @@ static void* APS5_VABI Poller(void* opaque) {
     state.entered.store(true);
     if (state.pending) Require(Observe([&] { return state.release.load(); }), "release pending poll");
     if (state.jumpOnSignal && setjmp_nid_postfix(state.jump.data()) != 0) state.result = -3;
-    else state.result = poll_nid_postfix(state.descriptors.data(), static_cast<std::uint32_t>(state.descriptors.size()), state.timeout);
+    else state.result = Multiplex(state);
     state.error = *__error_nid_postfix();
     state.returned.store(true);
+    if (waitApi == WaitApi::Legacy) scePthreadTestcancel();
     if (state.disabled) {
         Require(state.result == (state.descriptors.empty() ? 0 : 1), "disabled poll lost completion");
         Require(Observe([&] { return state.release.load(); }), "observe cancellation submitted before enabling");
@@ -777,7 +805,8 @@ static void Run(const std::string& transport, const std::string& scenario) {
     if (state.cancelOnTimeout) state.timeout = 50;
     if (scenario == "timeout" || (empty && state.disabled)) state.timeout = 100;
     if (scenario == "zero" || scenario == "invalid") state.timeout = 0;
-    if (scenario == "invalid") state.descriptors.push_back({100000, 1, -1});
+    if (waitApi == WaitApi::Legacy) state.timeout = 0;
+    if (scenario == "invalid") state.descriptors.push_back({waitApi == WaitApi::Poll ? 100000 : 1023, 1, -1});
     if (scenario == "duplicate") state.descriptors.push_back(state.descriptors.front());
     if (scenario == "nonblocking") Require(fcntl_nid_postfix(state.descriptors.front().descriptor, 4, 4) == 0, "nonblocking");
     int extra[2]{-1, -1};
@@ -855,22 +884,32 @@ static void Run(const std::string& transport, const std::string& scenario) {
         Require(sceKernelRemoveExceptionHandler(30) == 0, "remove signal handler");
     }
     if (scenario == "complete" || scenario == "duplicate") {
-        Require(state.result == (scenario == "duplicate" ? 2 : 1), "readiness count");
+        Require(state.result == (scenario == "duplicate" && waitApi == WaitApi::Poll ? 2 : 1), "readiness count");
         for (const auto& entry : state.descriptors) Require(entry.revents == 1, "readiness flags");
     }
     if (scenario == "timeout" || scenario == "zero") Require(state.result == 0, "timeout result");
     if (scenario == "timeout") Require(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(100), "timeout returned early");
-    if (race && result != GUEST_CANCELED) Require(state.result == 1 && state.descriptors.front().revents == (scenario == "race" ? 1 : 0x20), "race lost result");
+    if (race && result != GUEST_CANCELED) {
+        if (scenario == "close_cancel" && waitApi == WaitApi::Select) Require(state.result == -1 && state.error == 9, "select race lost retirement");
+        else Require(state.result == 1 && state.descriptors.front().revents == (scenario == "race" ? 1 : 0x20), "race lost result");
+    }
     if (result == GUEST_CANCELED && !state.disabled)
         for (const auto& entry : state.descriptors) Require(entry.revents == -1, "cancellation copied partial event set");
-    if (scenario == "invalid") Require(state.result == 1 && state.descriptors.back().revents == 0x20, "invalid descriptor");
-    if (scenario == "close" && net)
+    if (scenario == "invalid") {
+        if (waitApi == WaitApi::Poll) Require(state.result == 1 && state.descriptors.back().revents == 0x20, "invalid descriptor");
+        else Require(state.result == -1 && state.error == 9 && state.descriptors.back().revents == -1, "select invalid descriptor");
+    }
+    if (waitApi == WaitApi::Select && (scenario == "close" || scenario == "reuse"))
+        Require((state.result == -1 && state.error == 9 && state.descriptors.front().revents == -1) ||
+            (net && state.result == 1 && state.descriptors.front().revents == 1), "select retirement or borrowed shutdown");
+    else if (scenario == "close" && net)
         Require(state.result == 1 && (state.descriptors.front().revents & (1 | 0x10 | 0x20)) != 0, "borrowed close must report shutdown or retirement");
     else if (scenario == "close" || scenario == "reuse") Require(state.result >= 1 && state.descriptors.front().revents == 0x20, "closed admission must report POLLNVAL");
     if (scenario == "reuse") {
         char byte = 0;
         Require(read_nid_postfix(state.descriptors.front().descriptor, &byte, 1) == 1 && byte == 'n', "replacement was consumed");
     }
+    if (waitApi == WaitApi::Legacy) Require(state.returned.load() && state.result == 0, "sceSpSelect consumed POSIX cancellation");
     KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
     Require(scePthreadKeyDelete(state.key) == 0, "delete key");
     if (!empty && scenario != "close" && scenario != "close_cancel") Require(close_nid_postfix(state.descriptors.front().descriptor) == 0, "close input");
@@ -895,7 +934,8 @@ static std::size_t Resources() {
 }
 
 int main(int argc, char** argv) {
-    Require(argc == 3, "transport and scenario required");
+    Require(argc == 3 || argc == 4, "transport and scenario required");
+    if (argc == 4) waitApi = std::string(argv[3]) == "select" ? WaitApi::Select : WaitApi::Legacy;
     std::mutex mutex;
     std::condition_variable changed;
     bool finished = false;
