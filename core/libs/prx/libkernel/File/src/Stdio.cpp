@@ -283,6 +283,10 @@ std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descr
         changed.WaitUntil(sleep, TimedWait::DeadlineNanos(1000));
     }
 }
+static bool BrokenPipeError(DWORD error) {
+    return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA || error == ERROR_PIPE_NOT_CONNECTED;
+}
+
 std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t bytes) {
     const auto handle = WindowsDescriptorHandle_nid_no_patch(descriptor);
     const auto type = GetFileType(handle);
@@ -291,7 +295,7 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
         if (result < 0 && ThreadCancel::IoActive()) {
             if (_doserrno == ERROR_OPERATION_ABORTED) errno = EINTR;
             else if (type == FILE_TYPE_PIPE && errno == ENOSPC && _doserrno == 0) errno = EAGAIN;
-            else if (type == FILE_TYPE_PIPE && (_doserrno == ERROR_BROKEN_PIPE || _doserrno == ERROR_NO_DATA)) errno = EPIPE;
+            else if (type == FILE_TYPE_PIPE && BrokenPipeError(_doserrno)) errno = EPIPE;
         }
         return result;
     };
@@ -301,7 +305,7 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
     if (pipe && ThreadCancel::Native([&] { return GetNamedPipeHandleStateW(handle, &mode, nullptr, nullptr, nullptr, nullptr, 0) ? 0 : -1; }) < 0) {
         const auto error = GetLastError();
         if (error == ERROR_ACCESS_DENIED) return nativeWrite();
-        errno = ThreadCancel::IoInterrupted() ? EINTR : error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ? EPIPE : EIO;
+        errno = ThreadCancel::IoInterrupted() ? EINTR : BrokenPipeError(error) ? EPIPE : EIO;
         return -1;
     }
     const bool nonblocking = pipe && (mode & PIPE_NOWAIT) != 0;
@@ -319,7 +323,12 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
             try {
                 checked = ThreadCancel::Native([&] { return GuestSockets::PipeWriteState(descriptor, &available, &eof, &writable) ? 0 : -1; });
             } catch (const std::runtime_error&) {
-                if (!ThreadCancel::IoInterrupted()) throw;
+                if (!ThreadCancel::IoInterrupted()) {
+                    const auto query = ThreadCancel::Native([&] { return GetNamedPipeHandleStateW(handle, &mode, nullptr, nullptr, nullptr, nullptr, 0) ? 0 : -1; });
+                    const auto error = GetLastError();
+                    if (query < 0 && BrokenPipeError(error)) { errno = EPIPE; return transferred == 0 ? -1 : transferred; }
+                    if (!ThreadCancel::IoInterrupted()) throw;
+                }
                 checked = -1;
             }
             if (checked < 0) { errno = ThreadCancel::IoInterrupted() ? EINTR : EBADF; return transferred == 0 ? -1 : transferred; }
@@ -338,7 +347,7 @@ std::int64_t File::IoWriteNative(int descriptor, const void* buffer, std::size_t
         const DWORD error = result < 0 ? GetLastError() : ERROR_SUCCESS;
         transferred += done;
         if (result < 0) {
-            errno = error == ERROR_OPERATION_ABORTED ? EINTR : error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ? EPIPE :
+            errno = error == ERROR_OPERATION_ABORTED ? EINTR : BrokenPipeError(error) ? EPIPE :
                 error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER ? EFAULT : error == ERROR_ACCESS_DENIED ? EBADF :
                 error == ERROR_DISK_FULL || error == ERROR_HANDLE_DISK_FULL ? ENOSPC : EIO;
             return transferred == 0 ? -1 : transferred;
