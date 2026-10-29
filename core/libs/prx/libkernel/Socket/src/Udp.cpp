@@ -249,6 +249,8 @@ int TransferForNativeOwner(KernelSocketPoll::NativeOwner* owner, bool send, void
 #endif
 }
 
+std::atomic<std::uint64_t> wakerCreations{0};
+
 struct Waker {
     NativeSocket value = Invalid;
     Waker() {
@@ -274,6 +276,7 @@ struct Waker {
             Close();
             throw std::runtime_error("equeue waker: loopback socket setup failed, guest errno " + std::to_string(error));
         }
+        ++wakerCreations;
     }
     ~Waker() { Close(); }
     void Close() {
@@ -311,7 +314,10 @@ int WaitTransferReady(Socket& socket, bool send, int milliseconds) {
         error = result < 0 ? WSAGetLastError() : 0;
         return result;
     }
-    Waker waker;
+    struct TransferWakerTag {};
+    auto& waker = HostThreadLocal<Waker, TransferWakerTag>();
+    char discarded[64];
+    while (::recv(waker.value, discarded, sizeof(discarded), 0) > 0) {}
     ThreadCancel::IoWait operation([](void* opaque) noexcept {
         auto& waker = *static_cast<Waker*>(opaque);
         const char byte = 0;
@@ -2353,4 +2359,8 @@ std::int64_t APS5_VABI _sendmsg_nid_postfix(int descriptor, const GuestMsghdr* m
 std::int64_t APS5_VABI _recvmsg_nid_postfix(int descriptor, GuestMsghdr* message, int flags) {
     return recvmsg_nid_postfix(descriptor, message, flags);
 }
+}
+
+extern "C" std::uint64_t GuestSocketWakerCreationsForTest_nid_no_patch() {
+    return wakerCreations.load();
 }

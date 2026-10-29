@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <array>
 #include <chrono>
@@ -102,7 +103,24 @@ static void RetainedTimeoutWithInterrupts() {
 }
 #endif
 
+#ifdef _WIN32
+static void TransferWakerReuse() {
+    const auto before = GuestSocketWakerCreationsForTest_nid_no_patch();
+    const int descriptor = socket_nid_postfix(2, 2, 0);
+    Require(descriptor >= 0 && Set(descriptor, ReceiveTimeout, 0, 2000) == 0);
+    char byte = '?';
+    for (int attempt = 0; attempt != 2; ++attempt) {
+        Require(Fails(recv_nid_postfix(descriptor, &byte, 1, 0), WouldBlock));
+        Require(byte == '?' && GuestSocketWakerCreationsForTest_nid_no_patch() == before + 1);
+    }
+    Require(close_nid_postfix(descriptor) == 0);
+}
+#endif
+
 int main() {
+#ifdef _WIN32
+    TransferWakerReuse();
+#endif
     const int datagram = socket_nid_postfix(2, 2, 0);
     std::array<std::uint8_t, 16> own{16, 2, 0, 0, 127, 0, 0, 1};
     Require(datagram >= 0 && bind_nid_postfix(datagram, own.data(), own.size()) == 0);
