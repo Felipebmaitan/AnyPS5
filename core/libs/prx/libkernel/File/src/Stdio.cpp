@@ -259,6 +259,14 @@ static std::shared_ptr<PositionedLock> PositionedMutex(int descriptor) {
 }
 File::PositionedTransferLock File::LockPositionedTransfer(int descriptor) {
     const auto entry = PositionedMutex(descriptor);
+    if (FileStreamCloseHookActive_nid_no_patch()) {
+        std::unique_lock lock(entry->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            FileStreamCloseEventForTest_nid_no_patch(descriptor, 1);
+            lock.lock();
+        }
+        return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex), std::move(lock));
+    }
     return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex));
 }
 std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descriptor) {
@@ -329,6 +337,7 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     const auto positioned = File::IoPositionedTransfer(descriptor);
     if (!positioned) return -1;
+    if (write) FileStreamCloseEventForTest_nid_no_patch(descriptor, 0);
     return NativePositionedTransfer(descriptor, buf, nbytes, offset, write);
 }
 std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbytes) {

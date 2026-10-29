@@ -91,12 +91,25 @@ static constexpr const char* FOPEN_MSG_OPEN_FAILED = "open failed";
 extern "C" int KeepHostStandardError_nid_no_patch();
 #endif
 
+extern "C" bool TryLockNativeStream_nid_no_patch(std::FILE* stream);
+
 class FileStream {
     class NativeLock {
         std::FILE* handle;
     public:
-        explicit NativeLock(std::FILE* handle) : handle(handle) {
+        explicit NativeLock(std::FILE* handle, bool closing = false) : handle(handle) {
             if (!handle) return;
+            if (closing && FileStreamCloseHookActive_nid_no_patch()) {
+#ifdef _WIN32
+                const bool acquired = TryLockNativeStream_nid_no_patch(handle);
+                const int descriptor = ::_fileno(handle);
+#else
+                const bool acquired = ::ftrylockfile(handle) == 0;
+                const int descriptor = ::fileno(handle);
+#endif
+                FileStreamCloseEventForTest_nid_no_patch(descriptor, acquired ? 3 : 2);
+                if (acquired) return;
+            }
 #ifdef _WIN32
             ::_lock_file(handle);
 #else
@@ -243,7 +256,7 @@ public:
             return Adopt(open(filename, mode));
         }
         auto* previous = GetHandle();
-        NativeLock streamLock(previous);
+        NativeLock streamLock(previous, true);
         _guest = {};
         guestError = false;
         randomDevice = false;
@@ -450,7 +463,7 @@ public:
 
     int Close() {
         GetHandle();
-        NativeLock streamLock(_handle);
+        NativeLock streamLock(_handle, true);
 #ifdef _WIN32
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
