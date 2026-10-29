@@ -7,6 +7,9 @@
 #include <atomic>
 
 extern "C" {
+void FileStreamSetCloseHookForTest_nid_no_patch(void (*hook)(int, int));
+bool FileStreamCloseHookActive_nid_no_patch();
+void FileStreamCloseEventForTest_nid_no_patch(int descriptor, int event);
 void DescriptorAccessInitialize_nid_no_patch(void* access, int descriptor);
 void DescriptorAccessLock_nid_no_patch(void* access);
 bool DescriptorAccessTryLock_nid_no_patch(void* access);

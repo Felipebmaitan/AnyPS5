@@ -195,3 +195,19 @@ void DescriptorWakeDestroy_nid_no_patch(void* registration) {
     std::lock_guard lock(self.operation->state->mutex);
     self.operation->wake = self.previous;
 }
+
+namespace {
+std::atomic<void (*)(int, int)> streamCloseHook{nullptr};
+}
+
+void FileStreamSetCloseHookForTest_nid_no_patch(void (*hook)(int, int)) {
+    streamCloseHook.store(hook);
+}
+
+bool FileStreamCloseHookActive_nid_no_patch() {
+    return streamCloseHook.load() != nullptr;
+}
+
+void FileStreamCloseEventForTest_nid_no_patch(int descriptor, int event) {
+    if (const auto hook = streamCloseHook.load()) hook(descriptor, event);
+}

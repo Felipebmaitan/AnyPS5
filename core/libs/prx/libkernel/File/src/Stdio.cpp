@@ -25,6 +25,7 @@
 #include "prx/libc/include/AppArchive.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libkernel/Semaphore/include/Ksem.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <atomic>
@@ -262,6 +263,14 @@ static std::shared_ptr<PositionedLock> PositionedMutex(int descriptor) {
 }
 File::PositionedTransferLock File::LockPositionedTransfer(int descriptor) {
     const auto entry = PositionedMutex(descriptor);
+    if (FileStreamCloseHookActive_nid_no_patch()) {
+        std::unique_lock lock(entry->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            FileStreamCloseEventForTest_nid_no_patch(descriptor, 1);
+            lock.lock();
+        }
+        return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex), std::move(lock));
+    }
     return PositionedTransferLock(std::shared_ptr<std::mutex>(entry, &entry->mutex));
 }
 std::optional<File::PositionedTransferLock> File::IoPositionedTransfer(int descriptor) {
@@ -409,6 +418,7 @@ static std::int64_t NativePositionedTransfer(int descriptor, void* buf, std::siz
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     const auto positioned = File::IoPositionedTransfer(descriptor);
     if (!positioned) return -1;
+    if (write) FileStreamCloseEventForTest_nid_no_patch(descriptor, 0);
     return NativePositionedTransfer(descriptor, buf, nbytes, offset, write);
 }
 std::int64_t File::WriteAtEnd(int descriptor, const void* buf, std::size_t nbytes) {
@@ -1017,6 +1027,7 @@ int APS5_VABI dup_nid_postfix(int d) {
     if (GuestSockets::IsOpen(d)) return GuestSockets::Duplicate(d);
     if (d < 0) return PosixFailure(GUEST_EBADF);
     if (IsKqueueDescriptor_nid_no_patch(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
+    if (IsKsemDescriptor(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a ksem id is not supported");
 #ifdef _WIN32
     const int duplicate = WithoutParameterHandler([d] { return ::_dup(d); });
     if (duplicate >= 0) File::DuplicateSharedMemoryDescriptor_nid_no_patch(d, duplicate);
@@ -1061,6 +1072,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     }
     const bool sourceIsRandom = File::IsRandomDevice(from);
     if (from != to && IsKqueueDescriptor_nid_no_patch(from)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
+    if (from != to && IsKsemDescriptor(from)) throw std::runtime_error(std::string(__func__) + ": duplicating a ksem id is not supported");
 #ifdef _WIN32
     if (WithoutParameterHandler([from] { return ::_get_osfhandle(from) == -1 ? -1 : 0; }) != 0) return PosixFailure(GUEST_EBADF);
     if (from == to) return to;
