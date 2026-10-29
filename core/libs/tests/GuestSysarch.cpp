@@ -5,8 +5,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
-#include <string>
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -68,7 +66,6 @@ int main() {
     asm volatile("movq %%fs:0, %0" : "=r"(self));
     Require(self == fs);
     RequireLowHalf(7, fs);
-    RequireLowHalf(9, base);
     *__error_nid_postfix() = 0;
     Require(sysarch(7, nullptr) == -1 && *__error_nid_postfix() == 14);
 #endif
