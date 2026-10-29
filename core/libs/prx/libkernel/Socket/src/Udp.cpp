@@ -902,22 +902,29 @@ int GuestSockets::DuplicateTo(int descriptor, int target) {
         const auto found = sockets.find(descriptor);
         if (found == sockets.end()) return Fail(9);
         if (target == descriptor) return target;
-        if (CopyNumberTo(descriptor, target) != 0) return -1;
-        const auto previous = sockets.find(target);
-        if (previous != sockets.end()) {
-            replaced = std::move(previous->second);
-            previous->second = found->second;
-        } else {
+        auto previous = sockets.find(target);
+        bool inserted = false;
+        if (previous == sockets.end()) {
             try {
-                sockets.emplace(target, found->second);
+                if (const auto hook = duplicateHook.load()) hook();
+                const auto entry = sockets.emplace(target, found->second);
+                previous = entry.first;
+                inserted = entry.second;
             } catch (const std::bad_alloc&) {
-                ReleaseNumber(target);
                 return Fail(12);
             }
         }
+        if (CopyNumberTo(descriptor, target) != 0) {
+            if (inserted) sockets.erase(previous);
+            return -1;
+        }
+        if (!inserted) {
+            replaced = std::move(previous->second);
+            previous->second = found->second;
+        }
     }
     KernelForgetSocket_nid_no_patch(target);
-    if (replaced) EqueueDescriptorClosed(target);
+    EqueueDescriptorClosed(target);
     {
         std::lock_guard lock(socketsMutex);
         closeOnExecDescriptors.erase(target);

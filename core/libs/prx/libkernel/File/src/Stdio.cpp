@@ -807,17 +807,29 @@ static bool HasNonDirectoryPrefix(const std::filesystem::path& native) {
     return false;
 }
 
+namespace {
+int DuplicateAdmitted(int descriptor);
+}
+
 int File::DuplicateFrom(int fd, int start) {
 #ifdef _WIN32
     GuestResourceLimit openFileLimit{};
     if (getrlimit_nid_postfix(8, &openFileLimit) == 0 && start >= openFileLimit.rlim_cur) return PosixFailure(GUEST_EINVAL);
+    const GuestDescriptorAccess source(fd, GuestDescriptorAccess::Mode::Read);
     std::vector<int> below;
-    int duplicate;
-    while ((duplicate = dup_nid_postfix(fd)) >= 0 && duplicate < start) below.push_back(duplicate);
+    int duplicate = -1;
+    try {
+        while ((duplicate = DuplicateAdmitted(fd)) >= 0 && duplicate < start) below.push_back(duplicate);
+    } catch (...) {
+        if (duplicate >= 0 && std::find(below.begin(), below.end(), duplicate) == below.end()) close_nid_postfix(duplicate);
+        for (const int descriptor : below) close_nid_postfix(descriptor);
+        throw;
+    }
     const int error = *__error_nid_postfix();
     for (const int descriptor : below) close_nid_postfix(descriptor);
     return duplicate < 0 ? PosixFailure(error) : duplicate;
 #else
+    const GuestDescriptorAccess source(fd, GuestDescriptorAccess::Mode::Read);
     const int duplicate = ::fcntl(fd, F_DUPFD, start);
     if (duplicate < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
     try {
@@ -1038,10 +1050,8 @@ int File::HostStandardError() {
     return g_hostStandardError.load();
 }
 
-extern "C" {
-
-int APS5_VABI dup_nid_postfix(int d) {
-    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Read);
+namespace {
+int DuplicateAdmitted(int d) {
     if (GuestSockets::IsOpen(d)) return GuestSockets::Duplicate(d);
     if (d < 0) return PosixFailure(GUEST_EBADF);
     if (IsKqueueDescriptor_nid_no_patch(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
@@ -1068,6 +1078,15 @@ int APS5_VABI dup_nid_postfix(int d) {
         throw;
     }
     return duplicate;
+}
+
+}
+
+extern "C" {
+
+int APS5_VABI dup_nid_postfix(int d) {
+    const GuestDescriptorAccess descriptorLock(d, GuestDescriptorAccess::Mode::Read);
+    return DuplicateAdmitted(d);
 }
 
 int APS5_VABI dup2_nid_postfix(int from, int to) {

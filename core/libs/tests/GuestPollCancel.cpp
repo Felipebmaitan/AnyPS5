@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
@@ -339,7 +340,8 @@ static void PublishReplacement(const std::string& scenario) {
     Pair(state, true);
     const int descriptor = state.descriptors.front().descriptor;
     const bool pipe = scenario == "publish_pipe";
-    const bool duplicate = scenario == "publish_dup";
+    const bool fcntlDuplicate = scenario == "publish_fcntl_dup";
+    const bool duplicate = scenario == "publish_dup" || fcntlDuplicate;
     const bool socketDuplicate = scenario == "publish_socket_dup";
     const bool queue = scenario == "publish_kqueue";
     const bool directory = scenario == "publish_directory";
@@ -383,7 +385,7 @@ static void PublishReplacement(const std::string& scenario) {
             next = pair[0];
             output = pair[1];
             Require(write_nid_postfix(output, "p", 1) == 1, "seed published pipe");
-        } else if (duplicate) next = dup_nid_postfix(source[0]);
+        } else if (duplicate) next = fcntlDuplicate ? fcntl_nid_postfix(source[0], 0, 0) : dup_nid_postfix(source[0]);
         else if (socketDuplicate) next = dup_nid_postfix(sourceSocket.descriptors[0].descriptor);
         else if (queue) {
             next = kqueue_nid_postfix();
@@ -412,6 +414,10 @@ static void PublishReplacement(const std::string& scenario) {
         if (output >= 0) Require(close_nid_postfix(output) == 0, "close published pipe output");
     });
     Require(Observe([&] { return close.publishBlocked.load() || schedule.entered.load(); }), "observe publication wait or premature poll admission");
+    if (fcntlDuplicate) {
+        GuestDescriptorAccess sourceAdmission(source[0], GuestDescriptorAccess::Mode::Update, std::defer_lock);
+        Require(!sourceAdmission.TryLock(), "fcntl publication released its source admission");
+    }
     close.release.store(true);
     schedule.release.store(true);
     closing.join();
@@ -488,6 +494,42 @@ static void DuplicateClose(bool fcntl) {
     KernelSetSocketDuplicateHookForTest_nid_no_patch(nullptr);
     Require(copy >= 0, "duplicate while close queued");
     Require(close_nid_postfix(copy) == 0 && close_nid_postfix(state.output) == 0, "close duplication resources");
+}
+
+static void DuplicateFailureHook() { throw std::bad_alloc(); }
+static void DuplicateAllocationFailure() {
+    State target, source;
+    Pair(target, true);
+    Pair(source, false);
+    const int descriptor = target.descriptors[0].descriptor;
+    Require(write_nid_postfix(target.output, "t", 1) == 1, "seed allocation-failure target");
+    KernelSetSocketDuplicateHookForTest_nid_no_patch(DuplicateFailureHook);
+    Require(dup2_nid_postfix(source.descriptors[0].descriptor, descriptor) == -1 && *__error_nid_postfix() == 12, "socket duplication allocation error");
+    KernelSetSocketDuplicateHookForTest_nid_no_patch(nullptr);
+    Require(DescriptorIsOpen_nid_no_patch(descriptor), "allocation failure closed duplication target");
+    GuestPollDescriptor request{descriptor, 1, -1};
+    Require(poll_nid_postfix(&request, 1, -1) == 1 && request.revents == 1, "allocation failure lost target readiness");
+    char byte = 0;
+    Require(sceNetRecv(descriptor, &byte, 1, 0) == 1 && byte == 't', "allocation failure replaced target owner");
+    Require(sceNetSocketClose(descriptor) == 0, "close allocation-failure target");
+    Require(dup2_nid_postfix(source.descriptors[0].descriptor, descriptor) == descriptor, "reuse allocation-failure target");
+    Require(write_nid_postfix(source.output, "s", 1) == 1, "seed allocation-failure replacement");
+    request.revents = -1;
+    Require(poll_nid_postfix(&request, 1, -1) == 1 && request.revents == 1, "allocation failure retained stale target owner");
+    Require(close_nid_postfix(descriptor) == 0 && close_nid_postfix(target.output) == 0, "close allocation-failure target resources");
+    Require(close_nid_postfix(source.descriptors[0].descriptor) == 0 && close_nid_postfix(source.output) == 0, "close allocation-failure source resources");
+}
+static void ReplaceQueueOwner() {
+    State source;
+    Pair(source, false);
+    const int queue = kqueue_nid_postfix();
+    Require(queue >= 0, "create replacement queue");
+    Require(dup2_nid_postfix(source.descriptors[0].descriptor, queue) == queue, "replace queue with socket");
+    Require(!IsKqueueDescriptor_nid_no_patch(queue), "socket replacement retained queue ownership");
+    Require(write_nid_postfix(source.output, "q", 1) == 1, "seed replacement socket");
+    GuestPollDescriptor request{queue, 1, -1};
+    Require(poll_nid_postfix(&request, 1, -1) == 1 && request.revents == 1, "poll replacement socket");
+    Require(close_nid_postfix(queue) == 0 && close_nid_postfix(source.descriptors[0].descriptor) == 0 && close_nid_postfix(source.output) == 0, "close queue replacement resources");
 }
 
 static void ReplacedNetOwner(bool socket) {
@@ -626,6 +668,8 @@ static void DescriptorCapacity() {
 
 static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
+    if (scenario == "duplicate_allocation_failure") { DuplicateAllocationFailure(); return; }
+    if (scenario == "replaced_queue_socket") { ReplaceQueueOwner(); return; }
     if (scenario.starts_with("stream_")) { StreamRetirement(scenario); return; }
     if (scenario == "duplicate_close" || scenario == "fcntl_duplicate_close") { DuplicateClose(scenario == "fcntl_duplicate_close"); return; }
     if (scenario.starts_with("publish_")) { PublishReplacement(scenario); return; }
