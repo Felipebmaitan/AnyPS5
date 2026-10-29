@@ -47,6 +47,11 @@ struct GuestDescriptorAccess::State {
             if (closing || operation->retireOnReplace) operation->Interrupt();
     }
 
+    void Refresh() noexcept {
+        for (auto* operation : operations)
+            if (operation->retireOnReplace) operation->Refresh();
+    }
+
     bool CanRead() const {
         return writer == std::this_thread::get_id() || (writer == std::thread::id{} && changesWaiting == 0);
     }
@@ -95,6 +100,11 @@ void DescriptorAccessLock_nid_no_patch(void* access) {
                     self.state->Interrupt(closing);
                     self.state->changed.wait_for(lock, std::chrono::milliseconds(1));
                 }
+            } else if (self.mode == GuestDescriptorAccess::Mode::Update) {
+                while (!self.state->CanChange()) {
+                    self.state->Refresh();
+                    self.state->changed.wait_for(lock, std::chrono::milliseconds(1));
+                }
             } else self.state->changed.wait(lock, [&] { return self.state->CanChange(); });
         } catch (...) {
             --self.state->changesWaiting;
@@ -124,6 +134,7 @@ bool DescriptorAccessTryLock_nid_no_patch(void* access) {
         const bool canChange = self.mode == GuestDescriptorAccess::Mode::Retire ?
             self.state->writer == std::thread::id{} || self.state->writer == std::this_thread::get_id() : self.state->CanChange();
         if (!canChange) {
+            if (self.mode == GuestDescriptorAccess::Mode::Update) self.state->Refresh();
             if (self.mode == GuestDescriptorAccess::Mode::Replace || self.mode == GuestDescriptorAccess::Mode::Publish)
                 self.state->Interrupt(self.mode == GuestDescriptorAccess::Mode::Publish);
             return false;
@@ -258,6 +269,12 @@ bool DescriptorOperationInterrupted_nid_no_patch() {
 
 void GuestDescriptorAccess::Operation::Interrupt() noexcept {
     interrupted.store(true);
+    for (auto* registration = wake; registration; registration = registration->previous)
+        registration->interrupt(registration->argument);
+}
+
+void GuestDescriptorAccess::Operation::Refresh() noexcept {
+    refresh.store(true);
     for (auto* registration = wake; registration; registration = registration->previous)
         registration->interrupt(registration->argument);
 }

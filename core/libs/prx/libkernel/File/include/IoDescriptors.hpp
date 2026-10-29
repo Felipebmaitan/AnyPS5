@@ -71,6 +71,12 @@ public:
         return found != entries.end() && (*found)->held;
     }
 
+    bool RefreshRequested() const {
+        for (const auto& entry : entries)
+            if (entry->operation && entry->operation->RefreshRequested()) return true;
+        return false;
+    }
+
     bool Pending() const {
         for (const auto& entry : entries)
             if (!entry->held && !Retired(entry->descriptor)) return true;

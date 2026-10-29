@@ -429,6 +429,42 @@ static void PublishReplacement(const std::string& scenario) {
     else if (!pipe && !duplicate && !socketDuplicate && !queue && !shared && !jit && !jitAlias) Require(unlink_nid_postfix(path.c_str()) == 0, "remove publication file");
 }
 
+static void StreamRetirement(const std::string& scenario) {
+    const auto path = "anyps5-poll-stream-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    auto* stream = fopen_nid_postfix(path.c_str(), "w+");
+    Require(stream != nullptr, "open poll stream");
+    const int descriptor = fileno_nid_postfix(stream);
+    State state;
+    observed = &state;
+    KernelSetPollWaitHookForTest_nid_no_patch(Hook);
+    GuestPollDescriptor request{descriptor, 0, -1};
+    std::atomic<int> result{-2};
+    std::thread polling([&] { result.store(poll_nid_postfix(&request, 1, -1)); });
+    Require(Observe([&] { return state.waiting.load(); }), "observe stream poll waiting");
+    if (scenario == "stream_update" || scenario == "stream_append") {
+        state.waiting.store(false);
+        if (scenario == "stream_append") Require(fcntl_nid_postfix(descriptor, 4, 8) == 0, "update append during poll");
+        else {
+            const GuestDescriptorAccess update(descriptor, GuestDescriptorAccess::Mode::Update);
+        }
+#ifdef _WIN32
+        Require(Observe([&] { return state.waiting.load(); }), "observe poll resumed after update");
+#else
+        if (scenario == "stream_update") Require(Observe([&] { return state.waiting.load(); }), "observe poll resumed after update");
+#endif
+        Require(result.load() == -2, "status update retired a valid descriptor");
+    }
+    if (scenario == "stream_reopen") {
+        Require(freopen_nid_postfix(path.c_str(), "r+", stream) == stream, "reopen while poll admitted");
+        Require(DescriptorIsOpen_nid_no_patch(fileno_nid_postfix(stream)), "reopened descriptor remains open");
+    } else Require(fclose_nid_postfix(stream) == 0, "close while poll admitted");
+    polling.join();
+    KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
+    Require(result.load() == 1 && request.revents == 0x20, "stream retirement did not invalidate poll");
+    if (scenario == "stream_reopen") Require(fclose_nid_postfix(stream) == 0, "close reopened stream");
+    Require(unlink_nid_postfix(path.c_str()) == 0, "remove stream poll file");
+}
+
 static std::atomic<bool> duplicateEntered{false}, duplicateReleased{false};
 static void DuplicateHook() {
     duplicateEntered.store(true);
@@ -590,6 +626,7 @@ static void DescriptorCapacity() {
 
 static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
+    if (scenario.starts_with("stream_")) { StreamRetirement(scenario); return; }
     if (scenario == "duplicate_close" || scenario == "fcntl_duplicate_close") { DuplicateClose(scenario == "fcntl_duplicate_close"); return; }
     if (scenario.starts_with("publish_")) { PublishReplacement(scenario); return; }
     if (scenario == "replaced_net_pipe" || scenario == "replaced_net_socket") { ReplacedNetOwner(scenario == "replaced_net_socket"); return; }

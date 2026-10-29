@@ -56,6 +56,7 @@ public:
         Operation(const Operation&) = delete;
         Operation& operator=(const Operation&) = delete;
         bool Interrupted() const { return interrupted.load(); }
+        bool RefreshRequested() const { return refresh.load(); }
         static bool CurrentInterrupted() { return DescriptorOperationInterrupted_nid_no_patch(); }
         class WakeRegistration {
         public:
@@ -85,8 +86,10 @@ public:
         Operation* previous = nullptr;
         WakeRegistration* wake = nullptr;
         std::atomic<bool> interrupted{false};
+        std::atomic<bool> refresh{false};
         bool retireOnReplace;
         void Interrupt() noexcept;
+        void Refresh() noexcept;
     };
     GuestDescriptorAccess(int descriptor, Mode mode)
         : GuestDescriptorAccess(descriptor, mode, std::defer_lock) { Lock(); }

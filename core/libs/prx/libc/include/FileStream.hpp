@@ -44,9 +44,9 @@ class ClosingDescriptor {
 public:
     ClosingDescriptor([[maybe_unused]] std::FILE* stream, int descriptor)
 #ifdef _WIN32
-        : _stream(stream), _access(descriptor, GuestDescriptorAccess::Mode::Change), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
+        : _stream(stream), _access(descriptor, GuestDescriptorAccess::Mode::Replace), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
 #else
-        : _access(descriptor, GuestDescriptorAccess::Mode::Change), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
+        : _access(descriptor, GuestDescriptorAccess::Mode::Replace), _closing(BeginClosingDescriptor_nid_no_patch(descriptor)) {}
 #endif
     ~ClosingDescriptor() { EndClosingDescriptor_nid_no_patch(_closing); }
     ClosingDescriptor(const ClosingDescriptor&) = delete;

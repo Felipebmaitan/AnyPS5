@@ -2128,6 +2128,9 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
     numbers.reserve(count);
     for (std::uint32_t index = 0; index < count; ++index) numbers.push_back(descriptors[index].descriptor);
     File::IoDescriptors admitted(std::move(numbers));
+    const auto refresh = [&] {
+        return admitted.RefreshRequested() && (!deadline || std::chrono::steady_clock::now() < *deadline);
+    };
     const auto attempt = [&]() -> std::optional<int> {
         wakeSocket.store(Invalid);
         if (!admitted.Acquire(interrupt, &wakeSocket)) return Fail(4);
@@ -2142,6 +2145,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         int ready = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            if (refresh()) return std::nullopt;
             auto& entry = descriptors[i];
             entry.revents = 0;
             if (entry.descriptor < 0) continue;
@@ -2176,6 +2180,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                 }
                 const bool vnode = admitted.WithOperation(entry.descriptor, [&] { return File::IsVnode(entry.descriptor); });
                 if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+                if (refresh()) return std::nullopt;
                 if (admitted.Retired(entry.descriptor)) {
                     entry.revents = GuestPollInvalid;
                     ++ready;
@@ -2187,6 +2192,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                     continue;
                 }
                 if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+                if (refresh()) return std::nullopt;
                 if (entry.descriptor <= 2) {
                     entry.revents = static_cast<short>(entry.descriptor == 0 ? 0 : entry.events & GuestPollWritable);
                     if (entry.revents) ++ready;
@@ -2279,6 +2285,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         bool probed = false;
         for (;;) {
             if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            if (refresh()) return std::nullopt;
             const bool invalid = retired();
             int checkedReady = 0;
             const bool urgent = anyUrgentPending();
@@ -2323,6 +2330,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
             if (slice != 0)
                 if (const auto hook = pollWaitHook.load()) hook(1);
             if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            if (refresh()) return std::nullopt;
             if (slice != 0 && deadline) {
                 const auto left = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now()).count();
                 slice = static_cast<int>(std::clamp<long long>(left, 0, sliced ? 1 : INT_MAX));
@@ -2337,6 +2345,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
             if (deadline && std::chrono::steady_clock::now() >= *deadline)
                 if (const auto hook = pollWaitHook.load()) hook(2);
             if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+            if (refresh()) return std::nullopt;
             int socketReady = 0;
             for (std::size_t index = 0; index < nativeCount; ++index)
                 if (native[index].revents) ++socketReady;
