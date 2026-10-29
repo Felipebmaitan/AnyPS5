@@ -983,4 +983,11 @@ int main(int argc, char** argv) {
     Require(sceRtcFormatRFC3339(ranges, &shifted, -1) == 0 && std::strcmp(ranges, "9999-12-31T23:59:00.00-00:01") == 0);
     Require(sceRtcInit() == 0);
     Require(sceRtcEnd() == 0);
+    for (const std::uint64_t value : {maxTick + 1, std::uint64_t{1} << 63, std::numeric_limits<std::uint64_t>::max()}) {
+        const RtcTick outOfRange{value};
+        Require(sceRtcSetCurrentTick(&outOfRange) == 0);
+        ranged = sentinel;
+        Require(sceRtcGetCurrentClockUtc(&ranged) == invalidValue && Equal(ranged, sentinel));
+        Require(sceRtcGetCurrentClockLocalTime(&ranged) == invalidValue && Equal(ranged, sentinel));
+    }
 }
