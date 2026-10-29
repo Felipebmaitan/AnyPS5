@@ -107,7 +107,9 @@ static void RetainedTimeoutWithInterrupts() {
 static void TransferWakerReuse() {
     const auto before = GuestSocketWakerCreationsForTest_nid_no_patch();
     const int descriptor = socket_nid_postfix(2, 2, 0);
-    Require(descriptor >= 0 && Set(descriptor, ReceiveTimeout, 0, 2000) == 0);
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(descriptor >= 0 && bind_nid_postfix(descriptor, address.data(), address.size()) == 0);
+    Require(Set(descriptor, ReceiveTimeout, 0, 2000) == 0);
     char byte = '?';
     for (int attempt = 0; attempt != 2; ++attempt) {
         Require(Fails(recv_nid_postfix(descriptor, &byte, 1, 0), WouldBlock));
