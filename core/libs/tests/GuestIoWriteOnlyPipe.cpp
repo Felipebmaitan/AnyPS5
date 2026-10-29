@@ -89,30 +89,33 @@ int main(int argc, char** argv) {
     std::int64_t available = 0;
     bool eof = false, writable = false;
     Require(GuestSockets::PipeWriteState(queryDescriptor, &available, &eof, &writable) && available > 0 && available < 1024 * 1024, "query finite pipe quota");
+    const bool attributes = scenario == "disconnected_attributes" || scenario == "disconnected_wait";
     HANDLE limited = INVALID_HANDLE_VALUE;
-    Require(DuplicateHandle(GetCurrentProcess(), client, GetCurrentProcess(), &limited, FILE_WRITE_DATA | SYNCHRONIZE, FALSE, 0), "retain minimal-access pipe client");
+    Require(DuplicateHandle(GetCurrentProcess(), client, GetCurrentProcess(), &limited, attributes ? 0 : FILE_WRITE_DATA | SYNCHRONIZE, FALSE, attributes ? DUPLICATE_SAME_ACCESS : 0), "retain pipe client");
     Require(::_close(queryDescriptor) == 0, "release pipe setup descriptor");
     client = limited;
     using Query = LONG (NTAPI*)(HANDLE, void*, void*, ULONG, int);
     const auto query = reinterpret_cast<Query>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile"));
     std::uintptr_t status[2]{};
     ACCESS_MASK access = 0;
-    Require(query && query(client, status, &access, sizeof(access), 8) >= 0 && (access & FILE_READ_ATTRIBUTES) == 0, "client unexpectedly has read-attribute access");
+    Require(query && query(client, status, &access, sizeof(access), 8) >= 0 && ((access & FILE_READ_ATTRIBUTES) != 0) == attributes, "client attribute rights differ");
     state.file = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(client), _O_WRONLY | _O_BINARY);
     Require(state.file >= 0, "adopt minimal pipe client");
     std::vector<char> fill(static_cast<std::size_t>(available) - (scenario == "nonblocking_partial" ? 1 : 0), 'f');
-    if (scenario != "complete") {
+    if (scenario != "complete" && scenario != "disconnected" && scenario != "disconnected_attributes") {
         DWORD count = 0;
         Require(WriteFile(client, fill.data(), static_cast<DWORD>(fill.size()), &count, nullptr) && count == fill.size(), "fill minimal pipe quota");
     }
+    if (scenario == "disconnected" || scenario == "disconnected_attributes") Require(DisconnectNamedPipe(server), "disconnect before write");
     Pthread writer{};
     Require(scePthreadCreate(&writer, nullptr, Writer, &state, "minimal-pipe") == 0, "start minimal pipe writer");
     Require(Observe([&] { return state.ready.load(); }), "minimal writer did not start");
-    const bool blocked = scenario == "cancel" || state.disabled || scenario == "close";
+    const bool blocked = scenario == "cancel" || state.disabled || scenario == "close" || scenario == "disconnected_wait";
     if (blocked && !state.disabled) Require(Observe([&] { std::lock_guard lock(writer->cancelLock); return writer->cancelIo != nullptr || state.done.load(); }), "minimal writer did not register");
     std::atomic<bool> closed{false};
     std::thread closer;
-    if (scenario == "close") closer = std::thread([&] { Require(close_nid_postfix(state.file) == 0, "close minimal pipe"); closed.store(true); });
+    if (scenario == "disconnected_wait") Require(DisconnectNamedPipe(server), "disconnect registered writer");
+    else if (scenario == "close") closer = std::thread([&] { Require(close_nid_postfix(state.file) == 0, "close minimal pipe"); closed.store(true); });
     else if (scenario == "cancel" || state.disabled) Require(scePthreadCancel(writer) == 0, "cancel minimal writer");
     bool woke = true;
     if (state.disabled) {
@@ -133,7 +136,8 @@ int main(int argc, char** argv) {
     std::printf("minimal pipe writer result %lld, error %d\n", static_cast<long long>(state.result), state.error);
     const bool canceled = scenario == "cancel" || state.disabled;
     Require(result == (canceled ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "minimal pipe join result");
-    if (scenario == "cancel") Require(!state.returned.load(), "blocked minimal writer returned before cancellation");
+    if (scenario.starts_with("disconnected")) Require(state.result == -1 && state.error == 32, "disconnected pipe did not report EPIPE");
+    else if (scenario == "cancel") Require(!state.returned.load(), "blocked minimal writer returned before cancellation");
     else if (scenario == "close") Require(state.result == -1 && state.error == 4, "minimal pipe close result");
     else if (scenario.starts_with("nonblocking")) {
         Require(state.result == -1 && state.error == 35, "minimal pipe nonblocking result");
