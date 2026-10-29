@@ -1545,6 +1545,32 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
     return !MetadataMoved(image, resource);
 }
 
+std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (disabled || stored == nullptr) return nullptr;
+    const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
+    const auto viewedBytes = DescribeSurface(viewed).guestBytes;
+    RequireNoMultisampleTarget(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), "a storage image access");
+    if (DepthSurfaceStorage(context, {}, viewed, 0) != nullptr) return nullptr;
+    if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), DepthPlaneScope::Overlapped));
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+    const bool profile = LookupOutcomes::Profiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto resource = StorageSurface(context, viewed);
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(storageCacheHeld);
+    if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
+    const auto it = findStorageByImage(cache, context.device, stored.get());
+    if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;
+    it->texture->Refresh();
+    cache.entries.splice(cache.entries.begin(), cache.entries, it);
+    TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+    return it->texture;
+}
+
 namespace {
 
 const char* roleName(ShaderRecompiler::DescriptorRole role) {
@@ -2165,6 +2191,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         // collects cost the same wherever they run.
         if (precollectImages()) phase(BuildPhase::Precollect);
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
+        requireGuestBuffers();
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         splitSets = SplitsSets(context, shaders);
@@ -2401,6 +2428,7 @@ void ShaderResources::buildComplete() {
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
+        requireGuestBuffers();
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
@@ -5623,6 +5651,7 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -5771,7 +5800,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest) continue;
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto address = override != moved.end() ? override->address : item.address;
+        const auto bytes = override != moved.end() ? override->size : item.size;
+        RequireNoMultisampleTarget(address, bytes, "a shader buffer access");
+    }
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    requireGuestBuffers();
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
 }

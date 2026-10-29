@@ -128,7 +128,7 @@ static bool IsSdkMmanSyscallStub(const std::vector<std::uint8_t>& code, std::siz
 }
 
 static ForbiddenInstruction ClassifyForbiddenInstruction(const std::vector<std::uint8_t>& codeSection, const std::size_t opcodeOffset, const std::size_t limit) {
-    if (opcodeOffset + 1 >= limit)
+    if (opcodeOffset >= limit || limit - opcodeOffset < 2u)
         return ForbiddenInstruction::None;
 
     const std::uint8_t byte0 = codeSection[opcodeOffset];
@@ -228,6 +228,8 @@ struct ActivePrefixes {
 
 static ActivePrefixes ActivePrefixesBefore(const std::vector<std::uint8_t>& code, const std::size_t opcode) {
     ActivePrefixes prefixes{false, 0, 0};
+    if (opcode > code.size())
+        return prefixes;
     std::size_t start = opcode;
     if (start > 0 && (code[start - 1] & 0xF0) == 0x40) {
         prefixes.Rex = code[start - 1];
@@ -247,6 +249,8 @@ static ActivePrefixes ActivePrefixesBefore(const std::vector<std::uint8_t>& code
 }
 
 static std::optional<std::uint64_t> ConstantRaxSetEndingAt(const std::vector<std::uint8_t>& code, const std::size_t end) {
+    if (end > code.size())
+        return std::nullopt;
     if (end >= 10 && code[end - 10] == 0x48 && code[end - 9] == 0xB8) {
         std::uint64_t value = 0;
         std::memcpy(&value, code.data() + end - 8, sizeof(value));
@@ -281,6 +285,8 @@ struct LowRaxWrite {
 };
 
 static std::optional<LowRaxWrite> ImmediateLowRaxWriteEndingAt(const std::vector<std::uint8_t>& code, const std::size_t end) {
+    if (end > code.size())
+        return std::nullopt;
     if (end >= 2 && code[end - 2] == 0xB0) {
         const ActivePrefixes prefixes = ActivePrefixesBefore(code, end - 2);
         if ((prefixes.Rex & 0x01) == 0)
@@ -295,6 +301,8 @@ static std::optional<LowRaxWrite> ImmediateLowRaxWriteEndingAt(const std::vector
 }
 
 static std::optional<std::uint64_t> ConstantSyscallNumberInBytes(const std::vector<std::uint8_t>& code, const std::size_t syscall) {
+    if (syscall > code.size())
+        return std::nullopt;
     using Step = std::tuple<std::size_t, std::uint64_t, std::uint64_t>;
     std::vector<Step> pending{{syscall, 0, 0}};
     std::set<Step> seen(pending.begin(), pending.end());
@@ -368,7 +376,7 @@ std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(const std::v
         recent.Push(match);
         if (match.Offset < codeSectionOffset) throw RelinkerException("Instruction match precedes code section offset", match.Offset);
         const std::size_t start = static_cast<std::size_t>(match.Offset - codeSectionOffset);
-        if (start > codeSection.size() || match.Length > codeSection.size() - start) throw RelinkerException("Instruction match exceeds code section", match.Offset);
+        if (start > limit || match.Length > limit - start) throw RelinkerException("Instruction match exceeds code section", match.Offset);
         const auto opcodeOffset = Codegen::DecodedInstruction{codeSection.data() + start, match.Length}.OpcodeOffset();
         const std::size_t opcode = start + opcodeOffset;
         const std::size_t spanLimit = std::min(limit, start + static_cast<std::size_t>(match.Length));
