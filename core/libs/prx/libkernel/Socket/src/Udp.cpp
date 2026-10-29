@@ -74,6 +74,7 @@ constexpr auto Invalid = -1;
 #endif
 int Fail(int error) { *__error_nid_postfix() = error; return -1; }
 constexpr int GuestSocketDescriptorLimit = 1024;
+thread_local void (*acceptObserver)() = nullptr;
 constexpr int GuestPeek = 0x2;
 constexpr int GuestWaitAll = 0x40;
 constexpr int GuestDontWait = 0x80;
@@ -1536,7 +1537,7 @@ int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const int error = NativeError();
     return Fail(error == 56 ? 22 : error);
 }
-int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* length) {
+static int Accept(int descriptor, void* address, std::uint32_t* length, std::shared_ptr<Socket>& accepted) {
     const auto listener = Lookup(descriptor);
     if (!listener) return -1;
     if (listener->type != 1 || (address && !length)) return Fail(22);
@@ -1551,7 +1552,7 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
     if (result < 0) return Fail(NativeError());
     Socket guard(native, listener->family, listener->type);
     try {
-        auto accepted = std::make_shared<Socket>(native, listener->family, listener->type);
+        accepted = std::make_shared<Socket>(native, listener->family, listener->type);
         guard.value = Invalid;
         if (listener->family == 28) accepted->options.tcpMaximumSegment = 1220;
         bool inheritNonblocking;
@@ -1574,12 +1575,31 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
             accepted->options.tcpFlags = listener->options.tcpFlags & 0x1000;
         }
         if (inheritNonblocking && SetNonBlocking(*accepted)) return -1;
-        const int acceptedDescriptor = Install(std::move(accepted));
-        if (acceptedDescriptor < 0) return -1;
         if (address) GuestAddress(peer, address, length);
-        return acceptedDescriptor;
+        return 0;
     } catch (const std::bad_alloc&) {
         return Fail(12);
+    }
+}
+int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* length) {
+    ThreadCancel::Check();
+    ThreadCancel::IoRestart restart(true);
+    for (;;) {
+        std::int64_t result;
+        {
+            ThreadCancel::IoPoint point(restart);
+            std::shared_ptr<Socket> accepted;
+            result = File::WithIoDescriptor(descriptor, [&](int descriptor) {
+                return Accept(descriptor, address, length, accepted);
+            });
+            if (result >= 0) {
+                restart.RetainResult(std::move(accepted));
+                if (acceptObserver) acceptObserver();
+            }
+        }
+        if (result >= 0) return Install(std::static_pointer_cast<Socket>(restart.ReleaseResult()));
+        if (ThreadCancel::Requested()) { restart.Clear(); ThreadCancel::Check(); }
+        if (!restart.Ready()) return static_cast<int>(result);
     }
 }
 std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std::uint64_t length, int flags) {
@@ -2363,4 +2383,8 @@ std::int64_t APS5_VABI _recvmsg_nid_postfix(int descriptor, GuestMsghdr* message
 
 extern "C" std::uint64_t GuestSocketWakerCreationsForTest_nid_no_patch() {
     return wakerCreations.load();
+}
+
+extern "C" void GuestSocketAcceptObserverForTest_nid_no_patch(void (*observer)()) {
+    acceptObserver = observer;
 }

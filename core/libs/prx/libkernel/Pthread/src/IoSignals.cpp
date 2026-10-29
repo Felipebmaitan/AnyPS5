@@ -38,6 +38,7 @@ struct IoRestart::State {
     std::uint32_t context;
     bool allowed;
     bool ready = false;
+    std::shared_ptr<void> result;
     std::vector<Descriptor> expected;
     State(State* previous, std::uintptr_t stack, bool allowed)
         : previous(previous), stack(stack), context(JumpBuffer::GuestContextCurrent_nid_no_patch()), allowed(allowed) {}
@@ -236,6 +237,9 @@ void IoRestart::Clear() {
 }
 
 bool IoRestart::Ready() const { return state->ready && IoRestartError(); }
+
+void IoRestart::RetainResult(std::shared_ptr<void> result) { state->result = std::move(result); }
+std::shared_ptr<void> IoRestart::ReleaseResult() { return std::move(state->result); }
 
 void BeginIoSignals(Pthread thread, IoRestart& restart, std::optional<TimedWait::DeliveryDeferral>& deferral) {
     if (current) {

@@ -6,6 +6,7 @@
 #include "prx/libc/include/DescriptorAccess.hpp"
 #include <cstdint>
 #include <cerrno>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -49,6 +50,8 @@ public:
     ~IoRestart();
     bool Ready() const;
     void Clear();
+    void RetainResult(std::shared_ptr<void> result);
+    std::shared_ptr<void> ReleaseResult();
     IoRestart(const IoRestart&) = delete;
     IoRestart& operator=(const IoRestart&) = delete;
 private:
