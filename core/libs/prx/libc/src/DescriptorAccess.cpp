@@ -238,9 +238,8 @@ void DescriptorOperationDestroy_nid_no_patch(void* operation) {
 }
 
 bool DescriptorOperationInterrupted_nid_no_patch() {
-    for (auto* current = GuestDescriptorAccess::Operation::current; current; current = current->previous)
-        if (current->Interrupted()) return true;
-    return false;
+    const auto* current = GuestDescriptorAccess::Operation::current;
+    return current && current->Interrupted();
 }
 
 void GuestDescriptorAccess::Operation::Interrupt() noexcept {

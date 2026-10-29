@@ -964,6 +964,11 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     }
     const int fd = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(handle->value));
     if (fd < 0) return fail(-fd);
+    GuestDescriptorAccess publication(fd, GuestDescriptorAccess::Mode::Change, std::defer_lock);
+    if (!publication.TryLock()) {
+        if (const auto hook = socketCloseHook.load()) hook(fd, 3);
+        publication.Lock();
+    }
     std::lock_guard lk(g_mutex);
     Sock s;
     s.family = family;
@@ -994,14 +999,12 @@ int APS5_VABI sceNetSocketClose(int s) {
         const auto it = g_socks.find(s);
         if (it != g_socks.end()) {
             native = it->second.native;
-            g_socks.erase(it);
-            for (auto& epoll : g_epoll_socks) epoll.second.erase(s);
             found = true;
         }
     }
     if (!found) {
-        descriptorLock.Drain(true);
         if (!GuestSocketIsOpen_nid_no_patch(s)) return fail(NET_EBADF);
+        descriptorLock.Drain(true);
         return close_nid_postfix(s) == 0 ? 0 : fail(*__error_nid_postfix());
     }
     descriptorLock.MarkChanged();
@@ -1014,7 +1017,13 @@ int APS5_VABI sceNetSocketClose(int s) {
     }
     if (const auto hook = socketCloseHook.load()) hook(s, 1);
     descriptorLock.Drain(false);
+    {
+        std::lock_guard lk(g_mutex);
+        g_socks.erase(s);
+        for (auto& epoll : g_epoll_socks) epoll.second.erase(s);
+    }
     KernelReleaseSocketNumber_nid_no_patch(s);
+    if (const auto hook = socketCloseHook.load()) hook(s, 2);
     g_cv.NotifyAll();
     return 0;
 }
@@ -1116,6 +1125,7 @@ int APS5_VABI sceNetAccept(int s, void* addr, uint32_t* addrlen) {
 #endif
     const int descriptor = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(connection.native->value));
     if (descriptor < 0) return fail(-descriptor);
+    const GuestDescriptorAccess publication(descriptor, GuestDescriptorAccess::Mode::Change);
     {
         std::lock_guard lk(g_mutex);
         g_socks.emplace(descriptor, connection);

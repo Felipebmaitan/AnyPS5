@@ -424,6 +424,7 @@ int Install(std::shared_ptr<Socket> socket) {
     socket->transfer = TransferForNativeOwner;
     const int number = ReserveNumber(socket->value);
     if (number < 0) return -1;
+    const GuestDescriptorAccess publication(number, GuestDescriptorAccess::Mode::Change);
     try {
         std::lock_guard lock(socketsMutex);
         sockets.insert_or_assign(number, std::move(socket));
@@ -2160,7 +2161,14 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                     if (entry.revents) ++ready;
                     continue;
                 }
-                if (File::IsVnode(entry.descriptor)) {
+                const bool vnode = admitted.WithOperation(entry.descriptor, [&] { return File::IsVnode(entry.descriptor); });
+                if (ThreadCancel::IoRequestInterrupted()) return Fail(4);
+                if (admitted.Retired(entry.descriptor)) {
+                    entry.revents = GuestPollInvalid;
+                    ++ready;
+                    continue;
+                }
+                if (vnode) {
                     entry.revents = static_cast<short>(entry.events & GuestPollVnodeReady);
                     if (entry.revents) ++ready;
                     continue;

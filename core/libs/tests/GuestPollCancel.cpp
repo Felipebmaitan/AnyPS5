@@ -209,12 +209,14 @@ struct CloseSchedule {
     int stage;
     std::atomic<int> entered{0};
     std::atomic<bool> paused{false};
+    std::atomic<bool> publishBlocked{false};
     std::atomic<bool> release{false};
 };
 static CloseSchedule* closeSchedule = nullptr;
 static void CloseHook(int descriptor, int stage) {
     auto& schedule = *closeSchedule;
     if (descriptor != schedule.descriptor) return;
+    if (stage == 3) { schedule.publishBlocked.store(true); return; }
     const int entry = stage == 0 ? schedule.entered.fetch_add(1) : schedule.entered.load() - 1;
     if (stage == schedule.stage && entry == 0) {
         schedule.paused.store(true);
@@ -279,6 +281,121 @@ static void BorrowedCloseReuse(const std::string& scenario) {
     Require(close_nid_postfix(state.output) == 0, "close peer");
 }
 
+static void ReusePublication() {
+    State state;
+    Pair(state, true);
+    const int descriptor = state.descriptors.front().descriptor;
+    std::vector<int> occupied;
+    do {
+        const int copy = dup_nid_postfix(state.output);
+        Require(copy >= 0, "fill publication descriptor holes");
+        occupied.push_back(copy);
+    } while (occupied.back() < descriptor);
+    CloseSchedule schedule{descriptor, 2};
+    closeSchedule = &schedule;
+    NetSetSocketCloseHookForTest_nid_no_patch(CloseHook);
+    std::thread closing([&] { Require(sceNetSocketClose(descriptor) == 0, "close publication predecessor"); });
+    Require(Observe([&] { return schedule.paused.load(); }), "observe released number before close completion");
+#ifndef _WIN32
+    const auto hole = std::find_if(occupied.begin(), occupied.end(), [&](int value) { return value < descriptor; });
+    Require(hole != occupied.end(), "native socket allocation hole");
+    Require(close_nid_postfix(*hole) == 0, "release native socket allocation hole");
+    occupied.erase(hole);
+#endif
+    int result = -2;
+    std::thread creating([&] {
+        const int next = sceNetSocket("publication", 2, 1, 0);
+        Require(next == descriptor, "reuse publication number");
+        result = sceNetSocketClose(next);
+    });
+    Require(Observe([&] { return schedule.publishBlocked.load() || schedule.entered.load() == 2; }), "observe publication admission or consumer snapshot");
+    schedule.release.store(true);
+    closing.join();
+    creating.join();
+    NetSetSocketCloseHookForTest_nid_no_patch(nullptr);
+    Require(result == 0, "old close invalidated the newly published socket generation");
+    for (const int copy : occupied) Require(close_nid_postfix(copy) == 0, "close publication filler");
+    Require(close_nid_postfix(state.output) == 0, "close publication peer");
+}
+
+struct ClassificationSchedule {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+};
+static ClassificationSchedule* classificationSchedule = nullptr;
+static void ClassificationHook(int stage) {
+    if (stage != 0) return;
+    classificationSchedule->entered.store(true);
+    Require(Observe([] { return classificationSchedule->release.load(); }), "release poll classification");
+}
+
+static void CloseClassification(bool borrowed, bool fileFirst) {
+    State state;
+    int pipe[2]{-1, -1};
+    std::FILE* file = nullptr;
+    if (borrowed) Pair(state, true);
+    else {
+        if (fileFirst) file = std::tmpfile();
+        Require(pipe_nid_postfix(pipe) == 0, "classification pipe");
+        if (!fileFirst) file = std::tmpfile();
+        Require(file != nullptr, "classification regular file");
+        state.descriptors.push_back({pipe[0], 1, -1});
+#ifdef _WIN32
+        state.descriptors.push_back({::_fileno(file), 1, -1});
+#else
+        state.descriptors.push_back({::fileno(file), 1, -1});
+#endif
+    }
+    const int descriptor = state.descriptors.front().descriptor;
+    GuestDescriptorAccess identity(descriptor, GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    const auto version = identity.Snapshot();
+    ClassificationSchedule schedule;
+    classificationSchedule = &schedule;
+    KernelSetPollWaitHookForTest_nid_no_patch(ClassificationHook);
+    CloseSchedule close{descriptor, 1};
+    closeSchedule = &close;
+    if (borrowed) NetSetSocketCloseHookForTest_nid_no_patch(CloseHook);
+    std::atomic<bool> returned{false};
+    int result = -2;
+    bool threw = false;
+    std::thread polling([&] {
+        try { result = poll_nid_postfix(state.descriptors.data(), state.descriptors.size(), 0); }
+        catch (...) { threw = true; }
+        returned.store(true);
+    });
+    Require(Observe([&] { return schedule.entered.load(); }), "observe admitted poll before classification");
+    std::thread closing([&] { Require((borrowed ? sceNetSocketClose(descriptor) : close_nid_postfix(descriptor)) == 0, "close during classification"); });
+    Require(Observe([&] { return borrowed ? close.paused.load() : !version.Unchanged(); }), "observe classification retirement");
+    schedule.release.store(true);
+    Require(Observe([&] { return returned.load(); }), "classification must complete");
+    close.release.store(true);
+    polling.join();
+    closing.join();
+    Require(!threw, "close made a supported descriptor fail classification");
+    if (borrowed) Require(result == 0 || (result == 1 && state.descriptors[0].revents != 0), "borrowed classification result");
+    else Require(result == 2 && state.descriptors[0].revents == 0x20 && state.descriptors[1].revents == 1, "retirement hid regular file readiness");
+    KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
+    NetSetSocketCloseHookForTest_nid_no_patch(nullptr);
+    if (borrowed) Require(close_nid_postfix(state.output) == 0, "close classification peer");
+    else Require(close_nid_postfix(pipe[1]) == 0 && std::fclose(file) == 0, "close classification resources");
+}
+
+static void InvalidNetClose() {
+    int pipe[2];
+    Require(pipe_nid_postfix(pipe) == 0, "invalid close pipe");
+    GuestDescriptorAccess held(pipe[0], GuestDescriptorAccess::Mode::Read);
+    GuestDescriptorAccess::Operation operation(held);
+    std::atomic<bool> returned{false};
+    int result = 0;
+    std::thread closing([&] { result = sceNetSocketClose(pipe[0]); returned.store(true); });
+    const bool prompt = Observe([&] { return returned.load(); });
+    const bool interrupted = operation.Interrupted();
+    held.Unlock();
+    closing.join();
+    Require(prompt && result < 0 && !interrupted, "invalid net close drained or interrupted a pipe");
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close invalid close pipe");
+}
+
 #ifndef _WIN32
 static void DescriptorCapacity() {
     auto* file = std::tmpfile();
@@ -316,6 +433,9 @@ static void DescriptorCapacity() {
 #endif
 
 static void Run(const std::string& transport, const std::string& scenario) {
+    if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
+    if (scenario == "reuse_publication") { ReusePublication(); return; }
+    if (scenario == "invalid_net_close") { InvalidNetClose(); return; }
     if (scenario == "admission_timeout") { AdmissionTimeout(); return; }
     if (scenario == "close_reuse" || scenario == "close_twice" || scenario == "close_stale") { BorrowedCloseReuse(scenario); return; }
 #ifndef _WIN32

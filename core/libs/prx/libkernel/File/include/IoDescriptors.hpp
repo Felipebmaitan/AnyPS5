@@ -5,6 +5,8 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <stdexcept>
+#include <utility>
 
 namespace File {
 
@@ -50,6 +52,16 @@ public:
             return entry->descriptor == descriptor;
         });
         return found != entries.end() && ((*found)->retired || ((*found)->operation && (*found)->operation->Interrupted()) || !(*found)->version.Unchanged());
+    }
+
+    template <class TCall>
+    auto WithOperation(int descriptor, TCall&& call) {
+        for (auto& entry : entries) {
+            if (entry->descriptor != descriptor || !entry->held) continue;
+            GuestDescriptorAccess::Operation operation(entry->access, true);
+            return std::forward<TCall>(call)();
+        }
+        throw std::logic_error("descriptor operation without admission");
     }
 
     bool Available(int descriptor) const {
