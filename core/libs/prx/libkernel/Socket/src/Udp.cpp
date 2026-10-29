@@ -2381,6 +2381,9 @@ int KernelPollDescriptors_nid_no_patch(GuestPollDescriptor* descriptors, std::ui
                 for (std::uint32_t i = 0; i < count; ++i)
                     if (selected ? KernelSocketPoll::SelectEvents(descriptors[i].events, descriptors[i].revents) != 0 : descriptors[i].revents != 0) ++result;
                 if (!selected || result || expired) return result;
+                if (const auto hook = pollWaitHook.load()) hook(3);
+                ready = 0;
+                for (std::uint32_t i = 0; i < count; ++i) descriptors[i].revents = 0;
             }
             if (partial) return std::nullopt;
         }

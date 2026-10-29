@@ -6,6 +6,7 @@
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "prx/libSceNet/include/Net.hpp"
 #include <array>
@@ -32,6 +33,7 @@
 #include <sys/resource.h>
 #ifdef __linux__
 #include <sys/syscall.h>
+#include <sys/socket.h>
 #endif
 #endif
 
@@ -746,7 +748,60 @@ static void DescriptorCapacity() {
 }
 #endif
 
+#ifdef __linux__
+static std::atomic<bool> ignoredStatus{false}, releaseStatus{false};
+static void IgnoredStatusHook(int stage) {
+    if (stage == 1) observed->waiting.store(true);
+    if (stage != 3) return;
+    observed->waiting.store(false);
+    ignoredStatus.store(true);
+    Require(Observe([] { return releaseStatus.load(); }), "release ignored socket status");
+}
+static void IgnoredStatus() {
+    const int reservation = socket_nid_postfix(2, 2, 0);
+    Require(reservation >= 0, "reserve unreachable port");
+    std::array<unsigned char, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(bind_nid_postfix(reservation, address.data(), address.size()) == 0, "bind unreachable port");
+    std::uint32_t length = address.size();
+    Require(getsockname_nid_postfix(reservation, address.data(), &length) == 0, "query unreachable port");
+    Require(close_nid_postfix(reservation) == 0, "release unreachable port");
+    State state;
+    const int descriptor = socket_nid_postfix(2, 2, 0);
+    Require(descriptor >= 0 && connect_nid_postfix(descriptor, address.data(), address.size()) == 0, "connect error socket");
+    state.descriptors.push_back({descriptor, 2, -1});
+    observed = &state;
+    KernelSetPollWaitHookForTest_nid_no_patch(IgnoredStatusHook);
+    Require(scePthreadKeyCreate(&state.key, reinterpret_cast<pthread_key_destructor_func_t>(Destroy)) == 0, "error socket TSD key");
+    Require(send_nid_postfix(descriptor, "x", 1, 0) == 1, "generate unreachable error");
+    Pthread thread = nullptr;
+    Require(scePthreadCreate(&thread, nullptr, Poller, &state, nullptr) == 0, "create exception-only selector");
+    Require(Observe([] { return ignoredStatus.load(); }), "observe ignored native socket error");
+    int error = 0;
+    socklen_t errorLength = sizeof(error);
+    Require(::getsockopt(static_cast<int>(GuestSockets::NativeDescriptor(descriptor)), SOL_SOCKET, SO_ERROR, &error, &errorLength) == 0 && error != 0, "clear observed native socket error");
+    releaseStatus.store(true);
+    const bool blocked = Observe([&] {
+        if (!state.waiting.load()) return false;
+        std::ifstream input("/proc/self/task/" + std::to_string(state.nativeId.load()) + "/syscall");
+        long call = -1;
+        std::uint64_t descriptors = 0, count = 0, timeout = 0;
+        input >> call >> std::hex >> descriptors >> count >> timeout;
+        return input && call == SYS_poll && timeout != 0;
+    });
+    Require(pthread_cancel_nid_postfix(thread) == 0, "cancel exception-only selector");
+    void* result = nullptr;
+    Require(scePthreadJoin(thread, &result) == 0 && result == GUEST_CANCELED, "join exception-only selector");
+    KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
+    Require(scePthreadKeyDelete(state.key) == 0 && close_nid_postfix(descriptor) == 0, "release error socket state");
+    Require(state.cleanups.load() == 1 && state.destructors.load() == 1 && state.descriptors.front().revents == -1, "error wait cancellation cleanup");
+    Require(blocked, "select kept busy polling after the native error was cleared");
+}
+#endif
+
 static void Run(const std::string& transport, const std::string& scenario) {
+#ifdef __linux__
+    if (scenario == "ignored_error") { IgnoredStatus(); return; }
+#endif
     if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
     if (scenario == "duplicate_allocation_failure") { DuplicateAllocationFailure(); return; }
     if (scenario == "replaced_queue_socket") { ReplaceQueueOwner(); return; }
