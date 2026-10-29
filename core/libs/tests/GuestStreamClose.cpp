@@ -118,6 +118,8 @@ static void CloseWaitsForALockedStream() {
     std::thread closer([&] { Require(fclose_nid_postfix(stream) == 0); });
     Require(Await([] { return (observedEvents.load() & 4) != 0; }));
     Require(sceKernelLseek(descriptor, 0, FromStart) == 0);
+    char byte = 0;
+    Require(read_nid_postfix(descriptor, &byte, 1) == 0);
     funlockfile_nid_postfix(stream);
     closer.join();
     FileStreamSetCloseHookForTest_nid_no_patch(nullptr);
