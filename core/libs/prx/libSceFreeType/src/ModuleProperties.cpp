@@ -52,7 +52,7 @@ int Read(FT_Library library, const char* moduleName, const char* propertyName, v
 int ReadIncreaseXHeight(FT_Library library, const char* moduleName, const char* propertyName, void* output) {
     GuestFaceRec* guestFace = nullptr;
     std::memcpy(&guestFace, output, sizeof(guestFace));
-    const auto face = FaceOf(guestFace);
+    const auto face = FaceOf_nid_no_patch(guestFace);
     FT_Prop_IncreaseXHeight hostProp{};
     hostProp.face = face ? face->host : nullptr;
     const auto error = FT_Property_Get(library, moduleName, propertyName, &hostProp);
@@ -73,7 +73,7 @@ int Write(FT_Library library, const char* moduleName, const char* propertyName, 
 int WriteIncreaseXHeight(FT_Library library, const char* moduleName, const char* propertyName, const void* input) {
     GuestPropIncreaseXHeight guestProp{};
     std::memcpy(&guestProp, input, sizeof(guestProp));
-    const auto face = FaceOf(guestProp.face);
+    const auto face = FaceOf_nid_no_patch(guestProp.face);
     FT_Prop_IncreaseXHeight hostProp{};
     hostProp.face = face ? face->host : nullptr;
     hostProp.limit = guestProp.limit;
