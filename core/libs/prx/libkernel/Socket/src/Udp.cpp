@@ -950,6 +950,18 @@ int SocketSendFlags(Socket& socket, int flags) {
     std::lock_guard lock(socket.modeMutex);
     return NativeSendFlags(socket.options.noSignal ? flags | GuestNoSignal : flags);
 }
+int SendBytes(Socket& socket, int remaining, int flags) {
+#ifdef _WIN32
+    if (ThreadCancel::IoActive() && socket.type == 1 && (flags & GuestDontWait) == 0) {
+        std::lock_guard lock(socket.modeMutex);
+        if (!socket.options.nonblocking) return std::min(remaining, std::max(1, socket.options.sendBuffer));
+    }
+#else
+    static_cast<void>(socket);
+    static_cast<void>(flags);
+#endif
+    return remaining;
+}
 int ReceiveNative(Socket& socket, void* buffer, int length, int flags, sockaddr* address, socklen_t* addressLength) {
 #ifdef _WIN32
     return Transfer(socket, false, flags, length, [&](int offset) {
@@ -1620,16 +1632,17 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
         if (!restart.Ready()) return static_cast<int>(result);
     }
 }
-std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std::uint64_t length, int flags) {
+static std::int64_t Send(int descriptor, const void* buffer, std::uint64_t length, int flags) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if ((flags & ~GuestSendFlags) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
     if (const int waited = WaitForTransfer(*socket, true, flags)) return Fail(waited);
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buffer, length);
     const auto result = Transfer(*socket, true, flags, static_cast<int>(length), [&](int offset) {
         return ::send(socket->value, offset == 0 ? static_cast<const char*>(buffer) : static_cast<const char*>(buffer) + offset,
-            static_cast<int>(length) - offset, SocketSendFlags(*socket, flags));
+            SendBytes(*socket, static_cast<int>(length) - offset, flags), SocketSendFlags(*socket, flags));
     });
     return result < 0 ? Fail(SendError(socket->type)) : result;
 }
@@ -1756,7 +1769,7 @@ int APS5_VABI ioctl_nid_postfix(int descriptor, std::uint64_t request, void* arg
 int APS5_VABI _ioctl_nid_postfix(int descriptor, std::uint64_t request, void* argument) {
     return ioctl_nid_postfix(descriptor, request, argument);
 }
-std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, std::uint64_t length,
+static std::int64_t SendTo(int descriptor, const void* buffer, std::uint64_t length,
     int flags, const void* address, std::uint32_t addressLength) {
     if (address) {
         if (const int error = AddressLengthError(address, addressLength)) return Fail(error);
@@ -1766,13 +1779,14 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
     if ((flags & ~GuestSendFlags) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buffer, length);
     if (const int waited = WaitForTransfer(*socket, true, flags)) return Fail(waited);
     int result;
     if (!address || (socket->type == 1 && PeerConnected(*socket))) {
         if (!address && addressLength != 0) return Fail(22);
         result = Transfer(*socket, true, flags, static_cast<int>(length), [&](int offset) {
             return ::send(socket->value, offset == 0 ? static_cast<const char*>(buffer) : static_cast<const char*>(buffer) + offset,
-                static_cast<int>(length) - offset, SocketSendFlags(*socket, flags));
+                SendBytes(*socket, static_cast<int>(length) - offset, flags), SocketSendFlags(*socket, flags));
         });
     } else {
         sockaddr_storage native{};
@@ -1781,7 +1795,7 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
         if (const auto answered = ZeroPortSend(*socket, native, length); answered != NotAnswered) return answered;
         result = Transfer(*socket, true, flags, static_cast<int>(length), [&](int offset) {
             return ::sendto(socket->value, offset == 0 ? static_cast<const char*>(buffer) : static_cast<const char*>(buffer) + offset,
-                static_cast<int>(length) - offset, SocketSendFlags(*socket, flags), reinterpret_cast<sockaddr*>(&native), size);
+                SendBytes(*socket, static_cast<int>(length) - offset, flags), SocketSendFlags(*socket, flags), reinterpret_cast<sockaddr*>(&native), size);
         });
     }
     return result < 0 ? Fail(SendError(socket->type)) : result;
@@ -1833,10 +1847,12 @@ static std::int64_t MessageLength(const GuestMsghdr* message) {
     }
     return static_cast<std::int64_t>(total);
 }
-std::int64_t APS5_VABI sendmsg_nid_postfix(int descriptor, const GuestMsghdr* message, int flags) {
+static std::int64_t SendMessageInternal(int descriptor, const GuestMsghdr* message, int flags) {
     const auto total = MessageLength(message);
     if (total < 0) return -1;
     if (message->control && message->controlLength) throw std::runtime_error("sendmsg: control data is not supported");
+    const File::IoDescriptor retained(descriptor);
+    if (retained.Value() < 0) return -1;
     std::vector<char> buffer;
     try {
         buffer.resize(static_cast<std::size_t>(total));
@@ -1848,7 +1864,7 @@ std::int64_t APS5_VABI sendmsg_nid_postfix(int descriptor, const GuestMsghdr* me
         if (message->iov[i].length) std::memcpy(buffer.data() + offset, message->iov[i].base, message->iov[i].length);
         offset += message->iov[i].length;
     }
-    return sendto_nid_postfix(descriptor, buffer.data(), buffer.size(), flags, message->name, message->name ? message->nameLength : 0u);
+    return SendTo(descriptor, buffer.data(), buffer.size(), flags, message->name, message->name ? message->nameLength : 0u);
 }
 #ifdef _WIN32
 static bool GuestPagesAllow(std::uintptr_t start, std::size_t bytes, DWORD allowed) {
@@ -2304,6 +2320,25 @@ std::int64_t APS5_VABI recv_nid_postfix(int descriptor, void* buffer, std::uint6
         return Receive(descriptor, buffer, length, flags);
     }); });
 }
+std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std::uint64_t length, int flags) {
+    return ThreadCancel::IoWrite([&] { return File::WithIoDescriptor(descriptor, [&](int descriptor) {
+        return Send(descriptor, buffer, length, flags);
+    }); });
+}
+std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, std::uint64_t length,
+    int flags, const void* address, std::uint32_t addressLength) {
+    return ThreadCancel::IoWrite([&]() -> std::int64_t {
+        if (address) {
+            if (const int error = AddressLengthError(address, addressLength)) return Fail(error);
+        }
+        return File::WithIoDescriptor(descriptor, [&](int descriptor) {
+            return SendTo(descriptor, buffer, length, flags, address, addressLength);
+        });
+    });
+}
+std::int64_t APS5_VABI sendmsg_nid_postfix(int descriptor, const GuestMsghdr* message, int flags) {
+    return ThreadCancel::IoWrite([&] { return SendMessageInternal(descriptor, message, flags); });
+}
 std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::uint64_t length,
     int flags, void* address, std::uint32_t* addressLength) {
     return ThreadCancel::Io([&] { return File::WithIoDescriptor(descriptor, [&](int descriptor) {
@@ -2319,7 +2354,7 @@ std::int64_t GuestSockets::Read(int descriptor, void* buffer, std::size_t length
 }
 
 std::int64_t GuestSockets::Write(int descriptor, const void* buffer, std::size_t length) {
-    return send_nid_postfix(descriptor, buffer, length, 0);
+    return Send(descriptor, buffer, length, 0);
 }
 
 std::int64_t GuestSockets::Readv(int descriptor, const Iovec* iov, int iovcnt) {
