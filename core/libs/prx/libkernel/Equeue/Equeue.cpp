@@ -284,7 +284,10 @@ void KernelEqueuePrivate::WaitForDescriptors(std::unique_lock<std::mutex>& lock,
         ~Registration() {
             if (!lock.owns_lock()) lock.lock();
             if (active) queue.m_pollers.erase(std::find(queue.m_pollers.begin(), queue.m_pollers.end(), waker));
+            if (const auto hook = keventWaitHook.load()) hook(5);
+            lock.unlock();
             ReleaseWatched(wait, waker);
+            lock.lock();
         }
     } registration{*this, lock, wait, waker};
     GatherInterests(wait, waker, false);

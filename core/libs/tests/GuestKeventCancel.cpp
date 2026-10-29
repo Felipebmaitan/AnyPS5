@@ -360,6 +360,57 @@ static void Run(const std::string& transport, const std::string& scenario) {
     Require(scePthreadKeyDelete(state.key) == 0, "delete key");
 }
 
+struct ReversalState {
+    int parent = -1;
+    int child = -1;
+    std::atomic<bool> gathered{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> scanning{false};
+    std::atomic<bool> cleanup{false};
+};
+static ReversalState* reversal = nullptr;
+static thread_local int reversalRole = 0;
+static void ReversalHook(int stage) {
+    if (reversalRole == 1 && stage == 3 && !reversal->gathered.exchange(true))
+        Require(Observe([] { return reversal->release.load(); }), "release reversed wait");
+    if (reversalRole == 1 && stage == 5) reversal->cleanup.store(true);
+    if (reversalRole == 2 && stage == 4 && !reversal->scanning.exchange(true))
+        Require(Observe([] { return reversal->cleanup.load(); }), "observe parent cleanup while child locked");
+}
+static void* APS5_VABI ReversalWaiter(void* opaque) {
+    reversalRole = static_cast<int>(reinterpret_cast<std::uintptr_t>(opaque));
+    const KernelTimespec timeout{0, reversalRole == 1 ? 100000000 : 0};
+    KernelEvent event{};
+    Require(kevent_nid_postfix(reversalRole == 1 ? reversal->parent : reversal->child,
+        nullptr, 0, &event, 1, &timeout) == 0, "reversed watches timed out without readiness");
+    return nullptr;
+}
+static void Reversal() {
+    ReversalState state;
+    reversal = &state;
+    state.parent = kqueue_nid_postfix();
+    state.child = kqueue_nid_postfix();
+    int pipe[2];
+    Require(state.parent >= 0 && state.child >= 0 && pipe_nid_postfix(pipe) == 0, "reversal resources");
+    Add(state.child, pipe[0], EVFILT_READ);
+    Add(state.parent, state.child, EVFILT_READ);
+    KernelSetKeventWaitHookForTest_nid_no_patch(ReversalHook);
+    Pthread parent = nullptr;
+    Pthread child = nullptr;
+    Require(scePthreadCreate(&parent, nullptr, ReversalWaiter, reinterpret_cast<void*>(std::uintptr_t{1}), "kevent-parent") == 0, "parent waiter");
+    Require(Observe([&] { return state.gathered.load(); }), "old watch registrations gathered");
+    Add(state.parent, state.child, EVFILT_READ, EV_DELETE);
+    Add(state.child, state.parent, EVFILT_READ);
+    Require(scePthreadCreate(&child, nullptr, ReversalWaiter, reinterpret_cast<void*>(std::uintptr_t{2}), "kevent-child") == 0, "child scanner");
+    Require(Observe([&] { return state.scanning.load(); }), "child queue locked for scan");
+    state.release.store(true);
+    Require(Observe([&] { return parent->_finished.load() && child->_finished.load(); }), "reversed watch cleanup deadlocked");
+    Require(scePthreadJoin(parent, nullptr) == 0 && scePthreadJoin(child, nullptr) == 0, "join reversed waits");
+    KernelSetKeventWaitHookForTest_nid_no_patch(nullptr);
+    Require(close_nid_postfix(state.child) == 0 && close_nid_postfix(state.parent) == 0, "close reversed queues");
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close reversal pipe");
+}
+
 static void Capacity(const std::string& scenario) {
     State state;
     observed = &state;
@@ -439,7 +490,8 @@ int main(int argc, char** argv) {
     const auto before = resources ? Resources() : 0;
     const int rounds = resources ? 16 : std::string(argv[2]) == "race" ? 8 : 1;
     for (int i = 0; i < rounds; ++i) {
-        if (std::string(argv[1]) == "capacity") Capacity(argv[2]);
+        if (std::string(argv[1]) == "reversal") Reversal();
+        else if (std::string(argv[1]) == "capacity") Capacity(argv[2]);
         else Run(argv[1], resources ? "cancel" : argv[2]);
     }
     if (resources) Require(Resources() <= before + 2, "canceled kevent leaked resources");
