@@ -147,7 +147,7 @@ struct Socket : KernelSocketPoll::NativeOwner {
 };
 
 #ifdef _WIN32
-int WaitTransferReady(Socket& socket, bool send, int milliseconds);
+int WaitTransferReady(Socket& socket, bool send, int milliseconds, bool connecting = false);
 #endif
 
 template<typename TOperation>
@@ -298,7 +298,7 @@ std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
 std::set<int> closeOnExecDescriptors;
 #ifdef _WIN32
-int WaitTransferReady(Socket& socket, bool send, int milliseconds) {
+int WaitTransferReady(Socket& socket, bool send, int milliseconds, bool connecting) {
     int error = 0;
     struct ErrorRestore {
         int& error;
@@ -306,13 +306,18 @@ int WaitTransferReady(Socket& socket, bool send, int milliseconds) {
     } restore{error};
     fd_set ready;
     fd_set interrupted;
+    fd_set exceptions;
     FD_ZERO(&ready);
     FD_ZERO(&interrupted);
+    FD_ZERO(&exceptions);
     FD_SET(socket.value, &ready);
+    if (connecting) FD_SET(socket.value, &exceptions);
     timeval timeout{milliseconds < 0 ? 0 : milliseconds / 1000, milliseconds < 0 ? 0 : milliseconds % 1000 * 1000};
     if (!ThreadCancel::IoActive()) {
-        const int result = ::select(0, send ? nullptr : &ready, send ? &ready : nullptr, nullptr, milliseconds < 0 ? nullptr : &timeout);
+        const int result = ::select(0, send ? nullptr : &ready, send ? &ready : nullptr,
+            connecting ? &exceptions : nullptr, milliseconds < 0 ? nullptr : &timeout);
         error = result < 0 ? WSAGetLastError() : 0;
+        if (connecting && result > 0) return (FD_ISSET(socket.value, &ready) ? 1 : 0) | (FD_ISSET(socket.value, &exceptions) ? 2 : 0);
         return result;
     }
     struct TransferWakerTag {};
@@ -327,9 +332,11 @@ int WaitTransferReady(Socket& socket, bool send, int milliseconds) {
     FD_SET(waker.value, &interrupted);
     if (!send) FD_SET(socket.value, &interrupted);
     if (ThreadCancel::IoInterrupted()) { error = WSAEINTR; return -1; }
-    const int result = ::select(0, &interrupted, send ? &ready : nullptr, nullptr, milliseconds < 0 ? nullptr : &timeout);
+    const int result = ::select(0, &interrupted, send ? &ready : nullptr,
+        connecting ? &exceptions : nullptr, milliseconds < 0 ? nullptr : &timeout);
     error = result < 0 ? WSAGetLastError() : 0;
     if (ThreadCancel::IoInterrupted()) { error = WSAEINTR; return -1; }
+    if (connecting && result > 0) return (FD_ISSET(socket.value, &ready) ? 1 : 0) | (FD_ISSET(socket.value, &exceptions) ? 2 : 0);
     return result;
 }
 #endif
@@ -1479,8 +1486,7 @@ int APS5_VABI socketpair_nid_postfix(int family, int type, int protocol, int* de
         return Fail(12);
     }
 }
-int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint32_t length) {
-    if (const int error = AddressLengthError(address, length)) return Fail(error);
+static int Connect(int descriptor, const void* address, std::uint32_t length) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if (socket->family != GuestUnix && socket->type == 2 && address && length >= 2 && static_cast<const unsigned char*>(address)[1] == 0
@@ -1500,7 +1506,13 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
         std::lock_guard lock(socket->modeMutex);
         socket->options.reportedError = 0;
     }
-    if (::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size) == 0) return 0;
+    if (ThreadCancel::IoInterrupted()) return Fail(4);
+#ifdef _WIN32
+    const int connected = ::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size);
+#else
+    const int connected = ThreadCancel::Native([&] { return ::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size); });
+#endif
+    if (connected == 0) return 0;
 #ifdef _WIN32
     const int error = WSAGetLastError();
     if (error != WSAEWOULDBLOCK) return Fail(ConnectError());
@@ -1509,13 +1521,9 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
         if (socket->options.nonblocking) return Fail(36);
     }
     for (;;) {
-        fd_set write;
-        fd_set except;
-        FD_ZERO(&write);
-        FD_ZERO(&except);
-        FD_SET(socket->value, &write);
-        FD_SET(socket->value, &except);
-        if (::select(0, nullptr, &write, &except, nullptr) < 0) return Fail(NativeError());
+        const int ready = WaitTransferReady(*socket, true, -1, true);
+        if (ready < 0) return Fail(NativeError());
+        if (ready == 0) continue;
         int pending = 0;
         int pendingBytes = sizeof(pending);
         if (::getsockopt(socket->value, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&pending), &pendingBytes)) return Fail(NativeError());
@@ -1523,11 +1531,17 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
             WSASetLastError(pending);
             return Fail(ConnectError());
         }
-        if (FD_ISSET(socket->value, &write)) return 0;
+        if ((ready & 1) != 0) return 0;
     }
 #else
     return Fail(ConnectError());
 #endif
+}
+int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint32_t length) {
+    return static_cast<int>(ThreadCancel::Io([&]() -> std::int64_t {
+        if (const int error = AddressLengthError(address, length)) return Fail(error);
+        return File::WithIoDescriptor(descriptor, [&](int descriptor) { return Connect(descriptor, address, length); });
+    }, false));
 }
 int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const auto socket = Lookup(descriptor);
