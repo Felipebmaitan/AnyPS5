@@ -5,12 +5,14 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/FileLock.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -641,18 +643,50 @@ void ForgetDescriptor(int fd) {
 }
 
 std::uint64_t g_synchronousWrites = 0;
+std::atomic<SynchronousWriteHook> g_synchronousWriteHook{nullptr};
+std::atomic<SynchronousWriteHook> g_synchronousWriteMetadataHook{nullptr};
 
-void SyncWrites(int fd) {
+extern "C" void FileSetSynchronousWriteHookForTest_nid_no_patch(SynchronousWriteHook hook) {
+    g_synchronousWriteHook.store(hook);
+}
+
+extern "C" void FileSetSynchronousWriteMetadataHookForTest_nid_no_patch(SynchronousWriteHook hook) {
+    g_synchronousWriteMetadataHook.store(hook);
+}
+
+bool SyncWrites(int fd) {
     {
         std::lock_guard lock(g_mutex);
         const auto found = g_entries.find(fd);
-        if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return;
+        if (found == g_entries.end() || !found->second.status || (*found->second.status & Synchronous) == 0) return true;
     }
-    if (Classify(fd, "write") != Kind::File) return;
-    if (const int result = sceKernelFsync(fd); result != 0)
+    const auto hook = g_synchronousWriteHook.load();
+    const auto metadataHook = g_synchronousWriteMetadataHook.load();
+    bool synchronized = false;
+    int result;
+    try {
+        result = ThreadCancel::Native([&] {
+            if (metadataHook && metadataHook(fd) != 0) throw std::runtime_error("write: synchronous metadata query failed");
+            if (Classify(fd, "write") != Kind::File) return 0;
+            synchronized = true;
+            return hook ? hook(fd) : sceKernelFsync(fd);
+        });
+    } catch (const std::runtime_error&) {
+        if (!ThreadCancel::IoActive() || !ThreadCancel::IoInterrupted()) throw;
+        result = -1;
+    }
+    if (result != 0) {
+        if (ThreadCancel::IoActive() && (ThreadCancel::IoInterrupted() || (static_cast<unsigned>(result) & 0xffff) == EINTR)) {
+            ThreadCancel::IoNoRestart();
+            errno = EINTR;
+            return false;
+        }
         throw std::runtime_error("write: syncing an O_FSYNC file failed, fd=" + std::to_string(fd) + ", error=" + std::to_string(result & 0xffff));
+    }
+    if (!synchronized) return true;
     std::lock_guard lock(g_mutex);
     ++g_synchronousWrites;
+    return true;
 }
 
 bool Appends(int fd) {
@@ -667,7 +701,7 @@ bool IsCharacterDevice(int fd) {
     return DescriptorIsOpen_nid_no_patch(fd) && !GuestSockets::IsOpen(fd) && !File::DirectoryDescriptorPath(fd) && ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_CHAR;
 #else
     struct stat status{};
-    return ::fstat(fd, &status) == 0 && S_ISCHR(status.st_mode);
+    return ThreadCancel::Native([&] { return ::fstat(fd, &status); }) == 0 && S_ISCHR(status.st_mode);
 #endif
 }
 
@@ -684,7 +718,7 @@ bool IsVnode(int fd) {
     return File::DirectoryDescriptorPath(fd) || ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_DISK;
 #else
     struct stat status{};
-    return ::fstat(fd, &status) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
+    return ThreadCancel::Native([&] { return ::fstat(fd, &status); }) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
 #endif
 }
 
