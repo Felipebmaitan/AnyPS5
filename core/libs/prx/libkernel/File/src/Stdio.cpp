@@ -24,6 +24,7 @@
 #include "prx/libc/include/AppArchive.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libkernel/Semaphore/include/Ksem.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <atomic>
@@ -476,6 +477,7 @@ static bool FailPosixPositionedGuestSocket(int descriptor) {
 
 static bool IsPipeDescriptor(int descriptor) {
 #ifdef _WIN32
+    if (GuestSockets::IsOpen(descriptor)) return false;
     const auto handle = reinterpret_cast<HANDLE>(WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor); }));
     return handle != INVALID_HANDLE_VALUE && ::GetFileType(handle) == FILE_TYPE_PIPE;
 #else
@@ -500,7 +502,7 @@ static int PositionedArgumentError(int descriptor, bool write, bool nullBuffer, 
 
 static int TransferArgumentError(int descriptor, bool nullBuffer) {
     if (!nullBuffer) return 0;
-    return DescriptorIsOpen_nid_no_patch(descriptor) ? GUEST_EFAULT : GUEST_EBADF;
+    return (GuestSockets::IsOpen(descriptor) || DescriptorIsOpen_nid_no_patch(descriptor)) ? GUEST_EFAULT : GUEST_EBADF;
 }
 
 static int SceErrorFromErrno(int error) {
@@ -849,6 +851,7 @@ int APS5_VABI dup_nid_postfix(int d) {
     if (GuestSockets::IsOpen(d)) return GuestSockets::Duplicate(d);
     if (d < 0) return PosixFailure(GUEST_EBADF);
     if (IsKqueueDescriptor_nid_no_patch(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
+    if (IsKsemDescriptor(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a ksem id is not supported");
 #ifdef _WIN32
     const int duplicate = WithoutParameterHandler([d] { return ::_dup(d); });
     if (duplicate >= 0) File::DuplicateSharedMemoryDescriptor_nid_no_patch(d, duplicate);
@@ -880,6 +883,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     }
     const bool sourceIsRandom = File::IsRandomDevice(from);
     if (from != to && IsKqueueDescriptor_nid_no_patch(from)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
+    if (from != to && IsKsemDescriptor(from)) throw std::runtime_error(std::string(__func__) + ": duplicating a ksem id is not supported");
 #ifdef _WIN32
     if (WithoutParameterHandler([from] { return ::_get_osfhandle(from) == -1 ? -1 : 0; }) != 0) return PosixFailure(GUEST_EBADF);
     if (from == to) return to;
