@@ -65,10 +65,13 @@ bool TrackIoDescriptor(int descriptor);
 void IoNoRestart();
 void RetireIoStack(std::uintptr_t stack, std::uint32_t context = 0, bool maskRestored = false);
 
+extern "C" void KernelSetIoCleanupHookForTest_nid_no_patch(void (*hook)(int));
+
 class IoCleanup {
 public:
     struct State;
-    using Cleanup = void (*)(void*, bool);
+    using Completion = void (*)();
+    using Cleanup = Completion (*)(void*, bool);
     IoCleanup(Cleanup cleanup, void* argument);
     ~IoCleanup() noexcept(false);
     IoCleanup(const IoCleanup&) = delete;

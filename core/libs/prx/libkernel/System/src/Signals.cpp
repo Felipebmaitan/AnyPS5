@@ -592,7 +592,7 @@ thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
 
 namespace {
 
-int ChangeBlockedMask(int how, const GuestSignalSet* set, GuestSignalSet* previousSet, bool releaseHolds, bool* caught = nullptr, GuestSignalSet* guestPrevious = nullptr) {
+int ChangeBlockedMask(int how, const GuestSignalSet* set, GuestSignalSet* previousSet, bool releaseHolds, bool* caught = nullptr, GuestSignalSet* guestPrevious = nullptr, bool deliver = true) {
     if (set != nullptr && (how < 1 || how > 3)) { *__error_nid_postfix() = 22; return -1; }
     {
         std::lock_guard lock(registration);
@@ -628,11 +628,21 @@ int ChangeBlockedMask(int how, const GuestSignalSet* set, GuestSignalSet* previo
     }
     const bool faulted = guestPrevious != nullptr && !GuestCopyOut_nid_no_patch(guestPrevious, previousSet, sizeof(*previousSet));
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (DeliverUnblockedPending() && caught != nullptr) *caught = true;
+    if (deliver && DeliverUnblockedPending() && caught != nullptr) *caught = true;
     if (faulted) { *__error_nid_postfix() = 14; return -1; }
     return 0;
 }
 
+}
+
+extern "C" void CommitSignalMask_nid_no_patch(const GuestSignalSet* set) {
+    ChangeBlockedMask(GuestSigsetmask, set, nullptr, true, nullptr, nullptr, false);
+}
+
+extern "C" void DeliverSignalMaskPending_nid_no_patch() {
+    const int error = *__error_nid_postfix();
+    DeliverUnblockedPending();
+    *__error_nid_postfix() = error;
 }
 
 extern "C" int APS5_VABI SetSignalMaskCatching_nid_no_patch(const GuestSignalSet* set, GuestSignalSet* previousSet) {

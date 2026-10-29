@@ -750,6 +750,8 @@ int APS5_VABI killpg_nid_postfix(int pgrp, int guest);
 int APS5_VABI pthread_kill_nid_postfix(Pthread thread, int guest);
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous);
 int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet);
+void CommitSignalMask_nid_no_patch(const GuestSignalSet* set);
+void DeliverSignalMaskPending_nid_no_patch();
 int APS5_VABI SetSignalMaskCatching_nid_no_patch(const GuestSignalSet* set, GuestSignalSet* previousSet);
 int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet);
 int APS5_VABI pthread_sigmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet);

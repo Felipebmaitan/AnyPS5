@@ -57,6 +57,7 @@ namespace {
 
 class SignalManager;
 std::atomic<SignalManager*> published{nullptr};
+std::atomic<void (*)(int)> cleanupHook{nullptr};
 
 class SetupBlock {
 public:
@@ -218,6 +219,8 @@ SignalManager& Manager() {
 
 }
 
+extern "C" void KernelSetIoCleanupHookForTest_nid_no_patch(void (*hook)(int)) { cleanupHook.store(hook); }
+
 IoCleanup::IoCleanup(Cleanup cleanup, void* argument) {
     const SetupBlock blocked;
     JumpBuffer::GuestIoJumpRegister_nid_no_patch(RetireIoStack);
@@ -226,20 +229,21 @@ IoCleanup::IoCleanup(Cleanup cleanup, void* argument) {
 }
 
 IoCleanup::~IoCleanup() noexcept(false) {
-    Cleanup cleanup = nullptr;
-    void* argument = nullptr;
+    Completion completion = nullptr;
     {
         const SetupBlock blocked;
         auto** cursor = &cleanups;
         while (*cursor && (*cursor != state || (*cursor)->stack != reinterpret_cast<std::uintptr_t>(this))) cursor = &(*cursor)->previous;
         if (*cursor) {
-            cleanup = state->cleanup;
-            argument = state->argument;
+            const auto cleanup = state->cleanup;
+            auto* argument = state->argument;
             *cursor = state->previous;
             delete state;
+            if (const auto hook = cleanupHook.load()) hook(0);
+            completion = cleanup(argument, false);
         }
     }
-    if (cleanup) cleanup(argument, false);
+    if (completion) completion();
 }
 
 IoRestart::IoRestart(bool allowed) {
@@ -462,8 +466,7 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context, bool maskRestore
     if (mask) pthread_sigmask(SIG_SETMASK, &*mask, nullptr);
 #endif
     for (;;) {
-        IoCleanup::Cleanup cleanup = nullptr;
-        void* argument = nullptr;
+        IoCleanup::Completion completion = nullptr;
         {
             const SetupBlock blocked;
             auto** cursor = &cleanups;
@@ -471,11 +474,13 @@ void RetireIoStack(std::uintptr_t stack, std::uint32_t context, bool maskRestore
             if (!*cursor) break;
             auto* retired = *cursor;
             *cursor = retired->previous;
-            cleanup = retired->cleanup;
-            argument = retired->argument;
+            const auto cleanup = retired->cleanup;
+            auto* argument = retired->argument;
             delete retired;
+            if (const auto hook = cleanupHook.load()) hook(1);
+            completion = cleanup(argument, maskRestored);
         }
-        cleanup(argument, maskRestored);
+        if (completion) completion();
     }
     for (int signal = 1; signal < 64; ++signal)
         if ((signals & (std::uint64_t{1} << signal)) != 0) std::raise(signal);

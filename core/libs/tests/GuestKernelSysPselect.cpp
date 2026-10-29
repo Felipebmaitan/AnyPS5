@@ -11,6 +11,10 @@
 #include <source_location>
 #include <string>
 #include <stdexcept>
+#ifndef _WIN32
+#include <pthread.h>
+#include <csignal>
+#endif
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
 #include "prx/libkernel/System/include/UserContext.hpp"
@@ -121,6 +125,33 @@ void* APS5_VABI EscapeWorker(void*) {
     return nullptr;
 }
 
+#ifndef _WIN32
+void QueueNativeEscape(int stage) {
+    if (stage != 0) return;
+    ThreadCancel::KernelSetIoCleanupHookForTest_nid_no_patch(nullptr);
+    Require(pthread_kill(pthread_self(), SIGTERM) == 0);
+}
+
+int UnblockEscapeTest() {
+    escapeMode = "unblock";
+    Require(signal_nid_postfix(15, Escape) != reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1)));
+    expectedMask.bits[0] = 1u << (SigUsr1 - 1);
+    Require(sigprocmask_nid_postfix(SigSetmask, &expectedMask, nullptr) == 0);
+    if (sigsetjmp_nid_postfix(jumpBuffer.data(), 0) == 0) {
+        ThreadCancel::KernelSetIoCleanupHookForTest_nid_no_patch(QueueNativeEscape);
+        const Timespec zero{};
+        const SignalSet empty{};
+        pselect_nid_postfix(0, nullptr, nullptr, nullptr, &zero, &empty);
+        Require(false);
+    }
+    Require((CurrentMask().bits[0] & expectedMask.bits[0]) == expectedMask.bits[0]);
+    sigset_t native{};
+    Require(pthread_sigmask(SIG_BLOCK, nullptr, &native) == 0);
+    Require(sigismember(&native, SIGINT) == 0);
+    return 0;
+}
+#endif
+
 int EscapeTest(const std::string& mode) {
     escapeMode = mode;
     Require(signal_nid_postfix(SigUsr1, Escape) != reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1)));
@@ -178,6 +209,9 @@ int EscapeTest(const std::string& mode) {
 }
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    if (argc == 2 && std::string(argv[1]) == "unblock") return UnblockEscapeTest();
+#endif
     if (argc == 2) return EscapeTest(argv[1]);
     int descriptors[2]{-1, -1};
     Require(pipe_nid_postfix(descriptors) == 0);

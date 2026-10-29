@@ -10,7 +10,6 @@
 
 namespace {
 
-constexpr int SetMask = 3;
 constexpr int Eintr = 4;
 constexpr int Efault = 14;
 constexpr int DescriptorLimit = 1024;
@@ -35,15 +34,16 @@ struct MaskState {
     bool armed = false;
 };
 
-void RestoreMask(void* opaque, bool restored) {
+ThreadCancel::IoCleanup::Completion RestoreMask(void* opaque, bool restored) {
     auto* state = static_cast<MaskState*>(opaque);
     const GuestSignalSet previous = state->previous;
     const bool armed = state->armed;
     delete state;
-    if (!armed || restored) return;
+    if (!armed || restored) return nullptr;
     const int error = *__error_nid_postfix();
-    sigprocmask_nid_postfix(SetMask, &previous, nullptr);
+    CommitSignalMask_nid_no_patch(&previous);
     *__error_nid_postfix() = error;
+    return DeliverSignalMaskPending_nid_no_patch;
 }
 
 int Fault() {
