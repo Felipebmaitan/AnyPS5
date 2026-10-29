@@ -390,7 +390,6 @@ static FileStream* OpenDirectoryStream(const std::filesystem::path& path) {
     std::unique_ptr<void, decltype(release)> storage(::operator new(sizeof(FileStream)), release);
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> native(OpenDirectoryHandle(path), std::fclose);
     if (!native) return nullptr;
-    const GuestDescriptorAccess publication(::_fileno(native.get()), GuestDescriptorAccess::Mode::Publish);
     auto* stream = new (storage.get()) FileStream(native.get(), true);
     native.release();
     storage.release();
@@ -403,6 +402,9 @@ static void PublishReopenedStream(FileStream* stream) {
     try {
         const GuestDescriptorAccess publication(fileno_nid_postfix(stream), GuestDescriptorAccess::Mode::Publish);
     } catch (...) {
+#ifdef _WIN32
+        if (stream->IsDirectory()) ForgetDirectoryStream_nid_no_patch(fileno_nid_postfix(stream));
+#endif
         if (!stream->IsHostStandard()) std::fclose(stream->GetHandle());
         stream->Detach();
         if (stream->IsDynamic()) delete stream;
@@ -435,7 +437,6 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
                 return nullptr;
             }
             stream->MarkDirectory();
-            PublishReopenedStream(stream);
             return stream;
         }
 #endif

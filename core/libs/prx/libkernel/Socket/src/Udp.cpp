@@ -252,6 +252,7 @@ int TransferForNativeOwner(KernelSocketPoll::NativeOwner* owner, bool send, void
 
 std::atomic<std::uint64_t> wakerCreations{0};
 std::atomic<void (*)(int)> pollWaitHook{nullptr};
+std::atomic<void (*)()> duplicateHook{nullptr};
 
 struct WakerFailure : std::runtime_error {
     int error;
@@ -718,6 +719,10 @@ extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number) {
     ReleaseNumber(number);
 }
 
+extern "C" void KernelSetSocketDuplicateHookForTest_nid_no_patch(void (*hook)()) {
+    duplicateHook.store(hook);
+}
+
 extern "C" void KernelSetPollWaitHookForTest_nid_no_patch(void (*hook)(int)) {
     pollWaitHook.store(hook);
 }
@@ -868,7 +873,7 @@ bool GuestSockets::PipeReady(int descriptor, short events, short& revents) {
 namespace {
 int DuplicateSocket_nid_no_patch(int descriptor, int minimum) {
     if (minimum < 0) return Fail(22);
-    const GuestDescriptorAccess source(descriptor, GuestDescriptorAccess::Mode::Read);
+    if (const auto hook = duplicateHook.load()) hook();
     const auto socket = Find(descriptor);
     if (!socket) return Fail(9);
     const int duplicate = CopyNumber(descriptor, minimum);
@@ -1339,10 +1344,12 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
         }
         return File::Fcntl(descriptor, command, argument);
     }
-    if (command == 0) return DuplicateSocket_nid_no_patch(descriptor, static_cast<int>(argument));
+    if (command == 0 || command == 18) {
+        const GuestDescriptorAccess source(descriptor, GuestDescriptorAccess::Mode::Read);
+        return DuplicateSocket_nid_no_patch(descriptor, command == 0 ? static_cast<int>(argument) : 0);
+    }
     if (command == 17) return Fail(45);
     if (command == 10) return dup2_nid_postfix(descriptor, static_cast<int>(argument));
-    if (command == 18) return DuplicateSocket_nid_no_patch(descriptor, 0);
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     std::lock_guard lock(socket->modeMutex);

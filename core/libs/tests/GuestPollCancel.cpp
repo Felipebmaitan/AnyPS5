@@ -111,6 +111,7 @@ static void* APS5_VABI Poller(void* opaque) {
     state.returned.store(true);
     if (state.disabled) {
         Require(state.result == (state.descriptors.empty() ? 0 : 1), "disabled poll lost completion");
+        Require(Observe([&] { return state.release.load(); }), "observe cancellation submitted before enabling");
         Require(scePthreadSetcancelstate(GUEST_CANCEL_ENABLE, nullptr) == 0, "enable cancellation");
         scePthreadTestcancel();
     }
@@ -428,6 +429,31 @@ static void PublishReplacement(const std::string& scenario) {
     else if (!pipe && !duplicate && !socketDuplicate && !queue && !shared && !jit && !jitAlias) Require(unlink_nid_postfix(path.c_str()) == 0, "remove publication file");
 }
 
+static std::atomic<bool> duplicateEntered{false}, duplicateReleased{false};
+static void DuplicateHook() {
+    duplicateEntered.store(true);
+    Require(Observe([] { return duplicateReleased.load(); }), "release duplicate admission");
+}
+static void DuplicateClose(bool fcntl) {
+    State state;
+    Pair(state, false);
+    const int descriptor = state.descriptors[0].descriptor;
+    GuestDescriptorAccess access(descriptor, GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    const auto version = access.Snapshot();
+    KernelSetSocketDuplicateHookForTest_nid_no_patch(DuplicateHook);
+    int copy = -1;
+    std::thread duplicating([&] { copy = fcntl ? fcntl_nid_postfix(descriptor, 0, 0) : dup_nid_postfix(descriptor); });
+    Require(Observe([] { return duplicateEntered.load(); }), "observe outer duplicate admission");
+    std::thread closing([&] { Require(close_nid_postfix(descriptor) == 0, "close duplicating socket"); });
+    Require(Observe([&] { return !version.Unchanged(); }), "observe close queued behind duplicate");
+    duplicateReleased.store(true);
+    duplicating.join();
+    closing.join();
+    KernelSetSocketDuplicateHookForTest_nid_no_patch(nullptr);
+    Require(copy >= 0, "duplicate while close queued");
+    Require(close_nid_postfix(copy) == 0 && close_nid_postfix(state.output) == 0, "close duplication resources");
+}
+
 static void ReplacedNetOwner(bool socket) {
     State state, replacement;
     Pair(state, true);
@@ -564,6 +590,7 @@ static void DescriptorCapacity() {
 
 static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
+    if (scenario == "duplicate_close" || scenario == "fcntl_duplicate_close") { DuplicateClose(scenario == "fcntl_duplicate_close"); return; }
     if (scenario.starts_with("publish_")) { PublishReplacement(scenario); return; }
     if (scenario == "replaced_net_pipe" || scenario == "replaced_net_socket") { ReplacedNetOwner(scenario == "replaced_net_socket"); return; }
     if (scenario == "reuse_publication") { ReusePublication(); return; }
