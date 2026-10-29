@@ -1,4 +1,5 @@
 #include "prx/libkernel/include/Api.hpp"
+#include "AppArchiveFixture.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/include/Cancel.hpp"
@@ -471,6 +472,57 @@ static void StreamRetirement(const std::string& scenario) {
     Require(unlink_nid_postfix(path.c_str()) == 0, "remove stream poll file");
 }
 
+static void StreamMetadataHook(int descriptor, int stage) {
+    if (stage != 4 || descriptor != closeSchedule->descriptor) return;
+    closeSchedule->paused.store(true);
+    Require(Observe([] { return closeSchedule->release.load(); }), "release stream metadata retirement");
+}
+static void DirectoryStreamRetirement(bool reopen) {
+#ifdef _WIN32
+    const auto previous = std::filesystem::current_path();
+    const auto root = AppArchiveFixture::EnterFreshRoot("anyps5-poll-directory-stream");
+    AppArchiveFixture::WriteArchive(root / "app0.zar", {{"OnlyArchive/data.bin", {'x'}}});
+    std::filesystem::create_directory(root / "native");
+    auto* stream = fopen_nid_postfix("native", "r");
+    Require(stream != nullptr, "open directory stream");
+    const int descriptor = fileno_nid_postfix(stream);
+    const int archive = open_nid_postfix("/app0/OnlyArchive", 0x20000, 0);
+    Require(archive >= 0 && dup2_nid_postfix(archive, descriptor) == descriptor, "replace stream with archive directory");
+    Require(close_nid_postfix(archive) == 0, "close archive directory source");
+    CloseSchedule close{descriptor, 4};
+    closeSchedule = &close;
+    ClassificationSchedule classification;
+    classificationSchedule = &classification;
+    KernelSetPollWaitHookForTest_nid_no_patch(ClassificationHook);
+    FileStreamSetCloseHookForTest_nid_no_patch(StreamMetadataHook);
+    GuestPollDescriptor request{descriptor, 1, -1};
+    int result = -2;
+    std::thread polling([&] {
+        try { result = poll_nid_postfix(&request, 1, -1); }
+        catch (...) { result = -3; }
+    });
+    Require(Observe([&] { return classification.entered.load(); }), "observe directory classification admission");
+    std::thread closing([&] {
+        if (reopen) Require(freopen_nid_postfix("native", "r", stream) == stream, "reopen directory stream");
+        else Require(fclose_nid_postfix(stream) == 0, "close directory stream");
+    });
+    Require(Observe([&] { return close.paused.load(); }), "observe stream before retirement admission");
+    classification.release.store(true);
+    polling.join();
+    close.release.store(true);
+    closing.join();
+    KernelSetPollWaitHookForTest_nid_no_patch(nullptr);
+    FileStreamSetCloseHookForTest_nid_no_patch(nullptr);
+    Require(result == 1 && request.revents == 1, "stream close removed admitted directory metadata");
+    if (reopen) Require(fclose_nid_postfix(stream) == 0, "close reopened directory stream");
+    std::error_code error;
+    std::filesystem::current_path(previous);
+    std::filesystem::remove_all(root, error);
+#else
+    static_cast<void>(reopen);
+#endif
+}
+
 static std::atomic<bool> duplicateEntered{false}, duplicateReleased{false};
 static void DuplicateHook() {
     duplicateEntered.store(true);
@@ -670,6 +722,7 @@ static void Run(const std::string& transport, const std::string& scenario) {
     if (scenario == "net_classification" || scenario == "file_classification" || scenario == "file_classification_reverse") { CloseClassification(scenario == "net_classification", scenario == "file_classification_reverse"); return; }
     if (scenario == "duplicate_allocation_failure") { DuplicateAllocationFailure(); return; }
     if (scenario == "replaced_queue_socket") { ReplaceQueueOwner(); return; }
+    if (scenario == "stream_directory_close" || scenario == "stream_directory_reopen") { DirectoryStreamRetirement(scenario == "stream_directory_reopen"); return; }
     if (scenario.starts_with("stream_")) { StreamRetirement(scenario); return; }
     if (scenario == "duplicate_close" || scenario == "fcntl_duplicate_close") { DuplicateClose(scenario == "fcntl_duplicate_close"); return; }
     if (scenario.starts_with("publish_")) { PublishReplacement(scenario); return; }

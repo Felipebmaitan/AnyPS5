@@ -266,10 +266,11 @@ public:
         std::wstring wideMode;
         for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
         const int replaced = previous ? _fileno(previous) : -1;
+        FileStreamCloseEventForTest_nid_no_patch(replaced, 4);
+        std::optional<ClosingDescriptor> closing(std::in_place, previous, replaced);
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(replaced);
         auto* const standard = HostStandardHandle_nid_no_patch(replaced);
         GuestFileLockForget_nid_no_patch(replaced);
-        std::optional<ClosingDescriptor> closing(std::in_place, previous, replaced);
         if (open && !filename.empty()) {
             if (!IsHostStandard()) {
                 _handle = nullptr;
@@ -465,9 +466,10 @@ public:
         GetHandle();
         NativeLock streamLock(_handle, true);
 #ifdef _WIN32
+        FileStreamCloseEventForTest_nid_no_patch(::_fileno(_handle), 4);
+        const ClosingDescriptor closing(_handle, ::_fileno(_handle));
         GuestFileLockForget_nid_no_patch(::_fileno(_handle));
         if (std::exchange(directory, false)) ForgetDirectoryStream_nid_no_patch(::_fileno(_handle));
-        const ClosingDescriptor closing(_handle, ::_fileno(_handle));
 #else
         const ClosingDescriptor closing(_handle, ::fileno(_handle));
 #endif
