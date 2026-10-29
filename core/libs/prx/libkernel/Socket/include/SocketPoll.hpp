@@ -42,3 +42,4 @@ extern "C" bool KernelFindSocketNative_nid_no_patch(int descriptor, std::shared_
 extern "C" bool KernelLookupSocketNative_nid_no_patch(int descriptor, std::shared_ptr<void>* owner, std::uintptr_t* native);
 extern "C" int KernelReserveSocketNumber_nid_no_patch(std::uintptr_t native);
 extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number);
+extern "C" void KernelSetPollWaitHookForTest_nid_no_patch(void (*hook)(int));

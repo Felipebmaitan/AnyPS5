@@ -1,3 +1,4 @@
+#include "prx/libc/include/DescriptorAccess.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "prx/libSceNet/include/Net.hpp"
@@ -999,6 +1000,7 @@ int APS5_VABI sceNetSocketClose(int s) {
         ::shutdown(native->value, SHUT_RDWR);
 #endif
     }
+    const GuestDescriptorAccess descriptorLock(s, GuestDescriptorAccess::Mode::Replace);
     KernelReleaseSocketNumber_nid_no_patch(s);
     g_cv.NotifyAll();
     return 0;

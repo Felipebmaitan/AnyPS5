@@ -39,10 +39,11 @@ public:
         std::shared_ptr<State> state;
         std::uint64_t value = 0;
     };
-    enum class Mode { Read, Change, Update, Close };
+    enum class Mode { Read, Change, Update, Close, Replace };
     class Operation {
     public:
-        explicit Operation(GuestDescriptorAccess& access) { DescriptorOperationInitialize_nid_no_patch(this, &access); }
+        explicit Operation(GuestDescriptorAccess& access, bool retireOnReplace = false)
+            : retireOnReplace(retireOnReplace) { DescriptorOperationInitialize_nid_no_patch(this, &access); }
         ~Operation() { DescriptorOperationDestroy_nid_no_patch(this); }
         Operation(const Operation&) = delete;
         Operation& operator=(const Operation&) = delete;
@@ -76,6 +77,7 @@ public:
         Operation* previous = nullptr;
         WakeRegistration* wake = nullptr;
         std::atomic<bool> interrupted{false};
+        bool retireOnReplace;
         void Interrupt() noexcept;
     };
     GuestDescriptorAccess(int descriptor, Mode mode)
@@ -118,6 +120,7 @@ private:
     std::shared_ptr<State> state;
     Mode mode;
     bool held = false;
+    std::atomic<bool> wakePending{false};
 };
 
 #endif

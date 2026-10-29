@@ -107,6 +107,26 @@ struct BlockedRead {
     std::int64_t result = -2;
 };
 
+static void PendingAdmissionWake() {
+    int pipe[2];
+    Require(pipe_nid_postfix(pipe) == 0, "create admission wake pipe");
+    GuestDescriptorAccess writer(pipe[0], GuestDescriptorAccess::Mode::Update);
+    GuestDescriptorAccess reader(pipe[0], GuestDescriptorAccess::Mode::Read, std::defer_lock);
+    reader.Wake();
+    std::atomic<bool> returned{false};
+    bool acquired = false;
+    std::thread waiter([&] {
+        acquired = reader.ReadOrWait();
+        if (acquired) reader.Unlock();
+        returned.store(true);
+    });
+    const bool prompt = Observe([&] { return returned.load(); });
+    writer.Unlock();
+    waiter.join();
+    Require(prompt && !acquired, "admission lost a wake sent before its wait");
+    Require(close_nid_postfix(pipe[0]) == 0 && close_nid_postfix(pipe[1]) == 0, "close admission wake pipe");
+}
+
 static void* APS5_VABI Reader(void* argument) {
     auto& read = *static_cast<BlockedRead*>(argument);
     read.result = read_nid_postfix(read.descriptor, &read.byte, 1);
@@ -736,6 +756,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[1], "capacity") == 0) Capacity();
     else if (std::strcmp(argv[1], "no_aliases") == 0) NoAliases();
     else if (std::strcmp(argv[1], "access_cancel") == 0) AccessCancellation();
+    else if (std::strcmp(argv[1], "pending_wake") == 0) PendingAdmissionWake();
     else if (std::strcmp(argv[1], "protected_close") == 0) ProtectedClose();
     else if (std::strcmp(argv[1], "invalid_duplicate") == 0) InvalidDuplicate();
     else if (std::strcmp(argv[1], "stdio_close") == 0) StreamOrder(false);

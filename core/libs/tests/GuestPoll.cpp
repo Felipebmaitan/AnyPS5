@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <source_location>
 #include <string>
 #include <thread>
 
@@ -30,7 +31,11 @@ using NativeSocket = int;
 constexpr NativeSocket NativeInvalid = -1;
 static void CloseNative(NativeSocket socket) { close(socket); }
 #endif
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, const std::source_location where = std::source_location::current()) {
+    if (value) return;
+    std::fprintf(stderr, "poll assertion failed at line %u\n", where.line());
+    std::abort();
+}
 constexpr short In = 0x1;
 constexpr short Priority = 0x2;
 constexpr short ReadBand = 0x80;

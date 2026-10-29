@@ -41,6 +41,7 @@
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/File/include/IoDescriptors.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -250,6 +251,7 @@ int TransferForNativeOwner(KernelSocketPoll::NativeOwner* owner, bool send, void
 }
 
 std::atomic<std::uint64_t> wakerCreations{0};
+std::atomic<void (*)(int)> pollWaitHook{nullptr};
 
 struct Waker {
     NativeSocket value = Invalid;
@@ -700,6 +702,10 @@ extern "C" int KernelReserveSocketNumber_nid_no_patch(std::uintptr_t native) {
 extern "C" void KernelReleaseSocketNumber_nid_no_patch(int number) {
     const GuestDescriptorAccess descriptorLock(number, GuestDescriptorAccess::Mode::Change);
     ReleaseNumber(number);
+}
+
+extern "C" void KernelSetPollWaitHookForTest_nid_no_patch(void (*hook)(int)) {
+    pollWaitHook.store(hook);
 }
 
 namespace {
@@ -2085,6 +2091,30 @@ int APS5_VABI sendfile_nid_postfix(int file, int descriptor, std::int64_t offset
 static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count, int timeout) {
     if (timeout < -1) return Fail(22);
     if (count && !descriptors) return Fail(14);
+    std::atomic<NativeSocket> wakeSocket{Invalid};
+    const auto interrupt = [](void* opaque) noexcept {
+        const auto socket = static_cast<std::atomic<NativeSocket>*>(opaque)->load();
+        if (socket != Invalid) {
+            const char byte = 0;
+            ::send(socket, &byte, 1, 0);
+        }
+    };
+    std::vector<int> numbers;
+    numbers.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) numbers.push_back(descriptors[index].descriptor);
+    File::IoDescriptors admitted(std::move(numbers));
+    const auto interrupted = [&] {
+        int invalid = 0;
+        for (std::uint32_t index = 0; index < count; ++index) {
+            auto& entry = descriptors[index];
+            entry.revents = admitted.Retired(entry.descriptor) ? GuestPollInvalid : 0;
+            if (entry.revents) ++invalid;
+        }
+        return invalid != 0 ? invalid : Fail(4);
+    };
+    if (!admitted.Acquire(interrupt, &wakeSocket)) return interrupted();
+    ThreadCancel::IoWait cancellation(interrupt, &wakeSocket);
+    if (const auto hook = pollWaitHook.load()) hook(0);
     std::vector<std::shared_ptr<void>> held;
     std::vector<NativePollDescriptor> native;
     std::vector<std::uint32_t> owners;
@@ -2092,6 +2122,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
     std::vector<std::uint32_t> kqueues;
     int ready = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
+        if (ThreadCancel::IoInterrupted()) return interrupted();
         auto& entry = descriptors[i];
         entry.revents = 0;
         if (entry.descriptor < 0) continue;
@@ -2123,6 +2154,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                 if (entry.revents) ++ready;
                 continue;
             }
+            if (ThreadCancel::IoInterrupted()) return interrupted();
             if (entry.descriptor <= 2) {
                 entry.revents = static_cast<short>(entry.descriptor == 0 ? 0 : entry.events & GuestPollWritable);
                 if (entry.revents) ++ready;
@@ -2157,12 +2189,16 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         owners.push_back(index);
     }
 #endif
-    if (native.empty() && pipes.empty() && kqueues.empty()) {
-        if (ready || timeout == 0) return ready;
-        if (timeout < 0) throw std::runtime_error("poll: an infinite wait without sockets or pipes never returns");
-        PreciseSleepUs(static_cast<unsigned long long>(timeout) * 1000);
-        return 0;
-    }
+    const auto nativeCount = native.size();
+    struct PollWakerTag {};
+    auto& waker = HostThreadLocal<Waker, PollWakerTag>();
+    char discarded[64];
+    while (::recv(waker.value, discarded, sizeof(discarded), 0) > 0) {}
+    wakeSocket.store(waker.value);
+    NativePollDescriptor wakeRequest{};
+    wakeRequest.fd = waker.value;
+    wakeRequest.events = POLLIN;
+    native.push_back(wakeRequest);
     const auto collect = [&](std::size_t i, bool pipe) {
         auto& entry = descriptors[owners[i]];
 #if defined(_WIN32) || defined(__APPLE__)
@@ -2209,6 +2245,7 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         return false;
     };
     for (;;) {
+        if (ThreadCancel::IoInterrupted()) return interrupted();
         int checkedReady = 0;
         const bool urgent = anyUrgentPending();
 #ifdef _WIN32
@@ -2221,11 +2258,6 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
         for (const auto index : kqueues) {
             auto& entry = descriptors[index];
             const auto readable = KqueueReadable(entry.descriptor);
-            if (!readable && DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
-                if (timeout < 0) return poll_nid_postfix(descriptors, count, -1);
-                const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-                return poll_nid_postfix(descriptors, count, static_cast<int>(std::max<long long>(0, (left + 999) / 1000)));
-            }
             entry.revents = !readable ? GuestPollInvalid : *readable ? static_cast<short>(entry.events & GuestPollReadable) : short{0};
             if (entry.revents) ++checkedReady;
         }
@@ -2238,27 +2270,26 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
                 slice = static_cast<int>(std::clamp<long long>(left, 0, 1));
             }
         }
-        if (!native.empty()) {
-            for (auto& request : native) request.revents = 0;
+        for (auto& request : native) request.revents = 0;
+        if (slice != 0)
+            if (const auto hook = pollWaitHook.load()) hook(1);
+        if (ThreadCancel::IoInterrupted()) return interrupted();
 #ifdef _WIN32
-            if (WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice) < 0) return Fail(NativeError());
+        if (WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice) < 0) return Fail(NativeError());
 #else
-            if (::poll(native.data(), static_cast<nfds_t>(native.size()), slice) < 0) return Fail(NativeError());
+        if (::poll(native.data(), static_cast<nfds_t>(native.size()), slice) < 0) return Fail(NativeError());
 #endif
-        } else if (!ready && !checkedReady && !urgent) {
-            const auto wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
-            PreciseSleepUntil(timeout < 0 ? wake : std::min(deadline, wake));
-        }
+        if (ThreadCancel::IoInterrupted()) return interrupted();
         int socketReady = 0;
-        for (const auto& request : native)
-            if (request.revents) ++socketReady;
+        for (std::size_t index = 0; index < nativeCount; ++index)
+            if (native[index].revents) ++socketReady;
         const bool expired = timeout >= 0 && std::chrono::steady_clock::now() >= deadline;
         if (ready || checkedReady || urgent || socketReady || expired || !sliced) {
             ready += checkedReady;
 #ifdef _WIN32
-            for (std::size_t i = 0; i < native.size(); ++i) collect(i, false);
+            for (std::size_t i = 0; i < nativeCount; ++i) collect(i, false);
 #else
-            for (std::size_t i = 0; i < native.size(); ++i) collect(i, i >= socketCount);
+            for (std::size_t i = 0; i < nativeCount; ++i) collect(i, i >= socketCount);
 #endif
             return ready;
         }
@@ -2266,14 +2297,16 @@ static int PollDescriptors(GuestPollDescriptor* descriptors, std::uint32_t count
 }
 
 int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t count, int timeout) {
-    if (timeout < -1) return Fail(22);
-    if (count && !descriptors) return Fail(14);
-    std::vector<GuestPollDescriptor> local(count);
-    const auto bytes = local.size() * sizeof(GuestPollDescriptor);
-    if (count && !GuestCopyIn_nid_no_patch(local.data(), descriptors, bytes)) return Fail(14);
-    const int result = PollDescriptors(local.data(), count, timeout);
-    if (result >= 0 && count && !GuestCopyOut_nid_no_patch(descriptors, local.data(), bytes)) return Fail(14);
-    return result;
+    return ThreadCancel::Io([&] {
+        if (timeout < -1) return Fail(22);
+        if (count && !descriptors) return Fail(14);
+        std::vector<GuestPollDescriptor> local(count);
+        const auto bytes = local.size() * sizeof(GuestPollDescriptor);
+        if (count && !GuestCopyIn_nid_no_patch(local.data(), descriptors, bytes)) return Fail(14);
+        const int result = PollDescriptors(local.data(), count, timeout);
+        if (result >= 0 && count && !GuestCopyOut_nid_no_patch(descriptors, local.data(), bytes)) return Fail(14);
+        return result;
+    }, false);
 }
 }
 

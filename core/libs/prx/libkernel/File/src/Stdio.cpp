@@ -1054,7 +1054,7 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
         if (!socket && !DescriptorIsOpen_nid_no_patch(from)) return PosixFailure(GUEST_EBADF);
     }
     GuestDescriptorAccess source(from, GuestDescriptorAccess::Mode::Read, std::defer_lock);
-    GuestDescriptorAccess target(to, GuestDescriptorAccess::Mode::Change, std::defer_lock);
+    GuestDescriptorAccess target(to, GuestDescriptorAccess::Mode::Replace, std::defer_lock);
     if (from == to) source.Lock();
     else GuestDescriptorAccess::LockTogether(source, target);
     if (GuestSockets::IsOpen(from)) {
