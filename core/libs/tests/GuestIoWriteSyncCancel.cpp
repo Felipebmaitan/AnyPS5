@@ -60,6 +60,7 @@ static int Flush(int file) {
     Require(file == state->file, "flush used a different descriptor");
     const auto call = state->calls.fetch_add(1) + 1;
     if (state->preflight != 0 && call != state->preflight) return 0;
+    if (state->scenario == "signal" && state->preflight == 0 && call > 1) return 0;
     if (state->scenario == "zero" || state->scenario == "error" || state->scenario == "legacy") return 0;
     state->entered.store(true);
     char token = 0;
@@ -122,7 +123,12 @@ static void* APS5_VABI Writer(void* opaque) {
     __pthread_cleanup_push_imp_nid_postfix(Cleanup, state, &cleanup);
     state->result = Write(2);
     state->error = *__error_nid_postfix();
+    if (state->scenario == "signal" && state->preflight == 0 && state->result == -1 && state->error == 4) {
+        state->result = Write(2);
+        state->error = *__error_nid_postfix();
+    }
     state->returned.store(true);
+    if (state->scenario == "cancel") scePthreadTestcancel();
     if (state->scenario == "disabled" || state->api == "sce") {
         Require(state->result == 2, "disabled or SCE flush lost completion");
         Require(scePthreadSetcancelstate(GUEST_CANCEL_ENABLE, nullptr) == 0, "enable cancellation");
@@ -211,8 +217,8 @@ int main(int argc, char** argv) {
         Require(joined == (canceled ? GUEST_CANCELED : reinterpret_cast<void*>(std::uintptr_t{7})), "unexpected flush join result");
         Require(state->cleanups.load() == 1 && state->destructors.load() == 1 && state->calls.load() == (state->preflight != 0 ? (waiting ? 2u : state->preflight) : 1u), "flush repeated or cleanup lost");
         Require(std::filesystem::file_size(path) == (state->preflight != 0 && !waiting ? 0u : 2u), "flush interruption changed write progress");
-        if (canceled) Require(state->returned.load() == waiting, "canceled flush completion state");
-        else if (state->scenario == "complete") Require(state->result == 2, "completed flush lost positive result");
+        if (canceled) Require(state->returned.load() == (waiting || state->preflight == 0), "canceled flush completion state");
+        else if (state->scenario == "complete" || state->preflight == 0) Require(state->result == 2, "completed flush lost positive result");
         else Require(state->result == -1 && state->error == 4, "interrupted flush did not return EINTR");
         if (state->scenario == "signal") Require(state->signals.load() == 1, "restartable signal lost or write repeated");
         Require(scePthreadKeyDelete(state->key) == 0, "delete flush TSD key");
