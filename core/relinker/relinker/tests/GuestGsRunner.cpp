@@ -51,7 +51,6 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #ifndef GUEST_GS_RUNTIME
-    GuestGsInstallContinuation_nid_no_patch();
     AddVectoredExceptionHandler(1, Handle);
 #endif
     const auto nt = Read<std::uint32_t>(bytes.data() + 0x3c);
@@ -65,6 +64,7 @@ int main(int argc, char** argv) {
         const auto* section = bytes.data() + sections + index * 40;
         std::memcpy(image + Read<std::uint32_t>(section + 12), bytes.data() + Read<std::uint32_t>(section + 20), Read<std::uint32_t>(section + 16));
     }
+    if (!GuestGsRegisterImage_nid_no_patch(image)) return 4;
 #else
     image = static_cast<std::uint8_t*>(mmap(nullptr, bytes.size(), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (image == MAP_FAILED) return 4;
