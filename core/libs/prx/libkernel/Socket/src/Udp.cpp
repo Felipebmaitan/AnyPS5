@@ -946,7 +946,16 @@ int SendBytes(Socket& socket, int remaining, int flags) {
 #ifdef _WIN32
     if (ThreadCancel::IoActive() && socket.type == 1 && (flags & GuestDontWait) == 0) {
         std::lock_guard lock(socket.modeMutex);
-        if (!socket.options.nonblocking) return std::min(remaining, std::max(1, socket.options.sendBuffer));
+        if (!socket.options.nonblocking) {
+            if (socket.options.sendBuffer == 0) {
+                int buffer = 0;
+                std::uint32_t length = sizeof(buffer);
+                const int error = GuestSockets::GetSocketLevelOption(static_cast<std::uintptr_t>(socket.value), socket.options,
+                    socket.family, socket.type, 0x1001, &buffer, &length);
+                if (error != 0) throw std::runtime_error("send: initializing the send-buffer limit failed, error=" + std::to_string(error));
+            }
+            return std::min(remaining, std::max(1, socket.options.sendBuffer));
+        }
     }
 #else
     static_cast<void>(socket);
