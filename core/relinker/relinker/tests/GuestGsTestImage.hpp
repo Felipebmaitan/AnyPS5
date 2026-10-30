@@ -5,6 +5,7 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/GuestGs.hpp"
 #else
 #include <sys/mman.h>
 #endif
@@ -34,6 +35,10 @@ inline std::uint8_t* GuestGsMapTestImage(const std::vector<std::uint8_t>& bytes)
     for (unsigned index = 0; index < read.operator()<std::uint16_t>(nt + 6); ++index) {
         const auto section = sections + index * 40;
         std::memcpy(image + read.operator()<std::uint32_t>(section + 12), bytes.data() + read.operator()<std::uint32_t>(section + 20), read.operator()<std::uint32_t>(section + 16));
+    }
+    if (!GuestGsRegisterImage_nid_no_patch(image)) {
+        VirtualFree(image, 0, MEM_RELEASE);
+        return nullptr;
     }
     return image;
 #else

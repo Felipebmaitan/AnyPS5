@@ -31,7 +31,6 @@ struct GuestRuntime {
     std::set<std::string> ZeroReturnExports;
     bool DeferInitialization = false;
     bool RequiresGuestGsRuntime = false;
-    bool RequiresGuestGsContinuation = false;
 };
 
 }
