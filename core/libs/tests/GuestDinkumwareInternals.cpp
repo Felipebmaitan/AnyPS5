@@ -209,6 +209,36 @@ void TestIntegerErrors() {
     Require(_Stoullx_nid_postfix("18446744073709551616", &end, 10, &error) == 18446744073709551615ull && error == RangeError && *__error_nid_postfix() == RangeError, "_Stoullx overflow");
 }
 
+void TestFloatingRounds() {
+    GuestFloatingPointEnvironment saved;
+    Require(fegetenv_nid_postfix(&saved) == 0, "save floating environment");
+    constexpr int Expected[]{1, 3, 2, 0};
+    const int savedErrno = *__error_nid_postfix();
+    for (const unsigned precision : {0u, 0x200u, 0x300u}) {
+        for (unsigned x87 = 0; x87 != 4; ++x87) {
+            for (unsigned sse = 0; sse != 4; ++sse) {
+                for (const unsigned flush : {0u, 0x40u, 0x8000u, 0x8040u}) {
+                    auto input = saved;
+                    input.control = (input.control & 0xffff0000u) | 0x7fu | precision | (x87 << 10u);
+                    input.status = (input.status & ~0x3fu) | 0x25u;
+                    input.mxcsr = 0x1fa5u | (sse << 13u) | flush;
+                    asm volatile("fldenv %0" : : "m"(input));
+                    asm volatile("ldmxcsr %0" : : "m"(input.mxcsr));
+                    *__error_nid_postfix() = 97;
+                    Require(_Fltrounds_nid_postfix() == Expected[x87], "_Fltrounds follows x87 independently of SSE");
+                    GuestFloatingPointEnvironment after;
+                    Require(fegetenv_nid_postfix(&after) == 0, "read floating environment");
+                    Require(after.control == input.control && (after.status & 0x3fu) == 0x25u && after.mxcsr == input.mxcsr, "_Fltrounds preserves controls and flags");
+                    Require(*__error_nid_postfix() == 97, "_Fltrounds preserves errno");
+                }
+            }
+        }
+    }
+    asm volatile("fldenv %0" : : "m"(saved));
+    asm volatile("ldmxcsr %0" : : "m"(saved.mxcsr));
+    *__error_nid_postfix() = savedErrno;
+}
+
 void TestDoubleHelpers() {
     const double e = 0x1.5bf0a8b145769p+1;
     CheckExp(1.0, 1.0, 0, e, Finite, 0, 0, "_Exp e");
@@ -253,6 +283,10 @@ void TestDoubleHelpers() {
     CheckExp(0.0, 1.0, 2000, INFINITY, Infinite, ERANGE, FE_OVERFLOW | FE_INEXACT, "_Exp scaled overflow");
     CheckExp(1842.0, 1.0, 0, INFINITY, Infinite, ERANGE, FE_OVERFLOW | FE_INEXACT, "_Exp inside the positive cutoff overflows");
     CheckExp(-1842.0, 1.0, 0, 0.0, Zero, ERANGE, FE_UNDERFLOW | FE_INEXACT, "_Exp inside the negative cutoff underflows");
+    CheckExp(-0x1.a3ae147ae147bp+3, 1.0, 3, 0x1.0e6b5a0a65117p-16, Finite, 0, FE_INEXACT, "_Exp rounds a negative exponent as titles do");
+    CheckExp(-0x1.e1fae147ae148p+6, 2.0, 3, 0x1.1e838b63af9c1p-170, Finite, 0, FE_INEXACT, "_Exp rounds a scaled small result as titles do");
+    CheckExp(0x1.b073b645a1cacp+7, -1.0, -1, -0x1.edef67d6786cep+310, Finite, 0, FE_INEXACT, "_Exp rounds a large negative product as titles do");
+    CheckExp(0x1.5c523eb57b55fp-53, 2.0, 0, 0x1.0000000000001p+1, Finite, 0, FE_INEXACT, "_Exp evaluates arguments above half an epsilon");
 
     errno = 0;
     std::feclearexcept(FE_ALL_EXCEPT);
@@ -340,6 +374,10 @@ void TestDoubleHelpers() {
     CheckFExp(0.0f, 1.0f, 200, INFINITY, Infinite, ERANGE, FE_OVERFLOW | FE_INEXACT, "_FExp scaled overflow");
     CheckFExp(229.0f, 1.0f, 0, INFINITY, Infinite, ERANGE, FE_OVERFLOW | FE_INEXACT, "_FExp inside the positive cutoff overflows");
     CheckFExp(-229.0f, 1.0f, 0, 0.0f, Zero, ERANGE, FE_UNDERFLOW | FE_INEXACT, "_FExp inside the negative cutoff underflows");
+    CheckFExp(-0x1.4fbe76p+0f, 1.0f, 3, 0x1.13e1bp+1f, Finite, 0, FE_INEXACT, "_FExp rounds a negative exponent as titles do");
+    CheckFExp(-0x1.fd4b92p+5f, 1.0f, -3, 0x1.1d1806p-95f, Finite, 0, FE_INEXACT, "_FExp rounds a scaled small result as titles do");
+    CheckFExp(0x1.5e147ap+4f, 2.0f, 3, 0x1.7b078cp+35f, Finite, 0, FE_INEXACT, "_FExp rounds a large product as titles do");
+    CheckFExp(0x1.0644b8p-24f, 0.25f, 2, 0x1.000002p+0f, Finite, 0, FE_INEXACT, "_FExp evaluates arguments above half an epsilon");
 
     errno = 0;
     std::feclearexcept(FE_ALL_EXCEPT);
@@ -410,6 +448,7 @@ int main() {
     TestStod();
     TestStoll();
     TestDoubleHelpers();
+    TestFloatingRounds();
     TestFloatErrors();
     TestIntegerErrors();
     TestArithmetic();

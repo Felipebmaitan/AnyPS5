@@ -147,7 +147,6 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #ifndef GUEST_GS_RUNTIME
-    GuestGsInstallContinuation_nid_no_patch();
     AddVectoredExceptionHandler(1, Handle);
 #else
     if (expectedFault) AddVectoredExceptionHandler(1, Handle);

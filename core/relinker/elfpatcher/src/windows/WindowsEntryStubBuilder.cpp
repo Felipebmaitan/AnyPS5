@@ -69,7 +69,7 @@ std::u16string toUtf16(const std::string& text) {
 
 }
 
-WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules, const std::set<std::string>& unmatchedImportModules, const bool traceImports, const bool requiresGuestGsRuntime, const bool requiresGuestGsContinuation) const {
+WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules, const std::set<std::string>& unmatchedImportModules, const bool traceImports, const bool requiresGuestGsRuntime) const {
     if (!imports.empty() && libraries.empty())
         throw Domain::RelinkerException("ELF imports have no DT_NEEDED libraries");
     const auto path = normalizeRunPath(runPath);
@@ -168,13 +168,15 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     std::vector<bool> imported(libraries.size());
     std::optional<std::size_t> gsProvider;
     std::uint32_t gsSymbol = 0;
+    std::uint32_t gsFunction = 0;
     if (requiresGuestGsRuntime) {
         for (std::size_t index = guestModules.size(); index < libraries.size(); ++index) {
             if (libraries[index] == "libc.prx") gsProvider = index;
         }
         if (!gsProvider) throw Domain::RelinkerException("Windows guest GS requires libc.prx among the libraries");
         imported[*gsProvider] = true;
-        gsSymbol = addString(requiresGuestGsContinuation ? "GuestGsInstallContinuation_nid_no_patch" : "GuestGsIsReplay_nid_no_patch");
+        gsSymbol = addString("GuestGsRegisterImage_nid_no_patch");
+        gsFunction = reserve(8);
     }
     std::vector<bool> executableImports(guestModules.size());
     const bool unscopedImports = std::any_of(imports.begin(), imports.end(), [](const auto& import) { return import.Library.empty(); });
@@ -287,6 +289,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
             (import.Library.empty() ? std::string{} : " from " + import.Library) + "\n");
     const auto gsError = errors.size();
     if (requiresGuestGsRuntime) errors.push_back("FAIL: libc.prx does not provide the Windows guest GS runtime\n");
+    const auto gsRegistrationError = errors.size();
+    if (requiresGuestGsRuntime) errors.push_back("FAIL: cannot register Windows guest GS image metadata\n");
     const auto argumentError = errors.size();
     errors.push_back("FAIL: cannot prepare command-line arguments\n");
     const auto parentError = errors.size();
@@ -694,6 +698,21 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         code.Rip({0x48, 0x8d, 0x15}, gsSymbol);
         call("GetProcAddress");
         requireNonzero(gsError, 0xc0000139u);
+        code.Rip({0x48, 0x89, 0x05}, gsFunction);
+        code.Rip({0x48, 0x8d, 0x0d}, 0);
+        code.Rip({0xff, 0x15}, gsFunction);
+        code.Emit({0x0f, 0xb6, 0xc0});
+        requireNonzero(gsRegistrationError, 0xc000007bu);
+        for (std::size_t index = 0; index < guestModules.size(); ++index) {
+            if (!guestModules[index].RequiresGuestGsRuntime) continue;
+            code.Rip({0x48, 0x8b, 0x0d}, CheckedRva(handles + index * 8));
+            code.Emit({0x48, 0x85, 0xc9});
+            const auto absent = code.Branch({0x0f, 0x84});
+            code.Rip({0xff, 0x15}, gsFunction);
+            code.Emit({0x0f, 0xb6, 0xc0});
+            requireNonzero(gsRegistrationError, 0xc000007bu);
+            code.PatchBranch(absent, code.GetRva());
+        }
     }
     if (traceImports) {
         code.Rip({0x48, 0x8b, 0x0d}, CheckedRva(handles + *traceProvider * 8));

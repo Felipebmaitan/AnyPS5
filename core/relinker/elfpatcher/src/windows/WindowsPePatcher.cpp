@@ -68,6 +68,10 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(std::vector<std::uint8_t> sour
         sections.push_back({".procpar", nextRva, SectionRead | 0x40u, std::move(metadata)});
         nextRva = AlignRva(nextRva + sections.back().Data.size());
     }
+    if (!hasProcessParameters) {
+        sections.push_back({".procpar", nextRva, SectionRead | 0x40u, std::vector<std::uint8_t>(8)});
+        nextRva = AlignRva(nextRva + sections.back().Data.size());
+    }
     for (const auto& header : originalHeaders) {
         if (header.Type != 0x6474e550) continue;
         std::vector<std::uint8_t> metadata(4);
@@ -86,8 +90,6 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(std::vector<std::uint8_t> sour
     auto libraries = importBuilder.ReadLibraries(dynamicSection);
     const bool requiresGuestGsRuntime = std::any_of(sections.begin(), sections.end(), [](const auto& section) { return section.Name == ".ggs"; }) ||
         std::any_of(dynamicSection.GuestModules.begin(), dynamicSection.GuestModules.end(), [](const auto& module) { return module.RequiresGuestGsRuntime; });
-    const bool requiresGuestGsContinuation = std::any_of(sections.begin(), sections.end(), [](const auto& section) { return section.Name == ".ggm"; }) ||
-        std::any_of(dynamicSection.GuestModules.begin(), dynamicSection.GuestModules.end(), [](const auto& module) { return module.RequiresGuestGsContinuation; });
     if (requiresGuestGsRuntime && std::find(libraries.begin(), libraries.end(), "libc.prx") == libraries.end())
         libraries.emplace_back("libc.prx");
     std::vector<std::string> guestPaths;
@@ -104,7 +106,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(std::vector<std::uint8_t> sour
     if (dependencyDiagnostics)
         for (const auto& import : relocations.Imports) diagnostics += import.Name + '\n';
     report(8500);
-    auto entry = WindowsEntryStubBuilder().Build(nextRva, image.GetEntryRva(), nativeImports, libraries, relocations.Imports, runPath, lazyBinding, dependencyDiagnostics, dynamicSection.GuestModules, dynamicSection.UnmatchedImportModules, traceImports, requiresGuestGsRuntime, requiresGuestGsContinuation);
+    auto entry = WindowsEntryStubBuilder().Build(nextRva, image.GetEntryRva(), nativeImports, libraries, relocations.Imports, runPath, lazyBinding, dependencyDiagnostics, dynamicSection.GuestModules, dynamicSection.UnmatchedImportModules, traceImports, requiresGuestGsRuntime);
     report(9000);
     directories[3] = entry.ExceptionDirectory;
     const auto entryRva = entry.Code.Rva;
