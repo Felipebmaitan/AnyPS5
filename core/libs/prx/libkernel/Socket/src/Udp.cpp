@@ -947,7 +947,16 @@ int SendBytes(Socket& socket, int remaining, int flags) {
 #ifdef _WIN32
     if (ThreadCancel::IoActive() && socket.type == 1 && (flags & GuestDontWait) == 0) {
         std::lock_guard lock(socket.modeMutex);
-        if (!socket.options.nonblocking) return std::min(remaining, std::max(1, socket.options.sendBuffer));
+        if (!socket.options.nonblocking) {
+            if (socket.options.sendBuffer == 0) {
+                int buffer = 0;
+                std::uint32_t length = sizeof(buffer);
+                const int error = GuestSockets::GetSocketLevelOption(static_cast<std::uintptr_t>(socket.value), socket.options,
+                    socket.family, socket.type, 0x1001, &buffer, &length);
+                if (error != 0) throw std::runtime_error("send: initializing the send-buffer limit failed, error=" + std::to_string(error));
+            }
+            return std::min(remaining, std::max(1, socket.options.sendBuffer));
+        }
     }
 #else
     static_cast<void>(socket);
@@ -1337,17 +1346,20 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
         return 0;
     }
     if (command == 3) return 2 | (socket->options.nonblocking ? 4 : 0); // F_GETFL, O_RDWR
-    if (command != 4) return Fail(22);
-    const int flags = static_cast<int>(argument);
-    if ((flags & ~7) != 0) return Fail(45);
+    if (command == 4) {
+        const int flags = static_cast<int>(argument);
+        if ((flags & ~7) != 0) return Fail(45);
 #ifdef _WIN32
-    unsigned long enabled = (flags & 4) != 0;
+        unsigned long enabled = (flags & 4) != 0;
 #else
-    int enabled = (flags & 4) != 0;
-    if (::ioctl(socket->value, FIONBIO, &enabled)) return Fail(NativeError());
+        int enabled = (flags & 4) != 0;
+        if (::ioctl(socket->value, FIONBIO, &enabled)) return Fail(NativeError());
 #endif
-    socket->options.nonblocking = enabled != 0;
-    return 0;
+        socket->options.nonblocking = enabled != 0;
+        return 0;
+    }
+    if ((command >= 7 && command <= 9) || (command >= 11 && command <= 13) || command == 15 || command == 16) return Fail(9);
+    return Fail(22);
 }
 int APS5_VABI _fcntl_nid_postfix(int descriptor, int command, ...) {
 #ifdef _WIN32
