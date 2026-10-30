@@ -234,12 +234,12 @@ bool AppArchiveDescriptor_nid_no_patch(int descriptor, AppArchiveNode* node, std
     return true;
 }
 
-bool AppArchiveMappingDescriptor_nid_no_patch(int descriptor, int* backing) {
+bool AppArchiveMappingDescriptor_nid_no_patch(int descriptor, std::uint64_t offset, std::uint64_t length, int* backing) {
     const auto file = Attached(descriptor);
     if (!file) return false;
     if (backing == nullptr) throw std::invalid_argument("AppArchiveMappingDescriptor: null output");
     std::lock_guard lock(file->mutex);
-    *backing = AppArchiveMaterialize_nid_no_patch(file->node);
+    *backing = AppArchiveMaterialize_nid_no_patch(file->node, offset, length);
     return true;
 }
 

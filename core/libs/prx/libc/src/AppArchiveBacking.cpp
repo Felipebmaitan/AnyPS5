@@ -157,17 +157,19 @@ private:
 
 }
 
-extern "C" int AppArchiveMaterialize_nid_no_patch(const AppArchiveNode& node) {
-    if (node.Directory || node.Size > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+extern "C" int AppArchiveMaterialize_nid_no_patch(const AppArchiveNode& node, std::uint64_t offset, std::uint64_t length) {
+    constexpr auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (node.Directory || node.Size > limit || offset > limit || length > limit - offset)
         throw std::invalid_argument("materialize app0.zar: not a representable regular file");
     TemporaryBacking backing;
     std::array<unsigned char, 65536> buffer{};
-    for (std::uint64_t offset = 0; offset < node.Size;) {
-        const auto amount = std::min<std::uint64_t>(buffer.size(), node.Size - offset);
-        const auto read = AppArchiveRead_nid_no_patch(node.Handle, offset, buffer.data(), amount);
+    const auto available = offset < node.Size ? std::min(length, node.Size - offset) : 0;
+    for (std::uint64_t done = 0; done < available;) {
+        const auto amount = std::min<std::uint64_t>(buffer.size(), available - done);
+        const auto read = AppArchiveRead_nid_no_patch(node.Handle, offset + done, buffer.data(), amount);
         if (read != amount) throw std::runtime_error("materialize app0.zar: truncated archive entry");
         backing.Write(buffer.data(), static_cast<std::size_t>(amount));
-        offset += amount;
+        done += amount;
     }
     return backing.ReadOnlyDescriptor();
 }

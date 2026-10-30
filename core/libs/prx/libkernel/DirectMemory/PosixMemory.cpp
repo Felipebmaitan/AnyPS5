@@ -213,7 +213,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     ArchiveMappingDescriptor archive;
     try {
         if (File::IsArchivedFile(descriptor) && kind == GuestShared && (protection & 2) != 0) return failed(GuestAccess);
-        AppArchiveMappingDescriptor_nid_no_patch(descriptor, &archive.descriptor);
+        AppArchiveMappingDescriptor_nid_no_patch(descriptor, static_cast<std::uint64_t>(offset), rounded, &archive.descriptor);
     } catch (const std::system_error& error) {
         if (error.code() == std::errc::not_enough_memory) return failed(GuestNoMemory);
         if (error.code() == std::errc::permission_denied) return failed(GuestAccess);
@@ -236,6 +236,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         return failed(GuestIoError);
     }
     const int sourceDescriptor = archive.descriptor >= 0 ? archive.descriptor : descriptor;
+    const auto mappingOffset = archive.descriptor >= 0 ? std::int64_t{0} : offset;
 #if defined(__linux__) || defined(__APPLE__)
     const bool archiveBacked = archive.descriptor >= 0;
     const ScopedDescriptor pinnedDescriptor(sourceDescriptor, !archiveBacked);
@@ -262,7 +263,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
         if (kind == GuestShared && (protection & 2) != 0 && accessMode == 0) return failed(GuestAccess);
         if (kind == GuestPrivate) {
             const std::size_t privateAlignment = (flags & GuestAlignedSuper) != 0 ? SuperpageSize : PS5_PAGE_SIZE;
-            return MapPrivateFileCopy(address, rounded, protection, placement, privateAlignment, handle, mappingDescriptor, offset, accessMode, failed);
+            return MapPrivateFileCopy(address, rounded, protection, placement, privateAlignment, handle, mappingDescriptor, mappingOffset, accessMode, failed);
         }
     }
 #else
@@ -273,7 +274,7 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     void* mapped = nullptr;
     try {
         mapped = address;
-        const auto result = DoMapFileBacked_nid_no_patch(&mapped, rounded, protection, kind | placement, mappingDescriptor, static_cast<std::uint64_t>(offset), alignment);
+        const auto result = DoMapFileBacked_nid_no_patch(&mapped, rounded, protection, kind | placement, mappingDescriptor, static_cast<std::uint64_t>(mappingOffset), alignment);
         if (result != 0) return failed(result == SCE_KERNEL_ERROR_EINVAL ? GuestInvalid : GuestNoMemory);
         if ((placement & GuestMapFixed) != 0) ReleaseFlexibleMappingRange(reinterpret_cast<std::uintptr_t>(mapped), rounded);
         return mapped;
