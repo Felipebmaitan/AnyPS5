@@ -8,6 +8,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +66,31 @@ struct State {
     std::atomic<int> cleanups{0};
     std::atomic<int> destructors{0};
     std::atomic<Pthread> adopted{nullptr};
+};
+
+class Watchdog {
+public:
+    std::atomic<const char*> stage{"setup"};
+    explicit Watchdog(State& state) : monitor([this, &state] {
+        std::unique_lock lock(mutex);
+        if (condition.wait_for(lock, std::chrono::seconds(10), [this] { return done; })) return;
+        std::fprintf(stderr, "I/O context stalled: stage=%s phase=%d\n", stage.load(), state.phase.load());
+        std::fflush(stderr);
+        std::abort();
+    }) {}
+    ~Watchdog() {
+        {
+            std::lock_guard lock(mutex);
+            done = true;
+        }
+        condition.notify_one();
+        monitor.join();
+    }
+private:
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool done = false;
+    std::thread monitor;
 };
 
 static State* state;
@@ -236,6 +263,7 @@ int main(int argc, char** argv) {
     Require(argc == 2, "expected adopted, adopted_exit, swap, jump or sigjump");
     State reading;
     state = &reading;
+    Watchdog watchdog(reading);
 #ifdef __linux__
     if (std::strcmp(argv[1], "churn") == 0) { ContextChurn(); return 0; }
 #endif
@@ -282,13 +310,16 @@ int main(int argc, char** argv) {
     Pthread worker = nullptr;
     Require(scePthreadCreate(&worker, nullptr, Scheduler, nullptr, nullptr) == 0, "create fibre scheduler");
     for (int phase = 1; phase <= 2; ++phase) {
+        watchdog.stage.store("observe read admission");
         Require(Observe([&] {
             if (reading.phase.load() != phase) return false;
             std::lock_guard lock(worker->cancelLock);
             return worker->cancelIo != nullptr;
         }), "fibre read did not block");
+        watchdog.stage.store("raise exception");
         Require(sceKernelRaiseException(worker, 30) == 0, "interrupt fibre read");
     }
+    watchdog.stage.store("observe scheduler completion");
     Require(Observe([&] { return worker->_finished.load(); }), "fibre scheduler did not finish");
     Require(scePthreadJoin(worker, nullptr) == 0, "join fibre scheduler");
     Require(sceKernelRemoveExceptionHandler(30) == 0, "remove fibre handler");
