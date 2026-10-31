@@ -362,6 +362,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     if (APS5_ENABLE_TIMING_LOG) tail.roomReadyAt = std::chrono::steady_clock::now();
     auto* const capture = SubmissionCapture::Active();
     auto captured = capture != nullptr ? SubmissionCapture::Prepare(tail.queue, SubmissionKind::Rewind, tail.commands, tail.conditionalEnds) : CapturedSubmission{};
+    std::uint64_t retiredTakes = 0;
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -370,12 +371,15 @@ void Driver::executeRewindTail(const Submission& stalled) {
         tail.shaders = shaders;
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
+        const auto& waiting = workers[tail.queue].pending;
+        retiredTakes = waiting.empty() ? tail.received : std::min(tail.received, waiting.front().received);
         if (capture != nullptr) capture->Take(captured, tail.serial, captureTime(), tail.heldAtSubmit);
         if (ring) RecordSubmission(tail.queue, tail.serial, tail.commands, stalled.rewindTail, true);
     }
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
+    retireLabelTakes(tail.queue, retiredTakes);
     execute(tail);
 }
 
@@ -535,6 +539,18 @@ bool Driver::queue0Before(std::uint64_t received) const {
     for (const auto& pending : worker->second.pending) {
         if (pending.suspend) continue;
         return pending.received < received;
+    }
+    return false;
+}
+
+bool Driver::waitFreeBefore(std::uint64_t received) const {
+    for (const auto& [queue, worker] : workers) {
+        if (queue == 0 || worker.executingWaits) continue;
+        if (worker.executingWaitFree != 0 && worker.executingWaitFree < received) return true;
+        for (const auto& pending : worker.pending) {
+            if (!pending.waitFree || pending.received >= received) break;
+            return true;
+        }
     }
     return false;
 }
