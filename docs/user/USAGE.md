@@ -369,6 +369,18 @@ Leave the variable unset to keep the explicit error. Any other value also stops 
 
 Press F12 in the game window to save the next displayed frame as a PNG at the resolution of the game's display buffer, without the window's scaling, letterbox or [performance overlay](#performance-overlay). A BT.2100 PQ display buffer is saved converted to SDR, also while it is shown through [HDR output](#hdr-output). Files are named `<title ID>-<YYYYMMDD-HHMMSS>.png` and written to an `anyps5-screenshots/` directory beside the output executable, which is created when needed; set `ANYPS5_SCREENSHOTS` to use another directory. The saved path is printed to stderr. Presses while the previous screenshot is still being written are merged into one. The key is the `Screenshot` action of the [input mapping](INPUT_MAPPING.md). A screenshot that cannot be written stops the game with the error.
 
+### Host volume and mute
+
+F5 lowers, F6 raises and F8 mutes the host's output volume for the game window; the keys can be changed with `VolumeDown`, `VolumeUp` and `ToggleMute` in [the input mapping](INPUT_MAPPING.md). This is a control of the host, like the volume of a media player: it is not a console behaviour, the title does not see it, and its own volume settings are not changed.
+
+The volume goes from 0 to 100 in steps of 5 and starts at 100, or at `ANYPS5_VOLUME` (a whole number from 0 to 100). The output amplitude is the square of the volume as a fraction of 100, so 50 is a quarter of the amplitude. Mute is separate from the volume: unmuting brings the volume back, and a volume key while muted unmutes. A change of gain moves over 10 ms instead of jumping. Each press prints one line on stderr with the resulting level or mute; there is no on-screen indicator.
+
+At volume 100 and not muted the audio is passed to the host device unchanged, with no processing at all. The volume applies to what the title plays through `libSceAudioOut` and `libSceAudioOut2`, including what `libSceAudio3d` plays through them. The controller's own sound card and haptics, and the microphone, are not affected.
+
+Set `ANYPS5_MUTE_ON_FOCUS_LOSS=1` to mute the audio while the display window has no focus and restore it when the focus returns. `0` or unset leaves the audio alone. It does not change the mute set with the key: a window you muted stays muted when it regains focus. Only focus events count, so a window minimized without losing focus stays audible, and a window that opens without focus starts muted. An invalid value of either variable, including an empty one, stops the game with an error naming it.
+
+The keys work while the display window has focus. Not measured on a real audio device or on a console.
+
 ### GPU selection
 
 The game runs on the first Vulkan 1.1 device with graphics and compute queues and swapchain presentation, preferring a discrete GPU over an integrated one. Set `ANYPS5_GPU` to a part of a device name, compared without regard to case, to run on another device; the names are printed at start-up in the `Physical device candidate` lines. When no usable device contains the text, the start fails and the error lists the device names.
@@ -513,6 +525,16 @@ ANYPS5_LOG_FILE=run.log ./app.elf
 - While the variable is set the executable runs two extra threads and holds the standard streams in two pipes. A child process the title starts keeps its output in the same pipes, so output it writes after the title exits is lost, and on Linux and macOS the `SIGPIPE` of that write ends it unless it ignores the signal. When the title replaces itself with another executable through `sceSystemServiceLoadExec`, the real streams are handed over first.
 - With no console, for example a Windows executable started without one, only the file receives the log.
 - On Windows the redirection of the standard handles and the crash report path were written from the code and compiled for MinGW, but not run: an unexpected behaviour there is worth a bug report that says so.
+
+### Controller status panel
+
+A small panel over the presented image lists the controllers of the four player slots, one line for each slot that has had a controller since the game started (with `ANYPS5_PAD_STATUS` unset or 0, since the first F9 press, because controllers are not tracked before that): `P1 DUALSENSE  WIRED`, `P2 XBOX  BATTERY MEDIUM`, `P3 DISCONNECTED`. It is never shown permanently: it disappears 4 seconds after the last thing that showed it. With no controller seen yet it reads `NO CONTROLLER`.
+
+F9 shows it, in the game window; pressing F9 while it is shown starts the 4 seconds again. The key is `ShowPadStatus` in the [input mapping](INPUT_MAPPING.md) and accepts only keyboard keys. With `ANYPS5_PAD_STATUS=1` it also appears by itself when a controller connects (including a controller already connected when the game starts), disconnects, is replaced by another one in its slot, or its battery enters a lower class (full, medium, low, empty); each new event starts the 4 seconds again. `ANYPS5_PAD_STATUS=0` is the same as unset: only F9 shows it. For this variable an empty value is the same as an unset one, and any other value stops the game when video output starts, with an error that names the variable.
+
+A line is the player number (the controller's slot: a controller that reconnects takes the lowest free slot, which can be another player), the controller type and its power. The type is `DUALSENSE`, `DUALSHOCK 4`, `DUALSHOCK 3`, `XBOX` or `SWITCH`; for any other controller it is the name SDL reports, reduced to the characters of the overlay font and cut to 12 characters with a final dot, or `PAD` when SDL gives no name. The power is `WIRED` or one of SDL's battery classes, `BATTERY EMPTY` (up to 5%), `BATTERY LOW` (up to 20%), `BATTERY MEDIUM` (up to 70%) and `BATTERY FULL`; a controller whose driver or connection reports no level reads `BATTERY UNKNOWN`. What is reported depends on SDL, the operating system and the controller.
+
+The panel uses the font and scale of the [performance overlay](#performance-overlay) and sits in the corner mirrored horizontally from `ANYPS5_OVERLAY_POS`, the top right by default, so it never covers that overlay. While the system on-screen keyboard is shown the panel is not drawn, and its 4 seconds keep running. Screenshots do not include it. While it is hidden, which is always so unless F9 or `ANYPS5_PAD_STATUS=1` shows it, nothing is drawn, no render pass or memory is allocated for it and the presented image is unchanged. What still runs is a lock and a clock read in each present and in each video-out loop pass, to see whether the panel is wanted. With `ANYPS5_PAD_STATUS` unset or 0 and no F9 press, no controller name is copied and no battery level is read for it; they are read on every loop pass with `ANYPS5_PAD_STATUS=1`, and while the panel is shown after F9.
 
 ### Windows crash diagnostics
 
