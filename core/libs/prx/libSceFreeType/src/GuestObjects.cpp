@@ -57,7 +57,7 @@ void SyncFace_nid_no_patch(GuestFace& face) {
     SyncSlot(face);
 }
 
-void SyncSizeRecord_nid_no_patch(GuestFace& face, GuestSizeRec& rec, FT_Size host) {
+extern "C" void SyncSizeRecord_nid_no_patch(GuestFace& face, GuestSizeRec& rec, FT_Size host) {
     rec.face = &face.rec;
     rec.internal = host;
     if (!host) {
@@ -68,7 +68,7 @@ void SyncSizeRecord_nid_no_patch(GuestFace& face, GuestSizeRec& rec, FT_Size hos
     rec.metrics = {metrics.x_ppem, metrics.y_ppem, metrics.x_scale, metrics.y_scale, metrics.ascender, metrics.descender, metrics.height, metrics.max_advance};
 }
 
-void SyncSizePointer_nid_no_patch(GuestFace& face) {
+extern "C" void SyncSizePointer_nid_no_patch(GuestFace& face) {
     const FT_Size active = face.host->size;
     if (!active) {
         face.rec.size = nullptr;
