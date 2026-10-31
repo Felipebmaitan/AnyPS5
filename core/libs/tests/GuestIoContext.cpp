@@ -55,6 +55,7 @@ struct State {
     Fibre* active = nullptr;
     bool jumps = false;
     bool signalJumps = false;
+    bool underscoreJumps = false;
     bool manual = false;
     bool leave = false;
     bool signalLeave = false;
@@ -97,6 +98,18 @@ static void Switch(Fibre& from, Fibre& to) {
             }
             setcontext_nid_postfix(&to.context);
             Require(false, "signal context restore returned");
+        }
+        return;
+    }
+    if (state->underscoreJumps) {
+        if (_setjmp_nid_postfix(from.jump) == 0) {
+            if (to.started) {
+                alignas(16) std::uint64_t target[12];
+                std::memcpy(target, to.jump, sizeof(target));
+                _longjmp_nid_postfix(target, 1);
+            }
+            setcontext_nid_postfix(&to.context);
+            Require(false, "underscore context restore returned");
         }
         return;
     }
@@ -262,6 +275,7 @@ int main(int argc, char** argv) {
     reading.leave = scenario.ends_with("leave");
     reading.signalLeave = scenario.ends_with("sigleave");
     reading.signalJumps = scenario.ends_with("sigjump");
+    reading.underscoreJumps = scenario.ends_with("underscorejump");
     reading.jumps = scenario.ends_with("jump");
     for (auto& fibre : reading.fibres) Require(pipe_nid_postfix(fibre.descriptors) == 0, "create fibre pipe");
     Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(Handler)) == 0, "install fibre handler");
