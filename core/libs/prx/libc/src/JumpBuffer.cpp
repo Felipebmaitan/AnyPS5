@@ -154,6 +154,9 @@ asm(".text\n"
     "    fldcw 68(%rdi)\n"
     "    jmp *0(%rdi)\n"
     APS5_ASM_FUNCTION("_setjmp_nid_postfix")
+    "    push %rdi\n"
+    APS5_JUMP_ASM_CALL("JumpBufferSaveContext_nid_no_patch")
+    "    pop %rdi\n"
     "    movl $0, 88(%rdi)\n"
     "    mov (%rsp), %rax\n"
     "    mov %rax, 0(%rdi)\n"
@@ -170,15 +173,18 @@ asm(".text\n"
     "    xor %eax, %eax\n"
     "    ret\n"
     APS5_ASM_FUNCTION("_longjmp_nid_postfix")
-#ifdef _WIN32
     "    mov %rdi, %rbx\n"
     "    mov %esi, %r12d\n"
     "    and $-16, %rsp\n"
     "    mov 16(%rbx), %rdi\n"
+    "    mov 92(%rbx), %esi\n"
+    APS5_JUMP_ASM_CALL("GuestIoStackRestore_nid_no_patch")
+#ifdef _WIN32
+    "    mov 16(%rbx), %rdi\n"
     "    call GuestStackSwitch_nid_no_patch\n"
+#endif
     "    mov %rbx, %rdi\n"
     "    mov %r12d, %esi\n"
-#endif
     "    sub $8, %rsp\n"
     "    stmxcsr (%rsp)\n"
     "    mov 64(%rdi), %eax\n"
